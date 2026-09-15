@@ -71,7 +71,8 @@ jobs:
 
       - name: SBOM unavailable
         if: steps.sbom-install.outcome != 'success'
-        run: echo "Environment-blocked: cargo-cyclonedx unavailable; SBOM not generated."
+        run: |
+          Write-Output 'Environment-blocked: cargo-cyclonedx unavailable; SBOM not generated.'
 
       - name: upload SBOM (if produced)
         uses: actions/upload-artifact@v4
