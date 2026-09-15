@@ -1,0 +1,11 @@
+[package]
+name = "dji4g-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dji4g-ipc = { path = "../../crates/ipc" }
+dji4g-windows-platform = { path = "../../crates/windows-platform" }

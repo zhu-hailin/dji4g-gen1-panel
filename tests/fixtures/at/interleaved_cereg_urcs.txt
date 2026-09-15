@@ -1,0 +1,5 @@
+AT+CEREG?
++CEREG: 0,1
++CMTI: "SM",1
++CGEV: NW PDN ACT 1
+OK

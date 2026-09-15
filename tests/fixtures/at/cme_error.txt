@@ -1,0 +1,2 @@
+AT+CGATT?
++CME ERROR: 30

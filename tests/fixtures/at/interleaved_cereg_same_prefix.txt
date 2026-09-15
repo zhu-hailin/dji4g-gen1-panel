@@ -1,0 +1,4 @@
+AT+CEREG?
++CEREG: 5
++CEREG: 0,1
+OK

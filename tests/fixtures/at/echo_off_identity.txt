@@ -1,0 +1,4 @@
+Quectel
+EC25
+Revision: EC25EFAR06A06M4G
+OK

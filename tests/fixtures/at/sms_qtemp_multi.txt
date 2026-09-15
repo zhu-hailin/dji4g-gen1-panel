@@ -1,0 +1,5 @@
+AT+QTEMP
++QTEMP: "modem",41
++QTEMP: "pa",39
++QTEMP: "wifi",-5
+OK

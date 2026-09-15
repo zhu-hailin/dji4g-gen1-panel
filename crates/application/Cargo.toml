@@ -1,0 +1,10 @@
+[package]
+name = "dji4g-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dji4g-at-protocol = { path = "../at-protocol" }
+dji4g-domain = { path = "../domain" }

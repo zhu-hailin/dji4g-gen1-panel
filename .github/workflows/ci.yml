@@ -1,0 +1,144 @@
+name: ci
+
+# Release gates for the DJI first-generation 4G panel. Windows-only product, so every job runs on
+# a Windows runner with the MSVC toolchain pinned by rust-toolchain.toml.
+#
+# A gate that cannot run because a tool is missing must surface as a visible failure or an explicit
+# "Environment-blocked" note - never a silent pass.
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  verify:
+    name: fmt / clippy / test / release / deny
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x64
+
+      - name: rustfmt (check)
+        run: cargo fmt --all -- --check
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: tests (workspace, all targets)
+        run: cargo test --workspace --all-targets --locked
+
+      - name: release build
+        run: cargo build --workspace --release --locked --target ${{ env.TARGET }}
+
+      # Dependency license / advisory / ban / source gate. cargo-deny is provided by the action, so
+      # this is a hard gate in CI (locally it may be Environment-blocked if the tool is absent).
+      - name: install native cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        run: cargo deny check advisories licenses bans sources
+
+      # SBOM / license manifest. Best effort: if the generator cannot be installed, the step is
+      # reported as Environment-blocked rather than failing the whole pipeline or faking an output.
+      - name: install cargo-cyclonedx
+        id: sbom-install
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+        continue-on-error: true
+
+      - name: generate SBOM (CycloneDX)
+        if: steps.sbom-install.outcome == 'success'
+        run: cargo cyclonedx --workspace --all --output-cdx --output-prefix workspace
+        continue-on-error: true
+
+      - name: SBOM unavailable
+        if: steps.sbom-install.outcome != 'success'
+        run: echo "Environment-blocked: cargo-cyclonedx unavailable; SBOM not generated."
+
+      - name: upload SBOM (if produced)
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: sbom
+          path: |
+            workspace-cyclonedx.json
+            **/bom.json
+          if-no-files-found: ignore
+
+  package:
+    permissions:
+      contents: write
+    name: unsigned MSIX candidate + verify
+    runs-on: windows-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x64
+
+      # Validates the packaging plan and asset generation without needing the Windows SDK.
+      - name: build-msix dry-run test
+        shell: pwsh
+        run: ./packaging/tests/build-msix-dry-run.ps1
+
+      # Produces the UNSIGNED development candidate (panel + elevated helper) into dist/ with a
+      # SHA-256 release manifest. Never signs and never installs a certificate.
+      - name: build unsigned MSIX candidate
+        shell: pwsh
+        run: ./packaging/scripts/build-msix.ps1
+
+      # Fails closed on a missing file, wrong hash, wrong package identity, or an unexpected/debug
+      # binary inside the package.
+      - name: verify release candidate
+        shell: pwsh
+        run: ./packaging/scripts/verify-release.ps1
+
+      - name: upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: dji4g-panel-unsigned-msix
+          path: |
+            dist/*.msix
+            dist/*.sha256
+            dist/release-manifest.json
+          if-no-files-found: error
+
+      - name: build and verify portable ZIP
+        shell: pwsh
+        run: ./packaging/scripts/build-portable.ps1
+
+      - name: publish development release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "dev-${{ github.run_number }}"
+          $assets = Get-ChildItem dist -File | Where-Object { $_.Extension -in '.zip', '.msix', '.sha256', '.json' } | ForEach-Object { $_.FullName }
+          gh release create $tag @assets --repo '${{ github.repository }}' --target '${{ github.sha }}' --prerelease --title "DJI 4G Panel · $tag" --notes-file docs/RELEASE_NOTES_20260915.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

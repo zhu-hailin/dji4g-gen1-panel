@@ -1,0 +1,3 @@
+AT+CMGF?
++CMGF: 0
+OK

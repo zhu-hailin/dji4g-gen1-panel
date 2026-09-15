@@ -1,0 +1,13 @@
+/target/
+/dist/
+/.worktrees/
+/.superpowers/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.msix
+*.msixbundle
+*.cer
+*.pfx
+/target-rel2/

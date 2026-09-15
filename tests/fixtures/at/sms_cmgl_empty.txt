@@ -1,0 +1,2 @@
+AT+CMGL=4
+OK

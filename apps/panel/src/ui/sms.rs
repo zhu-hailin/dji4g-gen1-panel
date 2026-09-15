@@ -1,0 +1,1091 @@
+//! SMS page: aggregate inbox state from the snapshot plus the stored-message list.
+//!
+//! `ControllerSnapshot` carries the merged message view (`sms_messages`, a read-only copy whose
+//! `SmsMessage` redacts sender/body in `Debug`/`Serialize`); this page only projects it for
+//! display, masks senders by default, and never logs or exports message content.
+//!
+//! Layout: inbox/outgoing filters share a responsive list/detail view below a compact stats strip;
+//! the New SMS action opens a UI-owned draft with an explicit frozen confirmation. Outgoing records are local
+//! bookkeeping — their `index` is a locally assigned transaction id, not a module storage index,
+//! so their rows never issue module commands (no `SmsRead`, no `SmsDelete`) and only present the
+//! submission status.
+
+use std::time::{Duration, Instant};
+#[path = "sms_compose.rs"]
+mod compose;
+pub(crate) use compose::SmsComposeState;
+
+use dji4g_application::{ControllerSnapshot, UiCommand};
+use dji4g_domain::{FeatureStatus, SmsDirection, SmsEncoding, SmsMessage, SmsStatus};
+use eframe::egui::{self, RichText, Ui};
+
+use super::{StatusTone, meta_text, scale, wrapped_label};
+use crate::app::UiCommandSink;
+use crate::localization::{
+    Language, LocalizedText, TextArgs, TextKey, feature_status_note, format_text_in,
+};
+
+/// One projected stored message. Sender and body are carried verbatim only inside this UI-local
+/// value; the list projection never feeds a log, a diagnostic export, or any serialized document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmsRowVm {
+    pub index: u32,
+    /// `Some(true)` unread, `Some(false)` read, `None` while the read state is unknown.
+    pub unread: Option<bool>,
+    pub sender_masked: String,
+    /// Full sender, only revealed after an explicit row click.
+    pub sender_full: String,
+    pub body: String,
+    pub timestamp: Option<String>,
+    pub encoding: SmsEncoding,
+    /// `(sequence, total)` of a long message, when the PDU carried a concatenation header.
+    pub multipart: Option<(u8, u8)>,
+    pub status: SmsStatus,
+    /// Outgoing rows are local submission records, not module-stored mail.
+    pub direction: SmsDirection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmsVm {
+    pub title: LocalizedText,
+    pub intro: LocalizedText,
+    pub status: LocalizedText,
+    pub message_count: usize,
+    pub unread_count: usize,
+    pub capacity: Option<(u32, u32)>,
+    pub capacity_text: Option<LocalizedText>,
+    pub has_incomplete: bool,
+    /// Local-cache evictions reported by the store; non-zero means the local view is
+    /// incomplete even though the module may still hold the messages.
+    pub evicted: u32,
+    pub incomplete_warning: LocalizedText,
+    pub empty_text: LocalizedText,
+    pub list_pending_text: LocalizedText,
+    pub rows: Vec<SmsRowVm>,
+}
+
+/// Classification text for the inbox-wide [`FeatureStatus`]: a never-probed store reads
+/// 「尚未查询」, a completed read reads 「已读取」, and every classified failure keeps its
+/// precise note so 「没有数据」 and 「查询失败」 are never confused.
+#[must_use]
+pub fn sms_status_text(status: FeatureStatus, language: Language) -> LocalizedText {
+    match status {
+        FeatureStatus::NotProbed => LocalizedText::new(language, TextKey::SmsStatusNotQueried),
+        FeatureStatus::Supported | FeatureStatus::Empty => {
+            LocalizedText::new(language, TextKey::SmsStatusRead)
+        }
+        classified => feature_status_note(classified).map_or_else(
+            || LocalizedText::new(language, TextKey::SmsStatusNotQueried),
+            |key| LocalizedText::new(language, key),
+        ),
+    }
+}
+
+/// Encoding display vocabulary: GSM7/UCS2 are protocol names and stay verbatim; anything the
+/// codec does not model is the localized 「其他」.
+#[must_use]
+pub fn sms_encoding_text(encoding: SmsEncoding, language: Language) -> String {
+    match encoding {
+        SmsEncoding::Gsm7 => "GSM7".to_owned(),
+        SmsEncoding::Ucs2 => "UCS2".to_owned(),
+        SmsEncoding::Other => LocalizedText::new(language, TextKey::SmsEncodingOther).text,
+    }
+}
+
+/// One presentation tag on a row's preview line. `tone` stays neutral unless the message carries
+/// a real problem (an incomplete long message), so warning colour keeps its meaning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmsRowTag {
+    pub text: String,
+    pub tone: StatusTone,
+}
+
+/// Read-state presentation for the row's leading dot: a filled progress dot only for unread mail,
+/// a hollow neutral one for read or unknown state.
+#[must_use]
+pub fn row_read_state(unread: Option<bool>) -> (StatusTone, &'static str, TextKey) {
+    match unread {
+        Some(true) => (StatusTone::Progress, "●", TextKey::SmsUnread),
+        Some(false) => (StatusTone::Neutral, "○", TextKey::SmsRead),
+        None => (StatusTone::Neutral, "○", TextKey::ValueUnknown),
+    }
+}
+
+/// Submission status of one outgoing record: the only thing the module proved about it.
+/// `Received`/`Incomplete` are inbox vocabulary and are never produced for outgoing records;
+/// the impossible combination stays honestly 「未知」.
+#[must_use]
+pub fn outgoing_state(status: SmsStatus) -> (StatusTone, TextKey) {
+    match status {
+        SmsStatus::Submitted => (StatusTone::Positive, TextKey::SmsOutgoingSubmitted),
+        SmsStatus::Failed => (StatusTone::Negative, TextKey::SmsOutgoingFailed),
+        SmsStatus::OutcomeUnknown | SmsStatus::Received | SmsStatus::Incomplete => {
+            (StatusTone::Neutral, TextKey::SmsOutgoingUnknown)
+        }
+    }
+}
+
+/// Right-aligned vocabulary of one row, ordered left to right: encoding, fragment count, then the
+/// incomplete warning. Only the warning carries a warning tone. Outgoing rows carry none of it:
+/// the send receipt reports no encoding, concatenation headers never apply, and the status label
+/// in the row's first line already says the rest.
+#[must_use]
+pub fn row_tags(row: &SmsRowVm, language: Language) -> Vec<SmsRowTag> {
+    if row.direction == SmsDirection::Outgoing {
+        return Vec::new();
+    }
+    let mut tags = vec![SmsRowTag {
+        text: sms_encoding_text(row.encoding, language),
+        tone: StatusTone::Neutral,
+    }];
+    if let Some((sequence, total)) = row.multipart {
+        tags.push(SmsRowTag {
+            text: format!("{sequence}/{total}"),
+            tone: StatusTone::Neutral,
+        });
+    }
+    if row.status == SmsStatus::Incomplete {
+        tags.push(SmsRowTag {
+            text: LocalizedText::new(language, TextKey::SmsIncompleteTag).text,
+            tone: StatusTone::Caution,
+        });
+    }
+    tags
+}
+
+/// Project one stored message. The sender defaults to its masked form; the full sender and body
+/// are placed in the VM so an explicit row click can reveal/copy them in place.
+#[must_use]
+pub fn sms_row_vm(message: &SmsMessage, _language: Language) -> SmsRowVm {
+    SmsRowVm {
+        index: message.index,
+        unread: message.read.map(|read| !read),
+        sender_masked: message.sender_masked(),
+        sender_full: message.sender().to_owned(),
+        body: message.body().to_owned(),
+        timestamp: message.service_centre_timestamp.clone(),
+        encoding: message.encoding,
+        multipart: message
+            .multipart
+            .map(|multipart| (multipart.sequence, multipart.total)),
+        status: message.status,
+        direction: message.direction,
+    }
+}
+
+#[must_use]
+pub fn sms_vm(snapshot: &ControllerSnapshot, messages: &[SmsMessage], language: Language) -> SmsVm {
+    let summary = &snapshot.sms_inbox;
+    let mut status = sms_status_text(summary.status, language);
+    if let Some(error) = &snapshot.sms_inbox_failure {
+        let reason = match error.code.stable().as_str() {
+            "sms:port_busy" => "串口上一个操作尚未结束，请稍后刷新",
+            "sms:port_open_failed" | "sms:permission_denied" => "串口访问失败",
+            "sms:unsupported" => "未找到可验证的短信 AT 串口",
+            "sms:pdu_mode_required" | "sms:pdu_confirm_failed" => "短信 PDU 模式未确认",
+            "sms:verification_failed" => "模块响应未通过验证",
+            "sms:timeout" | "app:stage_timeout" => "短信查询超时",
+            "sms:no_device" => "无已验证的设备，请先检查概览中的模块连接状态",
+            "sms:device_removed" => "设备已断开",
+            _ => "短信查询失败",
+        };
+        status.text = format!("{reason}（{}）", error.code.stable().as_str());
+        if let Some(code) = error.os_code {
+            status.text.push_str(&format!("；系统错误 {code}"));
+        }
+    }
+    SmsVm {
+        title: LocalizedText::new(language, TextKey::SmsTitle),
+        intro: LocalizedText::new(language, TextKey::SmsIntro),
+        status,
+        message_count: summary.message_count,
+        unread_count: summary.unread_count,
+        capacity: summary.capacity,
+        capacity_text: summary.capacity.map(|(used, total)| {
+            format_text_in(
+                language,
+                TextKey::SmsCapacityUsed,
+                &TextArgs::used_total(used, total),
+            )
+        }),
+        has_incomplete: summary.has_incomplete,
+        evicted: summary.evicted,
+        incomplete_warning: LocalizedText::new(language, TextKey::SmsIncompleteWarning),
+        empty_text: LocalizedText::new(language, TextKey::SmsEmpty),
+        list_pending_text: LocalizedText::new(language, TextKey::SmsListPending),
+        rows: messages
+            .iter()
+            .map(|message| sms_row_vm(message, language))
+            .collect(),
+    }
+}
+
+/// How long a delete confirmation stays armed. Sending uses a persistent confirmation window.
+pub(crate) const CONFIRM_ARM_WINDOW: Duration = Duration::from_secs(3);
+
+pub(crate) fn render(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    messages: &[SmsMessage],
+    language: Language,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    let vm = sms_vm(snapshot, messages, language);
+    ui.horizontal_wrapped(|ui| {
+        ui.vertical(|ui| {
+            ui.heading("短信中心");
+            ui.label(meta_text("管理模块短信，阅读消息与发送记录"));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add(super::theme::primary_button("新建短信")).clicked() {
+                state.open = true;
+            }
+            if ui
+                .add_enabled(!snapshot.sms_refresh_pending, egui::Button::new("刷新列表"))
+                .clicked()
+            {
+                refresh(sink, state);
+            }
+        });
+    });
+    ui.add_space(16.0);
+    compose::render(ui, state, snapshot, sink);
+    let busy = snapshot
+        .sms_send
+        .as_ref()
+        .is_some_and(|send| send.is_active())
+        || snapshot.operation.as_ref().is_some_and(|operation| {
+            matches!(
+                operation.state,
+                dji4g_application::OperationState::Running { .. }
+            )
+        });
+    state.auto_refresh(
+        Instant::now(),
+        snapshot.app.device.is_some(),
+        busy,
+        snapshot.sms_refresh_pending,
+        sink,
+    );
+    render_inbox(ui, &vm, snapshot, language, sink, state);
+}
+
+fn refresh(sink: &dyn UiCommandSink, state: &mut SmsComposeState) {
+    state.request_refresh(Instant::now(), sink);
+}
+
+fn badge(ui: &mut Ui, text: impl Into<String>, color: egui::Color32) {
+    egui::Frame::none()
+        .fill(color.gamma_multiply(0.09))
+        .rounding(6.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text.into()).size(12.0).color(color));
+        });
+}
+
+fn empty_panel(ui: &mut Ui, title: &str, note: &str, height: f32) {
+    ui.vertical_centered(|ui| {
+        ui.add_space((height * 0.20).max(24.0));
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - 68.0) / 2.0).max(0.0));
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(0xec, 0xef, 0xff))
+                .rounding(18.0)
+                .inner_margin(20.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        super::icons::text(ui.ctx(), super::icons::MAIL, 28.0)
+                            .color(scale::DOWNLOAD),
+                    );
+                });
+        });
+        ui.add_space(16.0);
+        ui.label(RichText::new(title).size(18.0).strong().color(scale::INK));
+        ui.add_space(4.0);
+        wrapped_label(ui, meta_text(note));
+    });
+}
+
+fn render_inbox(
+    ui: &mut Ui,
+    vm: &SmsVm,
+    snapshot: &ControllerSnapshot,
+    language: Language,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    // Query evidence has its own quiet status strip; sending results remain independent.
+    ui.horizontal_wrapped(|ui| {
+        if snapshot.sms_refresh_pending {
+            ui.spinner();
+            ui.label(meta_text("正在同步模块短信…"));
+        } else {
+            ui.label(meta_text(&vm.status.text));
+        }
+        if vm.unread_count > 0 {
+            badge(ui, format!("{} 条未读", vm.unread_count), scale::DOWNLOAD);
+        }
+        if let Some((used, total)) = vm.capacity {
+            ui.label(meta_text(format!("存储 {used} / {total}")));
+        }
+    });
+    ui.label(meta_text(if snapshot.app.device.is_some() {
+        "每 15 秒自动同步 · 发送期间暂停"
+    } else {
+        "设备连接后自动同步短信"
+    }));
+    if let Some(error) = &state.refresh_error {
+        wrapped_label(ui, RichText::new(error).color(StatusTone::Caution.color()));
+    }
+    if vm.has_incomplete {
+        wrapped_label(
+            ui,
+            RichText::new(&vm.incomplete_warning.text).color(StatusTone::Caution.color()),
+        );
+    }
+    if vm.evicted > 0 {
+        wrapped_label(
+            ui,
+            meta_text(format!(
+                "本地缓存已移出 {} 条较早短信；模块存储可能仍有记录。",
+                vm.evicted
+            )),
+        );
+    }
+    ui.add_space(12.0);
+    let height = (ui.ctx().screen_rect().bottom() - ui.cursor().top() - 170.0).clamp(210.0, 340.0);
+    egui::Frame::none()
+        .fill(egui::Color32::WHITE)
+        .rounding(14.0)
+        .inner_margin(18.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                for (outgoing, title) in [(false, "收件箱"), (true, "发送记录")] {
+                    let count = vm
+                        .rows
+                        .iter()
+                        .filter(|r| (r.direction == SmsDirection::Outgoing) == outgoing)
+                        .count();
+                    let active = state.outgoing == outgoing;
+                    let response = ui.add(
+                        egui::Button::new(RichText::new(format!("{title}  {count}")).color(
+                            if active {
+                                scale::DOWNLOAD
+                            } else {
+                                scale::SECONDARY
+                            },
+                        ))
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE),
+                    );
+                    if active {
+                        let r = response.rect;
+                        ui.painter().line_segment(
+                            [r.left_bottom(), r.right_bottom()],
+                            egui::Stroke::new(2.0_f32, scale::DOWNLOAD),
+                        );
+                    }
+                    if response.clicked() {
+                        state.outgoing = outgoing;
+                        state.selected = None;
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(10.0);
+            let query = state.search.trim().to_lowercase();
+            let rows: Vec<_> = vm
+                .rows
+                .iter()
+                .filter(|row| {
+                    (row.direction == SmsDirection::Outgoing) == state.outgoing
+                        && (query.is_empty()
+                            || row.sender_full.to_lowercase().contains(&query)
+                            || row.body.to_lowercase().contains(&query))
+                })
+                .collect();
+            if state.selected.is_some_and(|key| {
+                !rows
+                    .iter()
+                    .any(|r| (r.direction == SmsDirection::Outgoing, r.index) == key)
+            }) {
+                state.selected = None;
+            }
+            let wide = ui.available_width() >= 720.0;
+            if wide {
+                let width = ui.available_width();
+                let list_width = (width * 0.38).clamp(270.0, 340.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(list_width, height - 88.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            list_panel(ui, &rows, snapshot, language, sink, state, height - 88.0);
+                        },
+                    );
+                    let (divider, _) = ui
+                        .allocate_exact_size(egui::vec2(1.0, height - 88.0), egui::Sense::hover());
+                    ui.painter().line_segment(
+                        [divider.center_top(), divider.center_bottom()],
+                        egui::Stroke::new(1.0_f32, scale::LINE),
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2((width - list_width - 26.0).max(180.0), height - 88.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_height(height - 88.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("sms-reader")
+                                .max_height(height - 88.0)
+                                .show(ui, |ui| {
+                                    render_detail(ui, &rows, language, sink, state);
+                                });
+                        },
+                    );
+                });
+            } else if state.selected.is_some() {
+                if ui.button("返回消息列表").clicked() {
+                    state.selected = None;
+                }
+                render_detail(ui, &rows, language, sink, state);
+            } else {
+                list_panel(ui, &rows, snapshot, language, sink, state, height - 88.0);
+            }
+            ui.add_space(14.0);
+            ui.separator();
+            ui.label(meta_text(
+                "模块接受发送 ≠ 收件人已收到  ·  短信内容不会写入诊断日志",
+            ));
+        });
+}
+
+fn list_panel(
+    ui: &mut Ui,
+    rows: &[&SmsRowVm],
+    snapshot: &ControllerSnapshot,
+    language: Language,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+    height: f32,
+) {
+    ui.set_min_height(height);
+    ui.add(
+        egui::TextEdit::singleline(&mut state.search)
+            .hint_text("搜索号码或短信内容")
+            .desired_width(f32::INFINITY)
+            .margin(egui::vec2(12.0, 10.0)),
+    );
+    ui.add_space(10.0);
+    if rows.is_empty() {
+        let (title, note) = if !state.search.trim().is_empty() {
+            ("没有找到相关短信", "试试其他号码或关键词")
+        } else if state.outgoing {
+            ("还没有发送记录", "点击右上角「新建短信」开始写信")
+        } else if snapshot.sms_refresh_pending {
+            ("正在读取短信", "正在与模块同步，请稍候")
+        } else {
+            match snapshot.sms_inbox.status {
+                FeatureStatus::NotProbed => ("收件箱等待同步", "连接模块后会自动读取已保存的短信"),
+                FeatureStatus::Supported | FeatureStatus::Empty => {
+                    ("暂无收到的短信", "模块中暂时没有可显示的短信")
+                }
+                _ => ("暂时无法读取短信", "请查看上方的具体错误，检查连接后重试"),
+            }
+        };
+        empty_panel(ui, title, note, height - 60.0);
+        if !state.outgoing && state.search.is_empty() && !snapshot.sms_refresh_pending {
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                if ui.button("刷新短信").clicked() {
+                    refresh(sink, state);
+                }
+            });
+        }
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt("sms-message-list")
+            .max_height(height - 48.0)
+            .show(ui, |ui| {
+                render_list(ui, rows, language, sink, state);
+            });
+    }
+}
+
+fn render_list(
+    ui: &mut Ui,
+    rows: &[&SmsRowVm],
+    language: Language,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    for row in rows {
+        let outgoing = row.direction == SmsDirection::Outgoing;
+        let key = (outgoing, row.index);
+        let selected = state.selected == Some(key);
+        let frame = egui::Frame::none()
+            .rounding(10.0)
+            .inner_margin(12.0)
+            .fill(if selected {
+                egui::Color32::from_rgb(0xed, 0xf0, 0xff)
+            } else {
+                egui::Color32::from_rgb(0xf8, 0xf9, 0xfc)
+            });
+        let response = frame
+            .show(ui, |ui| {
+                ui.spacing_mut().interact_size.y = 18.0;
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if row.unread == Some(true) && !outgoing {
+                        ui.colored_label(scale::DOWNLOAD, "●");
+                    }
+                    ui.label(
+                        RichText::new(&row.sender_masked)
+                            .size(15.0)
+                            .strong()
+                            .color(scale::INK),
+                    );
+                });
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(body_preview(&row.body))
+                            .size(13.0)
+                            .color(scale::SECONDARY),
+                    )
+                    .truncate(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(meta_text(row.timestamp.as_deref().unwrap_or("时间未提供")));
+                    if outgoing {
+                        ui.label(meta_text(outgoing_state(row.status).1.to_string(language)));
+                    }
+                });
+            })
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.hovered() && !selected {
+            ui.painter()
+                .rect_stroke(response.rect, 10.0, egui::Stroke::new(1.0_f32, scale::LINE));
+        }
+        if response.clicked() {
+            state.selected = Some(key);
+            if !outgoing {
+                state.error = sink
+                    .try_send(UiCommand::SmsRead { index: row.index })
+                    .err()
+                    .map(|e| compose::enqueue_error(e).to_owned());
+            }
+        }
+        ui.add_space(6.0);
+    }
+}
+
+fn render_detail(
+    ui: &mut Ui,
+    rows: &[&SmsRowVm],
+    language: Language,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    let Some(row) = rows
+        .iter()
+        .find(|row| state.selected == Some((row.direction == SmsDirection::Outgoing, row.index)))
+    else {
+        empty_panel(
+            ui,
+            "消息阅读区",
+            "从左侧选择一条短信，即可在这里查看完整内容",
+            300.0,
+        );
+        return;
+    };
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        badge(
+            ui,
+            if row.direction == SmsDirection::Incoming {
+                "收到的短信"
+            } else {
+                "发送记录"
+            },
+            scale::DOWNLOAD,
+        );
+        for tag in row_tags(row, language) {
+            badge(ui, tag.text, tag.tone.color());
+        }
+    });
+    ui.add_space(6.0);
+    wrapped_label(ui, RichText::new(&row.sender_full).size(18.0).strong());
+    ui.label(meta_text(
+        row.timestamp.as_deref().unwrap_or("模块未提供时间"),
+    ));
+    ui.add_space(8.0);
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(0xf5, 0xf7, 0xfb))
+        .rounding(12.0)
+        .inner_margin(18.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            wrapped_label(ui, RichText::new(&row.body).size(14.0).color(scale::INK));
+        });
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui.button(TextKey::ButtonCopy.to_string(language)).clicked() {
+            ui.ctx()
+                .copy_text(format!("{}\n{}", row.sender_full, row.body));
+        }
+        if row.direction == SmsDirection::Incoming {
+            render_delete_button(ui, row, language, sink);
+        } else {
+            badge(
+                ui,
+                outgoing_state(row.status).1.to_string(language),
+                outgoing_state(row.status).0.color(),
+            );
+        }
+    });
+}
+/// Per-row delete with an in-page two-click confirmation: the first click arms the button for
+/// [`CONFIRM_ARM_WINDOW`] and the second dispatches. No deletion is ever sent unconfirmed, and
+/// only incoming rows reach this path (an outgoing record has no module copy to delete).
+fn render_delete_button(ui: &mut Ui, row: &SmsRowVm, language: Language, sink: &dyn UiCommandSink) {
+    let armed_id = egui::Id::new(("sms-row-delete-armed", row.index));
+    let armed = ui
+        .data(|data| data.get_temp::<Instant>(armed_id))
+        .is_some_and(|at| at.elapsed() < CONFIRM_ARM_WINDOW);
+    let label = if armed {
+        TextKey::ButtonSmsDeleteConfirm
+    } else {
+        TextKey::ButtonSmsDelete
+    };
+    let button = egui::Button::new(RichText::new(label.to_string(language)).color(if armed {
+        StatusTone::Negative.color()
+    } else {
+        scale::SECONDARY
+    }));
+    if ui.add(button).clicked() {
+        if armed {
+            ui.data_mut(|data| data.remove::<Instant>(armed_id));
+            let _ = sink.try_send(UiCommand::SmsDelete { index: row.index });
+        } else {
+            ui.data_mut(|data| data.insert_temp(armed_id, Instant::now()));
+        }
+    }
+}
+
+/// Single-line body preview for a collapsed row: at most [`BODY_PREVIEW_CHARS`] characters, with
+/// an explicit ellipsis when the body continues. The full text stays behind the row click.
+const BODY_PREVIEW_CHARS: usize = 42;
+
+fn body_preview(body: &str) -> String {
+    let flattened = body.replace(['\r', '\n'], " ");
+    let mut chars = flattened.chars();
+    let preview: String = chars.by_ref().take(BODY_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+trait LocalizedKeyText {
+    fn to_string(self, language: Language) -> String;
+}
+
+impl LocalizedKeyText for TextKey {
+    fn to_string(self, language: Language) -> String {
+        crate::localization::LocalizedText::new(language, self).text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use dji4g_application::{CommandStateSnapshot, ControllerSnapshot, SettingsSnapshot};
+    use dji4g_domain::{
+        AppSnapshot, Availability, DeviceEpoch, FeatureStatus, Freshness, HotspotStatus,
+        SmsInboxSummary, SmsMessage, SmsMultipartInfo, SmsStatus, SmsStorageId,
+    };
+
+    fn snapshot(summary: SmsInboxSummary) -> ControllerSnapshot {
+        ControllerSnapshot {
+            publication_revision: 7,
+            app: Arc::new(AppSnapshot {
+                revision: 7,
+                observed_at: std::time::SystemTime::UNIX_EPOCH,
+                freshness: Freshness::Fresh,
+                availability: Availability::Available,
+                hotspot: HotspotStatus::Off,
+                device: None,
+                cellular: None,
+                network: None,
+                active_operation: None,
+                issues: Vec::new(),
+            }),
+            diagnostics: dji4g_application::DiagnosticSet::new(DeviceEpoch(1)),
+            prepared_action: None,
+            operation: None,
+            settings: SettingsSnapshot::default(),
+            command_state: CommandStateSnapshot::default(),
+            action_readiness: Vec::new(),
+            feedback: None,
+            sim_epoch: 0,
+            feature_status: None,
+            adapter_metrics: None,
+            timeline: Default::default(),
+            sms_inbox: summary,
+            sms_messages: Vec::new(),
+            sms_send: None,
+            sms_refresh_pending: false,
+            sms_inbox_failure: None,
+        }
+    }
+
+    fn message(index: u32, read: Option<bool>, status: SmsStatus) -> SmsMessage {
+        let mut message = SmsMessage::new(
+            index,
+            SmsStorageId("SM".to_owned()),
+            1,
+            0,
+            "+8613800138000",
+            "sensitive body",
+            SmsEncoding::Ucs2,
+            status,
+        );
+        message.service_centre_timestamp = Some("24/09/10,12:00:00+32".to_owned());
+        message.multipart = Some(SmsMultipartInfo {
+            reference: 1,
+            total: 3,
+            sequence: 2,
+        });
+        message.read = read;
+        message
+    }
+
+    fn outgoing_message(status: SmsStatus) -> SmsMessage {
+        SmsMessage::new_outgoing(
+            4,
+            1,
+            0,
+            "+8613800138000",
+            "sent body",
+            SmsEncoding::Other,
+            status,
+        )
+    }
+
+    #[test]
+    fn sms_vm_reports_status_counts_capacity_and_incomplete_flag() {
+        let vm = sms_vm(
+            &snapshot(SmsInboxSummary {
+                message_count: 2,
+                unread_count: 1,
+                capacity: Some((2, 30)),
+                status: FeatureStatus::Supported,
+                has_incomplete: true,
+                evicted: 0,
+            }),
+            &[],
+            Language::ZhCn,
+        );
+        assert_eq!(vm.status.text, "已读取");
+        assert_eq!(vm.message_count, 2);
+        assert_eq!(vm.unread_count, 1);
+        assert_eq!(
+            vm.capacity_text.as_ref().map(|text| text.text.as_str()),
+            Some("已用 2 / 总数 30")
+        );
+        assert!(vm.has_incomplete);
+        assert_eq!(vm.incomplete_warning.text, "存在未完整接收的长短信");
+        assert!(vm.rows.is_empty());
+        assert!(!vm.empty_text.text.trim().is_empty());
+        assert!(!vm.list_pending_text.text.trim().is_empty());
+    }
+
+    #[test]
+    fn sms_vm_wires_the_local_eviction_count_from_the_summary() {
+        let vm = sms_vm(
+            &snapshot(SmsInboxSummary {
+                evicted: 2,
+                ..SmsInboxSummary::default()
+            }),
+            &[],
+            Language::ZhCn,
+        );
+        assert_eq!(vm.evicted, 2);
+    }
+
+    #[test]
+    fn sms_vm_marks_an_unqueried_inbox_and_omits_absent_capacity() {
+        let vm = sms_vm(&snapshot(SmsInboxSummary::default()), &[], Language::ZhCn);
+        assert_eq!(vm.status.text, "尚未查询");
+        assert_eq!(vm.capacity_text, None);
+        assert!(!vm.has_incomplete);
+    }
+
+    #[test]
+    fn sms_vm_maps_a_classified_failure_to_its_precise_note() {
+        let vm = sms_vm(
+            &snapshot(SmsInboxSummary {
+                status: FeatureStatus::TransportFailure,
+                ..SmsInboxSummary::default()
+            }),
+            &[],
+            Language::ZhCn,
+        );
+        assert!(
+            vm.status.text.contains("本次超时"),
+            "got: {}",
+            vm.status.text
+        );
+        assert!(!vm.status.text.contains("尚未查询"));
+    }
+
+    #[test]
+    fn sms_row_vm_masks_the_sender_and_keeps_read_state_and_parts() {
+        let row = sms_row_vm(
+            &message(7, Some(false), SmsStatus::Incomplete),
+            Language::ZhCn,
+        );
+        assert_eq!(row.index, 7);
+        assert_eq!(row.direction, SmsDirection::Incoming);
+        assert_eq!(row.unread, Some(true));
+        assert_eq!(row.sender_masked, "****8000");
+        assert_eq!(row.sender_full, "+8613800138000");
+        assert_eq!(row.body, "sensitive body");
+        assert_eq!(row.timestamp.as_deref(), Some("24/09/10,12:00:00+32"));
+        assert_eq!(row.encoding, SmsEncoding::Ucs2);
+        assert_eq!(row.multipart, Some((2, 3)));
+        assert_eq!(row.status, SmsStatus::Incomplete);
+    }
+
+    #[test]
+    fn sms_row_vm_projects_outgoing_records_as_local_bookkeeping() {
+        let row = sms_row_vm(&outgoing_message(SmsStatus::Submitted), Language::ZhCn);
+        assert_eq!(row.direction, SmsDirection::Outgoing);
+        assert_eq!(row.status, SmsStatus::Submitted);
+        // Outgoing mail is never unread mail.
+        assert_eq!(row.unread, Some(false));
+        assert_eq!(row.timestamp, None);
+        assert_eq!(row.body, "sent body");
+        assert_eq!(row.sender_masked, "****8000");
+    }
+
+    #[test]
+    fn sms_row_vm_keeps_an_unknown_read_state_unknown() {
+        let row = sms_row_vm(&message(1, None, SmsStatus::Received), Language::ZhCn);
+        assert_eq!(row.unread, None);
+    }
+
+    #[test]
+    fn sms_vm_projects_rows_in_store_order() {
+        let messages = vec![
+            message(3, Some(true), SmsStatus::Received),
+            outgoing_message(SmsStatus::OutcomeUnknown),
+            message(9, Some(false), SmsStatus::Received),
+        ];
+        let vm = sms_vm(
+            &snapshot(SmsInboxSummary {
+                message_count: 3,
+                status: FeatureStatus::Supported,
+                ..SmsInboxSummary::default()
+            }),
+            &messages,
+            Language::ZhCn,
+        );
+        assert_eq!(
+            vm.rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![3, 4, 9]
+        );
+        assert_eq!(vm.rows[0].unread, Some(false));
+        assert_eq!(vm.rows[1].direction, SmsDirection::Outgoing);
+        assert_eq!(vm.rows[2].unread, Some(true));
+    }
+
+    #[test]
+    fn encoding_vocabulary_is_closed() {
+        assert_eq!(sms_encoding_text(SmsEncoding::Gsm7, Language::ZhCn), "GSM7");
+        assert_eq!(sms_encoding_text(SmsEncoding::Ucs2, Language::ZhCn), "UCS2");
+        assert_eq!(
+            sms_encoding_text(SmsEncoding::Other, Language::ZhCn),
+            "其他"
+        );
+    }
+
+    #[test]
+    fn the_body_preview_is_single_line_bounded_and_marks_truncation() {
+        assert_eq!(body_preview("短正文"), "短正文");
+        let exact = "字".repeat(BODY_PREVIEW_CHARS);
+        assert_eq!(
+            body_preview(&exact),
+            exact,
+            "an exact-fit body is not elided"
+        );
+        let long = format!("{exact}尾");
+        let preview = body_preview(&long);
+        assert_eq!(preview.chars().count(), BODY_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        assert!(
+            !body_preview("第一行\n第二行").contains('\n'),
+            "the preview must stay on one line"
+        );
+    }
+
+    #[test]
+    fn the_read_marker_is_a_filled_progress_dot_only_when_unread() {
+        assert_eq!(
+            row_read_state(Some(true)),
+            (StatusTone::Progress, "●", TextKey::SmsUnread)
+        );
+        assert_eq!(
+            row_read_state(Some(false)),
+            (StatusTone::Neutral, "○", TextKey::SmsRead)
+        );
+        assert_eq!(
+            row_read_state(None),
+            (StatusTone::Neutral, "○", TextKey::ValueUnknown)
+        );
+    }
+
+    #[test]
+    fn outgoing_submission_status_maps_to_its_tone_and_label() {
+        assert_eq!(
+            outgoing_state(SmsStatus::Submitted),
+            (StatusTone::Positive, TextKey::SmsOutgoingSubmitted)
+        );
+        assert_eq!(
+            outgoing_state(SmsStatus::Failed),
+            (StatusTone::Negative, TextKey::SmsOutgoingFailed)
+        );
+        assert_eq!(
+            outgoing_state(SmsStatus::OutcomeUnknown),
+            (StatusTone::Neutral, TextKey::SmsOutgoingUnknown)
+        );
+    }
+
+    #[test]
+    fn row_tags_keep_encoding_and_fragments_neutral_and_flag_the_incomplete_message() {
+        let row = sms_row_vm(
+            &message(7, Some(true), SmsStatus::Incomplete),
+            Language::ZhCn,
+        );
+        let tags = row_tags(&row, Language::ZhCn);
+        let texts = tags.iter().map(|tag| tag.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(texts, ["UCS2", "2/3", "未完整"]);
+        assert_eq!(tags[0].tone, StatusTone::Neutral);
+        assert_eq!(tags[1].tone, StatusTone::Neutral);
+        assert_eq!(tags[2].tone, StatusTone::Caution);
+    }
+
+    #[test]
+    fn row_tags_drop_the_incomplete_warning_for_a_complete_message() {
+        let mut complete = message(8, Some(false), SmsStatus::Received);
+        complete.multipart = None;
+        let row = sms_row_vm(&complete, Language::ZhCn);
+        let tags = row_tags(&row, Language::ZhCn);
+        let texts = tags.iter().map(|tag| tag.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(texts, ["UCS2"]);
+        assert!(tags.iter().all(|tag| tag.tone == StatusTone::Neutral));
+    }
+
+    #[test]
+    fn row_tags_are_empty_for_outgoing_rows() {
+        let row = sms_row_vm(&outgoing_message(SmsStatus::Submitted), Language::ZhCn);
+        assert_eq!(row_tags(&row, Language::ZhCn), Vec::new());
+    }
+
+    #[test]
+    fn the_page_renders_its_empty_state_without_panicking() {
+        struct NoopSink;
+        impl UiCommandSink for NoopSink {
+            fn try_send(&self, _command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+                Ok(())
+            }
+        }
+
+        let context = egui::Context::default();
+        let snapshot = snapshot(SmsInboxSummary {
+            message_count: 2,
+            unread_count: 1,
+            capacity: Some((2, 30)),
+            status: FeatureStatus::Supported,
+            has_incomplete: true,
+            evicted: 0,
+        });
+        let sink = NoopSink;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    render(
+                        ui,
+                        &snapshot,
+                        &[],
+                        Language::ZhCn,
+                        &sink,
+                        &mut SmsComposeState::default(),
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn the_page_renders_message_rows_without_panicking() {
+        struct NoopSink;
+        impl UiCommandSink for NoopSink {
+            fn try_send(&self, _command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+                Ok(())
+            }
+        }
+
+        let context = egui::Context::default();
+        let snapshot = snapshot(SmsInboxSummary {
+            message_count: 3,
+            unread_count: 1,
+            capacity: Some((2, 30)),
+            status: FeatureStatus::Supported,
+            has_incomplete: true,
+            evicted: 2,
+        });
+        let messages = vec![
+            message(1, Some(true), SmsStatus::Incomplete),
+            outgoing_message(SmsStatus::Failed),
+            message(2, Some(false), SmsStatus::Received),
+        ];
+        let sink = NoopSink;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    render(
+                        ui,
+                        &snapshot,
+                        &messages,
+                        Language::ZhCn,
+                        &sink,
+                        &mut SmsComposeState::default(),
+                    );
+                });
+            },
+        );
+    }
+}
