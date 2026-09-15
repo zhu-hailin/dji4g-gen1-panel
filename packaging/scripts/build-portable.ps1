@@ -15,6 +15,7 @@ foreach ($name in @('dji4g-panel.exe','dji4g-helper.exe')) {
 }
 Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/使用说明.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE-MIT'),(Join-Path $repoRoot 'LICENSE-APACHE') -Destination $staging
+Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/THIRD-PARTY-NOTICES.txt') -Destination $staging
 $manifest = Get-ChildItem -LiteralPath $staging -File | ForEach-Object { [pscustomobject]@{name=$_.Name;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash} }
 $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $staging 'portable-manifest.json') -Encoding utf8
 $payload = Get-ChildItem -LiteralPath $staging -File

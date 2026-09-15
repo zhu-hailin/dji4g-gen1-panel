@@ -20,7 +20,10 @@ version = 2
 yanked = "deny"
 # No blanket ignores. Any RUSTSEC advisory that fires must be triaged and either fixed or
 # explicitly ignored here with a written justification.
-ignore = []
+# Development-only review: informational unmaintained notice, no patched release.
+# Fixed system/bundled font inputs; no downloaded or user-selected fonts.
+# Reassess by 2026-12-31 or before adding font import. See docs/DEPENDENCY_REVIEW.md.
+ignore = ["RUSTSEC-2026-0192"]
 
 [licenses]
 version = 2
@@ -37,8 +40,15 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "0BSD",
+    "BSL-1.0",
 ]
 confidence-threshold = 0.8
+
+# Bundled, unmodified fallback fonts; notices ship in both archive formats.
+[[licenses.exceptions]]
+name = "epaint_default_fonts"
+version = "=0.29.1"
+allow = ["OFL-1.1", "LicenseRef-UFL-1.0"]
 
 [bans]
 # Warn (do not fail) on duplicate crate versions: the Windows/egui dependency trees legitimately

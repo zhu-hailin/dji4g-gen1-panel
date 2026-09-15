@@ -22,3 +22,5 @@
 ## 分发
 
 Windows x64 开发版本，未进行可信证书签名。便携包与 MSIX 均附 SHA-256；GitHub 发布工作流只有通过验证和包校验才创建 Release。CI 的依赖审计结果以 GitHub Actions 实际运行记录为准。
+
+云端编译、Clippy 和完整测试亦已通过。依赖审计包含一项明确记录的停止维护例外；详见 DEPENDENCY_REVIEW.md。

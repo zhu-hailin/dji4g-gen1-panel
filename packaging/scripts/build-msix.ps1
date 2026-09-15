@@ -159,6 +159,7 @@ $staging = Join-Path $stagingRoot ([guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
 try {
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/THIRD-PARTY-NOTICES.txt') -Destination $staging
     $assets = Join-Path $staging 'Assets'
     New-Item -ItemType Directory -Path $assets -Force | Out-Null
     Copy-Item -LiteralPath $panelExe -Destination (Join-Path $staging 'dji4g-panel.exe')
