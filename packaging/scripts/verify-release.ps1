@@ -72,6 +72,7 @@ $requiredEntries = @(
     'Assets/StoreLogo.png',
     'Assets/Square44x44Logo.png',
     'Assets/Square150x150Logo.png'
+    'THIRD-PARTY-NOTICES.txt'
 )
 
 # Patterns that must never appear in a release candidate.
