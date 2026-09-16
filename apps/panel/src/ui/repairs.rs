@@ -214,11 +214,40 @@ pub(crate) fn render(
             .color(scale::SECONDARY),
     );
     wrapped_label(ui, meta_text(vm.driver_notice.text.clone()));
+    let (usb_actions, other_actions): (Vec<_>, Vec<_>) =
+        vm.actions.into_iter().partition(|action| {
+            matches!(
+                action.action,
+                ActionKind::SetVerifiedUsbNetworkProfile { .. }
+            )
+        });
+    section_frame(ui, |ui| {
+        ui.label(section_heading("电脑网卡模式"));
+        ui.hyperlink_to("查看大疆官方使用说明", "https://dl.djicdn.com/downloads/DJI_Mavic_3/DJI_Cellular_Dongle_LTE_USB_Modem_User_Guide_v1.0.pdf");
+        wrapped_label(
+            ui,
+            "部分一代模块保留原厂固件即可用作电脑网卡。先检查驱动和当前网络状态；已经能上网时无需切换。",
+        );
+        wrapped_label(
+            ui,
+            meta_text(
+                "下方操作只切换 USB 网络配置，不刷写固件。DJI NDIS 配置需要匹配的 Windows 驱动；ECM 配置的兼容性取决于系统与驱动。",
+            ),
+        );
+        wrapped_label(
+            ui,
+            meta_text(
+                "切换会中断连接并可能重新枚举设备。仅适用于本项目已验证的设备配置；AT 端口不可用时，请先处理驱动问题。",
+            ),
+        );
+        for action in usb_actions {
+            render_action_button(ui, action, language, sink);
+        }
+    });
     // No nested scroll area: the shell already scrolls the page, so the grouped actions share
     // one scrollbar instead of fighting each other for height. Sections follow the domain risk
     // metadata, never a list index, so a high-risk action can never hide in the low-risk group.
-    let (low_risk, interrupting): (Vec<_>, Vec<_>) = vm
-        .actions
+    let (low_risk, interrupting): (Vec<_>, Vec<_>) = other_actions
         .into_iter()
         .partition(|action| !is_interrupting(&action.action));
     section_frame(ui, |ui| {

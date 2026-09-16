@@ -39,6 +39,12 @@
 
 ## 运行
 
+### 未刷机模块能否用于电脑？
+
+一代模块并非只支持无人机。[大疆官方使用说明（第 7 页）](https://dl.djicdn.com/downloads/DJI_Mavic_3/DJI_Cellular_Dongle_LTE_USB_Modem_User_Guide_v1.0.pdf)明确将 Windows 计算机列为支持设备。电脑无法上网时，应先检查 USB 驱动、SIM、网络注册和 IP 配置，不能仅凭“未刷机”判定需要更换固件。
+
+「修复 → 电脑网卡模式」提供现有的 DJI NDIS 与 ECM 配置切换，沿用前提检查、影响确认和执行流程。此操作修改 USB 网络配置，不刷写固件；切换可能中断连接并重新枚举设备。已经能上网时无需切换，AT 端口缺少驱动时应先修复驱动。配置仅限本项目验证范围，不应把不同型号、固件的 `usbnet` 数值直接套用。
+
 1. 从 Releases 下载 Windows x64 便携 ZIP，完整解压。
 2. 运行 `dji4g-panel.exe`，保持 `dji4g-helper.exe` 在同一目录。
 3. 升级前从托盘或设置页完全退出旧程序。
