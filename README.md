@@ -39,6 +39,12 @@
 
 ## 运行
 
+### 单文件独立版
+
+本地独立版只需复制并双击 `大疆4G面板独立版.exe`，自动准备内置程序与驱动资源并直接打开面板，无需单独安装应用或复制 DLL。驱动安装仍需管理员权限及硬件匹配。[构建与验证说明](docs/STANDALONE.md)。该版本尚未完成新电脑和卡巴斯基实机验收；含厂商驱动的本地二进制不随源码公开上传。
+
+「修复 → 首次连接检查」分别显示 USB、Windows 网卡和 AT 通信诊断，过期结果不会显示为当前成功。公开便携包不附带厂商驱动；本地离线版可包含本机导出的原始驱动及受控安装器，参见 [离线版说明](docs/LOCAL_OFFLINE_DRIVERS.md) 和 [审核记录](docs/DRIVER_BUNDLE_REVIEW.md)。
+
 ### 未刷机模块能否用于电脑？
 
 一代模块并非只支持无人机。[大疆官方使用说明（第 7 页）](https://dl.djicdn.com/downloads/DJI_Mavic_3/DJI_Cellular_Dongle_LTE_USB_Modem_User_Guide_v1.0.pdf)明确将 Windows 计算机列为支持设备。电脑无法上网时，应先检查 USB 驱动、SIM、网络注册和 IP 配置，不能仅凭“未刷机”判定需要更换固件。
@@ -70,6 +76,6 @@ cargo build --release --locked --target x86_64-pc-windows-msvc -p dji4g-panel -p
 
 ## 范围与许可
 
-目前面向第一代支持列表内的模块及 Windows x64。不包含二代支持、驱动分发、固件升级、任意 AT 命令终端或自动短信重发。
+目前面向第一代支持列表内的模块及 Windows x64。公开包不附带厂商驱动；不包含二代支持、固件升级、任意 AT 命令终端或自动短信重发。
 
 MIT OR Apache-2.0，见 [LICENSE-MIT](LICENSE-MIT) 与 [LICENSE-APACHE](LICENSE-APACHE)。

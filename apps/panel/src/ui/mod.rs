@@ -18,6 +18,7 @@ use crate::localization::{
 };
 
 pub mod diagnostics;
+pub(crate) mod driver_setup;
 pub mod overview;
 pub mod repairs;
 pub mod settings;

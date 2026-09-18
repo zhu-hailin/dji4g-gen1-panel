@@ -201,7 +201,7 @@ pub fn repairs_vm(snapshot: &ControllerSnapshot, now: SystemTime, language: Lang
 pub(crate) fn render(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
-    _now: SystemTime,
+    now: SystemTime,
     language: Language,
     sink: &dyn PanelCommandSink,
 ) {
@@ -214,6 +214,7 @@ pub(crate) fn render(
             .color(scale::SECONDARY),
     );
     wrapped_label(ui, meta_text(vm.driver_notice.text.clone()));
+    super::driver_setup::render(ui, snapshot, now, language);
     let (usb_actions, other_actions): (Vec<_>, Vec<_>) =
         vm.actions.into_iter().partition(|action| {
             matches!(

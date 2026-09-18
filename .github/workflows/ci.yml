@@ -42,6 +42,10 @@ jobs:
       - name: tests (workspace, all targets)
         run: cargo test --workspace --all-targets --locked
 
+      - name: driver result regression tests (no hardware changes)
+        shell: pwsh
+        run: ./packaging/scripts/test-driver-completion.ps1
+
       - name: release build
         run: cargo build --workspace --release --locked --target ${{ env.TARGET }}
 

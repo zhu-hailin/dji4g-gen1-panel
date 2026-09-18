@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+default-run = "dji4g-panel"
 
 [build-dependencies]
 winresource = "0.1"

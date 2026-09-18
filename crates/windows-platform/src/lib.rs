@@ -4,6 +4,7 @@
 
 mod adapter;
 pub mod autostart;
+pub mod driver_setup;
 pub mod hotspot;
 mod pnp;
 mod privilege;
@@ -16,6 +17,32 @@ pub mod sms;
 pub mod tray;
 
 pub use adapter::*;
+
+/// Resolve the OS shell independently of PATH and user-supplied environment variables.
+#[cfg(windows)]
+pub fn driver_setup_powershell() -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: the writable buffer holds exactly the advertised number of UTF-16 units.
+    let length = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]))
+            .join("WindowsPowerShell/v1.0/powershell.exe"),
+    )
+}
+
+#[cfg(not(windows))]
+pub fn driver_setup_powershell() -> std::io::Result<std::path::PathBuf> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
 pub use autostart::atomic_replace_file_public as atomic_replace_file;
 pub use autostart::*;
 pub use hotspot::*;
