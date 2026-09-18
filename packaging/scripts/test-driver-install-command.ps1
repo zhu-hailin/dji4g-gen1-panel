@@ -21,3 +21,6 @@ foreach ($code in @(0,3010,5)) {
  if ($needsRestart -ne ($code -eq 3010)) { throw "Wrong restart outcome: $code" }
  Write-Output "PASS: install command exit $code"
 }
+# The fake native process deliberately leaves 5 in LASTEXITCODE in the last case.
+# GitHub's pwsh wrapper uses that value as the job result; no real command failed.
+$global:LASTEXITCODE=0
