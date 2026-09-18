@@ -204,7 +204,7 @@ pub(crate) fn render(
     now: SystemTime,
     language: Language,
     sink: &dyn PanelCommandSink,
-) {
+) -> bool {
     let vm = repairs_vm(snapshot, SystemTime::now(), language);
     ui.heading(vm.title.text.clone());
     wrapped_label(
@@ -214,7 +214,7 @@ pub(crate) fn render(
             .color(scale::SECONDARY),
     );
     wrapped_label(ui, meta_text(vm.driver_notice.text.clone()));
-    super::driver_setup::render(ui, snapshot, now, language);
+    let install_requested = super::driver_setup::render(ui, snapshot, now, language);
     let (usb_actions, other_actions): (Vec<_>, Vec<_>) =
         vm.actions.into_iter().partition(|action| {
             matches!(
@@ -280,6 +280,7 @@ pub(crate) fn render(
             }
         });
     });
+    install_requested
 }
 
 fn is_interrupting(action: &ActionKind) -> bool {

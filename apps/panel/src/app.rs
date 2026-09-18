@@ -346,6 +346,7 @@ pub struct PanelApp {
     font_warning: Option<LocalizedText>,
     exports_dir: Option<PathBuf>,
     window: WindowState,
+    support_report: crate::support_report::ReportState,
     tray: Option<Box<dyn TrayEventSource>>,
     tray_tooltip: Option<Box<dyn TrayTooltipSink>>,
     tray_tooltip_base: Option<String>,
@@ -421,6 +422,7 @@ impl PanelApp {
             toast: None,
             font_warning,
             exports_dir: inputs.exports_dir,
+            support_report: crate::support_report::ReportState::default(),
             window: WindowState {
                 visible: true,
                 ..WindowState::default()
@@ -466,6 +468,7 @@ impl PanelApp {
             toast: None,
             font_warning: None,
             exports_dir: inputs.exports_dir,
+            support_report: crate::support_report::ReportState::default(),
             window: WindowState {
                 visible: true,
                 ..WindowState::default()
@@ -811,7 +814,10 @@ impl PanelApp {
     pub fn receive_latest_nonblocking(&mut self, ctx: &egui::Context) {
         if self.snapshot_rx.has_changed() {
             let previous_send = self.snapshot.sms_send.clone();
+            let previous_snapshot = Arc::clone(&self.snapshot);
             self.snapshot = self.snapshot_rx.borrow_and_update();
+            self.support_report
+                .observe(&previous_snapshot, &self.snapshot);
             self.wireless_history.observe(&self.snapshot);
             if self.snapshot.sms_send != previous_send {
                 if let Some(send) = &self.snapshot.sms_send {
@@ -1010,6 +1016,7 @@ impl PanelApp {
     }
 
     pub fn render(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.support_report.poll();
         let now = SystemTime::now();
         let snapshot = Arc::clone(&self.snapshot);
         self.wireless_history.observe(&snapshot);
@@ -1019,6 +1026,7 @@ impl PanelApp {
         // Set by the diagnostics page's UI-side command sink when the export button is used;
         // the export itself runs after layout so it can mutate the toast.
         let export_requested = Arc::new(AtomicBool::new(false));
+        let mut driver_install_requested = false;
 
         egui::TopBottomPanel::top("panel-top")
             .frame(
@@ -1030,18 +1038,44 @@ impl PanelApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(PANEL_WINDOW_TITLE).size(20.0).strong());
                     ui.add_space(16.0);
-                    ui.colored_label(availability.tone.color(), &availability.title.text);
-                    if availability.is_loading {
+                    let detection_failed = availability.is_loading && snapshot.diagnostics.iter().any(|check| matches!(check.state, dji4g_application::DiagnosticCheckState::Failed { .. }));
+                    ui.colored_label(availability.tone.color(), if detection_failed { "检测遇到问题，请查看诊断" } else { &availability.title.text });
+                    if availability.is_loading && !detection_failed {
                         ui.spinner();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("立即刷新").clicked() {
                             self.send(UiCommand::Refresh);
                         }
+                        if ui.add_enabled(!self.support_report.busy(), egui::Button::new("导出详细日志"))
+                            .on_hover_text("收集 USB、硬件 ID、驱动、串口、网络、检测阶段和安装日志；不包含短信正文。")
+                            .clicked()
+                        {
+                            self.support_report.request(self.exports_dir.clone(), Arc::clone(&snapshot));
+                        }
                     });
                 });
             });
         egui::TopBottomPanel::bottom("panel-footer").show(ctx, |ui| {
+            if !self.support_report.status.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    if self.support_report.busy() {
+                        ui.spinner();
+                    }
+                    ui.label(&self.support_report.status);
+                    if let Some(path) = &self.support_report.path {
+                        if ui.button("打开所在文件夹").clicked() {
+                            if let Err(error) = crate::support_report::open_report_folder(path) {
+                                self.support_report.status =
+                                    format!("打开目录失败：{error}；日志已保存，可复制路径打开");
+                            }
+                        }
+                        if ui.button("复制日志路径").clicked() {
+                            ui.output_mut(|output| output.copied_text = path.display().to_string());
+                        }
+                    }
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.label(crate::ui::meta_text(availability.freshness.text.clone()));
                 if snapshot
@@ -1090,6 +1124,24 @@ impl PanelApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.page {
                         Page::Overview => {
+                            crate::ui::driver_setup::render_guide(
+                                ui,
+                                &snapshot,
+                                now,
+                                self.language,
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("查看诊断原因").clicked() {
+                                    self.page = Page::Diagnostics;
+                                }
+                                if ui.button("驱动与连接修复").clicked() {
+                                    self.page = Page::Repairs;
+                                }
+                                if ui.button("收发短信").clicked() {
+                                    self.page = Page::Sms;
+                                }
+                            });
+                            ui.add_space(10.0);
                             ui.horizontal(|ui| {
                                 ui.selectable_value(&mut self.wireless_view, false, "连接概况");
                                 ui.selectable_value(&mut self.wireless_view, true, "无线观测");
@@ -1115,7 +1167,10 @@ impl PanelApp {
                             };
                             diagnostics::render(ui, &snapshot, self.language, &ui_side);
                         }
-                        Page::Repairs => repairs::render(ui, &snapshot, now, self.language, self),
+                        Page::Repairs => {
+                            driver_install_requested =
+                                repairs::render(ui, &snapshot, now, self.language, self);
+                        }
                         // The stored messages ride along in the snapshot as a read-only copy
                         // (SmsMessage redacts sender/body in Debug/Serialize, so nothing leaks
                         // into logs or exports).
@@ -1157,6 +1212,9 @@ impl PanelApp {
         if export_requested.load(Ordering::Acquire) {
             self.export_diagnostics(now);
         }
+        if driver_install_requested {
+            self.start_driver_install(ctx);
+        }
 
         if let Some(toast) = &self.toast {
             if now >= toast.expires_at {
@@ -1186,6 +1244,42 @@ impl PanelApp {
         // runner handles that command within one poll interval (~20 ms), so the plan is usually
         // published while the user is still reading the box.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn start_driver_install(&mut self, ctx: &egui::Context) {
+        if self.support_report.busy() || crate::ui::driver_setup::installation_busy(&self.snapshot)
+        {
+            dji4g_windows_platform::show_message_box(
+                "请等待当前任务完成",
+                "正在导出日志、发送短信或执行/确认修复。完成后再安装驱动，避免中断当前任务。",
+            );
+            return;
+        }
+        if !dji4g_windows_platform::confirm_message_box(
+            None,
+            "安装模块驱动",
+            "面板将自动退出，随后显示 Windows 管理员授权。\n仅安装硬件匹配的缺失驱动，正常接口不会强制重装。\n\n完成后重新打开独立程序，点击“立即刷新”；如提示重启，先重启电脑。\n\n现在继续？",
+        ) {
+            return;
+        }
+        let result = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe.with_file_name("dji4g-driver-setup.exe"))
+                .arg(format!("--wait-for-panel={}", std::process::id()))
+                .spawn()
+        });
+        match result {
+            Ok(_) => {
+                self.window.explicit_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                if let Some(tray) = self.tray.as_mut() {
+                    tray.acknowledge_exit();
+                }
+            }
+            Err(error) => dji4g_windows_platform::show_message_box(
+                "无法启动安装器",
+                &format!("面板保持运行，尚未安装驱动。\n{error}\n请导出详细日志。"),
+            ),
+        }
     }
 
     /// Present the native result box for the current snapshot, exactly once per finished

@@ -15,6 +15,7 @@ pub mod localization;
 pub mod logging;
 pub mod native_dialog;
 pub mod runtime;
+pub mod support_report;
 pub mod tray;
 pub mod ui;
 

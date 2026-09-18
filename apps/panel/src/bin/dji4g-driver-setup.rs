@@ -4,14 +4,22 @@ use std::{io::Write, process::Command};
 
 const SCRIPT: &str = include_str!("../../../../packaging/scripts/local-driver-install.ps1");
 
+fn panel_pid(argument: Option<&str>) -> Option<u32> {
+    argument?
+        .strip_prefix("--wait-for-panel=")?
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0 && *pid != std::process::id())
+}
+
 fn main() {
     let argument = std::env::args().nth(1);
     let check = matches!(argument.as_deref(), Some("--check" | "--plan"));
     if std::env::args().len() > 2
-        || !matches!(
+        || !(matches!(
             argument.as_deref(),
             None | Some("--check" | "--plan" | "--install")
-        )
+        ) || panel_pid(argument.as_deref()).is_some())
     {
         eprintln!("Usage: dji4g-driver-setup.exe [--check | --plan | --install]");
         std::process::exit(64);
@@ -51,6 +59,14 @@ fn run(check: bool) -> Result<String, String> {
         .ok_or("Missing executable directory")?
         .join("drivers");
     if !check && std::env::args().nth(1).as_deref() != Some("--install") {
+        if let Some(pid) = panel_pid(std::env::args().nth(1).as_deref()) {
+            dji4g_windows_platform::driver_setup::wait_for_panel_exit(
+                pid,
+                &exe.with_file_name("dji4g-panel.exe"),
+                std::time::Duration::from_secs(30),
+            )
+            .map_err(|e| e.to_string())?;
+        }
         // The elevated process repeats all validation after the native confirmation and UAC.
         let code = dji4g_windows_platform::driver_setup::elevate_current_driver_installer()
             .map_err(|e| format!("Windows 管理员授权或驱动安装启动失败：{e}"))?;
@@ -123,5 +139,27 @@ fn run(check: bool) -> Result<String, String> {
         ))
     } else {
         Err(format!("{report}{log_note}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn handoff_accepts_only_nonzero_process_id() {
+        assert_eq!(panel_pid(Some("--wait-for-panel=42")), Some(42));
+        for value in [
+            "--wait-for-panel=0",
+            "--wait-for-panel=-1",
+            "--wait-for-panel=4294967296",
+            "--wait-for-panel=42 --install",
+            "--install",
+        ] {
+            assert_eq!(panel_pid(Some(value)), None);
+        }
+        assert_eq!(
+            panel_pid(Some(&format!("--wait-for-panel={}", std::process::id()))),
+            None
+        );
     }
 }
