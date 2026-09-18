@@ -780,9 +780,8 @@ fn observe_at_session(
         parse_temperature_probe,
     );
 
-    let contexts = parse_pdp_contexts_with_activity(&contexts_response, &activity_response)
-        .map_err(|_| PortError::new(ErrorCode::VerificationFailed, "at:pdp_parse_failed"))?;
-    let primary = contexts.first();
+    let primary_context = parse_pdp_for_display(&contexts_response, &activity_response)?;
+    let primary = primary_context.as_ref();
     let firmware = revision_response.and_then(|response| {
         response
             .lines
@@ -840,6 +839,33 @@ fn observe_at_session(
         };
     }
     Ok(observation)
+}
+
+#[cfg(windows)]
+fn parse_pdp_for_display(
+    contexts: &AtResponse,
+    activity: &AtResponse,
+) -> Result<Option<dji4g_at_protocol::PdpContext>, PortError> {
+    use dji4g_at_protocol::PdpParseError;
+    match parse_pdp_contexts_with_activity(contexts, activity) {
+        Ok(contexts) => Ok(contexts.into_iter().next()),
+        Err(error @ (PdpParseError::WrongEpoch | PdpParseError::WrongCommand)) => {
+            Err(PortError::new(
+                ErrorCode::VerificationFailed,
+                match error {
+                    PdpParseError::WrongEpoch => "at:pdp_epoch_mismatch",
+                    _ => "at:pdp_wrong_command",
+                },
+            ))
+        }
+        Err(error) => {
+            // This read-only display is not APN repair: unknown PDP details do not invalidate
+            // the completed handshake or independently parsed SIM/registration observations.
+            // Keep the strict repair parser and record only a content-free typed error.
+            crate::logging::append_event(&format!("pdp_display_unavailable code={error}"));
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -1981,6 +2007,34 @@ fn system_route(result: &BoundProbeResult) -> Option<SystemRouteDto> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn pdp_display_parse_failure_does_not_fail_at_observation() {
+        use dji4g_at_protocol::{AtCommand, AtFinalCode, AtResponse};
+        let contexts = AtResponse {
+            epoch: dji4g_domain::DeviceEpoch(7),
+            command: AtCommand::PdpContexts,
+            lines: vec![r#"+CGDCONT: 1,"NONIP","example""#.into()],
+            final_code: AtFinalCode::Ok,
+        };
+        let activity = AtResponse {
+            command: AtCommand::PdpActivation,
+            lines: vec!["+CGACT: 1,1".into()],
+            ..contexts.clone()
+        };
+        assert!(
+            super::parse_pdp_for_display(&contexts, &activity)
+                .unwrap()
+                .is_none()
+        );
+        // Display fallback must not weaken the parser used for APN repair.
+        assert!(dji4g_at_protocol::parse_pdp_contexts_with_activity(&contexts, &activity).is_err());
+        let stale = AtResponse {
+            epoch: dji4g_domain::DeviceEpoch(8),
+            ..activity
+        };
+        assert!(super::parse_pdp_for_display(&contexts, &stale).is_err());
+    }
     use super::{
         ProductionAt, ProductionComposition, ProductionInventory, SystemClock, adapter_metrics,
         aggregate_stage, bound_luid, build_helper_request, endpoint_public_success,

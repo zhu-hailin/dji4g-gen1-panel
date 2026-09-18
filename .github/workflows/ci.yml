@@ -44,7 +44,9 @@ jobs:
 
       - name: driver result regression tests (no hardware changes)
         shell: pwsh
-        run: ./packaging/scripts/test-driver-completion.ps1
+        run: |
+          ./packaging/scripts/test-driver-completion.ps1
+          ./packaging/scripts/test-driver-install-command.ps1
 
       - name: release build
         run: cargo build --workspace --release --locked --target ${{ env.TARGET }}
@@ -136,14 +138,15 @@ jobs:
         shell: pwsh
         run: ./packaging/scripts/build-portable.ps1
 
-      - name: publish development release
+      - name: publish versioned release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = "dev-${{ github.run_number }}"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          $tag = "v$version"
           $assets = Get-ChildItem dist -File | Where-Object { $_.Extension -in '.zip', '.msix', '.sha256', '.json' } | ForEach-Object { $_.FullName }
-          gh release create $tag @assets --repo '${{ github.repository }}' --target '${{ github.sha }}' --prerelease --title "DJI 4G Panel · $tag" --notes-file docs/RELEASE_NOTES_20260915.md
+          gh release create $tag @assets --repo '${{ github.repository }}' --target '${{ github.sha }}' --latest --title "DJI 4G Panel $version" --notes-file "docs/RELEASE_NOTES_$version.md"
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

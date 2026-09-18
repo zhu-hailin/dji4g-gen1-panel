@@ -136,7 +136,7 @@ pub(crate) fn render(
                 path.is_file() && path.parent().is_some_and(|dir| dir.join("drivers/qcser.inf").is_file())
             });
             if bundled {
-                wrapped_label(ui, "此离线版附带本机导出的原始签名驱动。安装器会校验文件，仅处理硬件 ID 匹配的缺驱动接口；正常接口不会强制重装。");
+                wrapped_label(ui, "此离线版附带本机导出的原始签名驱动。安装器会校验文件，为缺驱动接口选择匹配包；Windows 可能同时更新其他匹配该包的设备，不强制覆盖更优驱动。");
                 wrapped_label(ui, meta_text("确认后面板会自动退出，再显示 Windows 管理员授权。安装结束后重新打开独立程序，点击“立即刷新”验证；如提示重启，请先重启电脑。"));
                 install_requested = ui.button("退出面板并安装驱动").clicked();
             } else {

@@ -90,7 +90,7 @@ $helperExe = Join-Path $repoRoot 'target\x86_64-pc-windows-msvc\release\dji4g-he
 $makeAppx = Find-KitTool 'makeappx.exe'
 $signTool = Find-KitTool 'signtool.exe'
 $target = 'x86_64-pc-windows-msvc'
-$artifactName = 'Dji4GPanel-0.1.0.0-unsigned-development-only.msix'
+$artifactName = 'Dji4GPanel-0.1.1.0-unsigned-development-only.msix'
 $assetRoot = Join-Path $repoRoot 'packaging\msix\Assets'
 
 if ($Sign -and [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
@@ -208,7 +208,7 @@ try {
         package_identity = [ordered]@{
             name = 'Dji4GPanel'
             publisher = 'CN=Dji4GPanel Development'
-            version = '0.1.0.0'
+            version = '0.1.1.0'
             processor_architecture = 'x64'
         }
         files = [ordered]@{

@@ -11,6 +11,7 @@ function Get-CimInstance {
   'matching' { [pscustomobject]@{ConfigManagerErrorCode=28;PNPDeviceID='USB\VID_2CA3&PID_4006&MI_02\TEST';HardwareID=@('USB\VID_2CA3&PID_4006&MI_02')} }
   'unmatched' { [pscustomobject]@{ConfigManagerErrorCode=28;PNPDeviceID='USB\VID_2CA3&PID_4006&MI_99\TEST';HardwareID=@('USB\VID_2CA3&PID_4006&MI_99')} }
   'disconnected' { }
+  'start-failed' { [pscustomobject]@{ConfigManagerErrorCode=10;PNPDeviceID='USB\VID_2CA3&PID_4006&MI_02\TEST';HardwareID=@('USB\VID_2CA3&PID_4006&MI_02')} }
   default { throw 'Unexpected fixture' }
  }
 }
@@ -21,6 +22,7 @@ foreach ($case in @(
  @{name='matching';code=0;expected='qcser.inf'},
  @{name='unmatched';code=1;expected='no unique matching driver'},
  @{name='disconnected';code=1;expected='No supported DJI'}
+ @{name='start-failed';code=1;expected='DRIVER_NOT_READY'}
 )) {
  $env:DJI4G_TEST_SCENARIO=$case.name
  $output=& (Join-Path $PSHOME 'pwsh.exe') -NoProfile -Command $testCommand

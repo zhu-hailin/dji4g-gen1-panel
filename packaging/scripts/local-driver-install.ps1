@@ -44,15 +44,20 @@ try {
  if ($install) {
  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
  if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator permission is required.' }
- Write-Output '大疆一代模块离线驱动安装。正常工作的接口会跳过。'
+ Write-Output '大疆一代模块离线驱动安装。Windows 将为匹配设备安装或更新驱动，不强制覆盖更优驱动。'
  Write-Output '请先关闭大疆 4G 面板。安装期间请勿发送短信或拔插模块。'
  if (Get-Process -Name 'dji4g-panel' -ErrorAction SilentlyContinue) { throw 'Close DJI 4G Panel and retry.' }
  }
  $deviceFilter = "PNPDeviceID LIKE 'USB\\VID_2CA3&PID_4006%' AND Present = TRUE"
  $devices = @(Get-CimInstance Win32_PnPEntity -Filter $deviceFilter -OperationTimeoutSec 20)
+ Write-Output ('Before install: ' + ($devices | Select-Object PNPDeviceID,Name,ConfigManagerErrorCode,HardwareID,Service | ConvertTo-Json -Depth 4 -Compress))
  if (!$devices.Count) { throw 'No supported DJI Gen1 USB device connected.' }
  $missing = @($devices | Where-Object { $_.ConfigManagerErrorCode -eq 28 })
- if (!$missing.Count) { Write-Output 'No missing-driver interfaces (Code 28). Nothing installed.'; exit 0 }
+ if (!$missing.Count) {
+  Write-Output 'No missing-driver interfaces (Code 28). Nothing installed.'
+  Assert-DriverCompletion -Devices $devices -NeedsRestart $false
+  exit 0
+ }
  $plans = @()
  foreach ($device in $missing) {
   $hardwareIds = @($device.HardwareID)
@@ -77,10 +82,12 @@ try {
  $pnputil=Join-Path ([Environment]::SystemDirectory) 'pnputil.exe'
  $needsRestart=$false
  foreach ($inf in @($plans.inf | Select-Object -Unique)) {
-  # Stage only: /install would also update unrelated matching devices.
-  & $pnputil /add-driver (Join-Path $root $inf)
+  # Staging and scanning alone do not request installation on existing devices.
+  # /install uses Windows ranking (no force); it can update other matching devices.
+  Write-Output ("Installing matching package: {0}" -f $inf)
+  & $pnputil /add-driver (Join-Path $root $inf) /install
   if ($LASTEXITCODE -eq 3010) { $needsRestart=$true }
-  elseif ($LASTEXITCODE -ne 0) { throw "DRIVER_STAGE_FAILED: $LASTEXITCODE" }
+  elseif ($LASTEXITCODE -ne 0) { throw "DRIVER_INSTALL_FAILED: $LASTEXITCODE" }
  }
  foreach ($plan in $plans) {
   & $pnputil /scan-devices /instanceid $plan.instance
@@ -89,6 +96,7 @@ try {
  }
  if ($needsRestart) { Write-Output 'Windows requested a restart. Restart before verifying device operation.' }
  $after=@(Get-CimInstance Win32_PnPEntity -Filter $deviceFilter -OperationTimeoutSec 20)
+ Write-Output ('After install: ' + ($after | Select-Object PNPDeviceID,Name,ConfigManagerErrorCode,HardwareID,Service | ConvertTo-Json -Depth 4 -Compress))
  Assert-DriverCompletion -Devices $after -NeedsRestart $needsRestart
  Write-Output 'Reopen DJI 4G Panel > Repair > First connection checks. Verify AT and network separately.'
  Write-Output 'PnP status alone does not prove SMS or Internet operation. New child interfaces may require running setup again.'

@@ -810,10 +810,6 @@ mod native {
         fmtid: DEVICE_PROPERTY_FMTID,
         pid: 14,
     };
-    const DEVPKEY_DEVICE_INSTANCE_ID: Devpropkey = Devpropkey {
-        fmtid: DEVICE_PROPERTY_FMTID,
-        pid: 256,
-    };
     const DEVPKEY_DEVICE_BUS_REPORTED_DESC: Devpropkey = Devpropkey {
         fmtid: Guid {
             data1: 0x540b947e,
@@ -1101,46 +1097,66 @@ mod native {
                 }
                 return Err(interface_error(code, "pnp:enumerate_failed"));
             }
-            let instance_id = match property_string(set.0, &info, &DEVPKEY_DEVICE_INSTANCE_ID)? {
-                Some(value) => value,
-                None => cm_device_id(info.dev_inst)?.ok_or(PlatformError {
-                    code: "pnp:instance_id_missing",
-                    os_code: None,
-                })?,
-            };
+            // Read identity without decoding optional device properties. Unrelated devices
+            // must not abort DJI discovery because of their display strings or driver metadata.
+            let instance_id = cm_device_id(info.dev_inst)?.ok_or(PlatformError {
+                code: "pnp:instance_id_missing",
+                os_code: None,
+            })?;
             let ancestry = ancestry(info.dev_inst, &instance_id)?;
-            let class = property_string(set.0, &info, &DEVPKEY_DEVICE_CLASS)?;
-            let net_cfg_instance_id = if class
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case("net"))
-                && net_paths.contains_key(&info.dev_inst)
-                && ancestry
-                    .iter()
-                    .any(|value| super::is_exact_target_identity(value))
-            {
-                registry_net_cfg_instance_id(set.0, &info)?
-            } else {
-                None
-            };
-            records.push(DeviceRecord {
-                dev_inst: info.dev_inst,
-                ancestry,
-                instance_id,
-                hardware_ids: property_multi_string(set.0, &info, &DEVPKEY_DEVICE_HARDWARE_IDS)?,
-                container_id: property_guid(set.0, &info, &DEVPKEY_DEVICE_CONTAINER_ID)?,
-                class,
-                friendly_name: property_string(set.0, &info, &DEVPKEY_DEVICE_FRIENDLY_NAME)?,
-                bus_reported_desc: property_string(
-                    set.0,
-                    &info,
-                    &DEVPKEY_DEVICE_BUS_REPORTED_DESC,
-                )?,
-                problem_code: property_u32(set.0, &info, &DEVPKEY_DEVICE_PROBLEM_CODE)?,
-                port_name: registry_port_name(set.0, &info)?,
-                net_cfg_instance_id,
-            });
+            if let Some(record) = read_related_record(&ancestry, || {
+                let class = property_string(set.0, &info, &DEVPKEY_DEVICE_CLASS)?;
+                let net_cfg_instance_id = if class
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("net"))
+                    && net_paths.contains_key(&info.dev_inst)
+                    && ancestry
+                        .iter()
+                        .any(|value| super::is_exact_target_identity(value))
+                {
+                    registry_net_cfg_instance_id(set.0, &info)?
+                } else {
+                    None
+                };
+                Ok(DeviceRecord {
+                    dev_inst: info.dev_inst,
+                    ancestry: ancestry.clone(),
+                    instance_id,
+                    hardware_ids: property_multi_string(
+                        set.0,
+                        &info,
+                        &DEVPKEY_DEVICE_HARDWARE_IDS,
+                    )?,
+                    container_id: property_guid(set.0, &info, &DEVPKEY_DEVICE_CONTAINER_ID)?,
+                    class,
+                    friendly_name: property_string(set.0, &info, &DEVPKEY_DEVICE_FRIENDLY_NAME)?,
+                    bus_reported_desc: property_string(
+                        set.0,
+                        &info,
+                        &DEVPKEY_DEVICE_BUS_REPORTED_DESC,
+                    )?,
+                    problem_code: property_u32(set.0, &info, &DEVPKEY_DEVICE_PROBLEM_CODE)?,
+                    port_name: registry_port_name(set.0, &info)?,
+                    net_cfg_instance_id,
+                })
+            })? {
+                records.push(record);
+            }
         }
         Ok(records)
+    }
+
+    fn read_related_record<T>(
+        ancestry: &[String],
+        read: impl FnOnce() -> InventoryResult<T>,
+    ) -> InventoryResult<Option<T>> {
+        if !ancestry
+            .iter()
+            .any(|id| super::is_exact_target_identity(id))
+        {
+            return Ok(None);
+        }
+        read().map(Some)
     }
 
     fn enumerate_interface_paths(class_guid: &Guid) -> InventoryResult<HashMap<Devinst, String>> {
@@ -1378,7 +1394,8 @@ mod native {
         let Some(value) = property_bytes(set, info, key)? else {
             return Ok(None);
         };
-        decode_property_string(value.property_type, &value.bytes).map(Some)
+        decode_property_string(value.property_type, &value.bytes)
+            .map(|text| (!text.is_empty()).then_some(text))
     }
 
     fn property_multi_string(
@@ -1484,7 +1501,7 @@ mod native {
                 os_code: None,
             });
         };
-        if content.is_empty() || content.contains(&0) {
+        if content.contains(&0) {
             return Err(PlatformError {
                 code: "pnp:property_invalid",
                 os_code: None,
@@ -1897,6 +1914,37 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn null_terminated_empty_property_string_is_valid() {
+            assert_eq!(
+                decode_property_string(DEVPROP_TYPE_STRING, &[0, 0]).unwrap(),
+                ""
+            );
+            for bytes in [&[][..], &[65, 0][..], &[65, 0, 0, 0, 66, 0, 0, 0][..]] {
+                assert!(decode_property_string(DEVPROP_TYPE_STRING, bytes).is_err());
+            }
+        }
+
+        #[test]
+        fn unrelated_device_properties_are_never_read() {
+            for id in [r"ROOT\RADMIN\0000", r"USB\VID_2CA3&PID_40060\OTHER"] {
+                let result: InventoryResult<Option<()>> = read_related_record(&[id.into()], || {
+                    panic!("unrelated property reader must not run")
+                });
+                assert_eq!(result.unwrap(), None);
+            }
+            let ancestry = vec![r"OTHER\CHILD".into(), r"USB\VID_2CA3&PID_4006\ROOT".into()];
+            assert_eq!(read_related_record(&ancestry, || Ok(6)).unwrap(), Some(6));
+            let error = read_related_record::<()>(&ancestry, || {
+                Err(PlatformError {
+                    code: "pnp:property_invalid",
+                    os_code: None,
+                })
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "pnp:property_invalid");
+        }
 
         #[test]
         fn optional_property_absence_is_not_an_inventory_failure() {
