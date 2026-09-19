@@ -176,6 +176,7 @@ fn base_snapshot() -> ControllerSnapshot {
         sms_send: None,
         sms_refresh_pending: false,
         sms_inbox_failure: None,
+        device_tools: Default::default(),
     }
 }
 

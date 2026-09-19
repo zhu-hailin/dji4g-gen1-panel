@@ -17,16 +17,17 @@ use std::{
 use dji4g_application::{
     ActionExecutor, ActionPreconditions, AdapterContext, AdapterMetrics, AdapterObservationDto,
     AdapterPort, AdapterStateDto, AtControlAvailability, AtObservation, AtPort, Clock,
-    DefaultRouteDto, DeviceEpoch, DevicePresenceDto, ExecutionReceipt, ExecutionReceiptOutcome,
-    FailureCode, HotspotControl, HotspotObservation, InventoryObservation, InventoryPort,
-    MonitorPorts, MonoTime, NetworkProbePort, PortError, PortFuture, PrivilegedExecutor,
-    ProbeObservationDto, ProbeStageDto, SmsListing, SmsPort, SmsSendReceipt, SmsSendResult,
-    StableCode, SystemRouteDto, TargetContext, ValidatedActionToken, mask_recipient,
+    DefaultRouteDto, DeviceEpoch, DevicePresenceDto, DeviceToolsPort, ExecutionReceipt,
+    ExecutionReceiptOutcome, FailureCode, HotspotControl, HotspotObservation, InventoryObservation,
+    InventoryPort, MonitorPorts, MonoTime, NetworkProbePort, PortError, PortFuture,
+    PrivilegedExecutor, ProbeObservationDto, ProbeStageDto, SmsListing, SmsPort, SmsSendReceipt,
+    SmsSendResult, StableCode, SystemRouteDto, TargetContext, ToolControl, ToolOperation,
+    ToolOutcome, ToolReceipt, ToolRequest, ToolTranscript, ValidatedActionToken, mask_recipient,
 };
 use dji4g_at_protocol::{
     Apn, AtCommand, AtFinalCode, AtResponse, PdpContextId, PdpContextState, ProtocolErrorKind,
-    VerifiedUsbNetProfile, parse_cnum_lines, parse_iccid_line, parse_pdp_contexts_with_activity,
-    parse_qtemp_lines, parse_serving_cell_line,
+    ToolParseError, ToolWireRequest, VerifiedUsbNetProfile, parse_cnum_lines, parse_iccid_line,
+    parse_pdp_contexts_with_activity, parse_qtemp_lines, parse_serving_cell_line,
 };
 use dji4g_domain::{
     ActionKind, AdapterBinding, AfterStateHash, DefaultRouteOwner, DnsProfile, ErrorCode,
@@ -42,10 +43,11 @@ use dji4g_ipc::{
 use dji4g_windows_platform::{
     AdapterIdentity, AdapterObservation, AddressFamily, BoundProbeResult, DjiDevice,
     EndpointAttempt, InterfaceMetrics, PlatformError, PrivilegeError, ProbePolicy, ProbeStage,
-    RepairAction, RepairError, SmsRecord, TlsEvidence, TrustedHelper, WindowsAdapterResolver,
-    WindowsDeviceInventory, WindowsHotspotControl, WindowsNativeRepairBackend, WindowsNetworkProbe,
-    WindowsRepairExecutor, launch_elevated_helper, probe_at_port, read_interface_metrics,
-    select_at_port_verified, sms_delete, sms_list, sms_query_pdu_mode, sms_read, sms_set_pdu_mode,
+    RepairAction, RepairError, SmsRecord, TlsEvidence, ToolExchangeOutcome, TrustedHelper,
+    UnansweredReason, WindowsAdapterResolver, WindowsDeviceInventory, WindowsHotspotControl,
+    WindowsNativeRepairBackend, WindowsNetworkProbe, WindowsRepairExecutor, launch_elevated_helper,
+    probe_at_port, read_interface_metrics, select_at_port_verified, sms_delete, sms_list,
+    sms_query_pdu_mode, sms_read, sms_set_pdu_mode, tool_exchange,
 };
 
 /// Maximum helper request lifetime, bounded by `dji4g_ipc::MAX_OPERATION_LIFETIME`.  The window
@@ -513,6 +515,162 @@ impl SmsPort for ProductionSms {
         })
     }
 }
+/// Production device-tool port.
+///
+/// Each request opens its own short-lived, handshake-verified AT session on the port the inventory
+/// proves belongs to the target, writes the validated line once, and gives the worker back. The
+/// request's frozen context is re-checked against the live target before anything is written: a
+/// task that started against one module must never be completed against another.
+pub struct ProductionDeviceTools {
+    inventory: Arc<ProductionInventory>,
+}
+
+impl DeviceToolsPort for ProductionDeviceTools {
+    fn execute(
+        &self,
+        target: &TargetContext,
+        request: ToolRequest,
+        control: ToolControl,
+    ) -> PortFuture<'_, Result<ToolReceipt, PortError>> {
+        let target = target.clone();
+        Box::pin(async move { self.run(&target, request, control) })
+    }
+}
+
+impl ProductionDeviceTools {
+    fn run(
+        &self,
+        target: &TargetContext,
+        request: ToolRequest,
+        control: ToolControl,
+    ) -> Result<ToolReceipt, PortError> {
+        // The whole task is bound to the device the context names, and the port the target proves.
+        if request.context.device_epoch != target.epoch()
+            || request.context.identity != *target.identity()
+        {
+            return Ok(context_changed_receipt(&request));
+        }
+        if let Some(known) = target.at_port() {
+            if request.context.at_port != known {
+                return Ok(context_changed_receipt(&request));
+            }
+        }
+        let started = std::time::Instant::now();
+        let wire = match &request.operation {
+            ToolOperation::Read(id) => ToolWireRequest::from_read(*id),
+            ToolOperation::Expert(line) => ToolWireRequest::from_expert(line.clone()),
+            // The runner expands a sweep into individual reads before it reaches a port; a bulk
+            // request here is an internal wiring error, not something to guess about.
+            ToolOperation::ProbeAll => {
+                return Err(PortError::new(
+                    ErrorCode::Internal,
+                    "device_tools:probe_not_expanded",
+                ));
+            }
+        };
+        let device = current_device(&self.inventory, target)?;
+        let exchange = tool_exchange(&device, target.epoch(), wire, control.clone())
+            .map_err(map_platform_error)?;
+        let elapsed = started.elapsed();
+        let operation = request.operation.kind();
+        let receipt = match exchange.outcome {
+            ToolExchangeOutcome::Answered(response) => ToolReceipt {
+                id: request.id,
+                context: request.context.clone(),
+                operation,
+                outcome: ToolOutcome::from_final_code(&response.final_code),
+                elapsed,
+                transcript: Arc::new(dji4g_application::transcript_from_response(&response)),
+                saw_final_code: true,
+                payload_lines: response.lines.len(),
+            },
+            ToolExchangeOutcome::Malformed(error) => ToolReceipt {
+                id: request.id,
+                context: request.context.clone(),
+                operation,
+                outcome: malformed_outcome(error),
+                elapsed,
+                transcript: Arc::new(ToolTranscript::new()),
+                saw_final_code: false,
+                payload_lines: 0,
+            },
+            ToolExchangeOutcome::Unanswered { wrote, reason } => ToolReceipt {
+                id: request.id,
+                context: request.context.clone(),
+                operation,
+                outcome: unanswered_outcome(wrote, reason),
+                elapsed,
+                transcript: Arc::new(ToolTranscript::new()),
+                saw_final_code: false,
+                payload_lines: 0,
+            },
+        };
+        Ok(receipt)
+    }
+}
+
+/// A request whose device context no longer matches the live target. Nothing was written.
+fn context_changed_receipt(request: &ToolRequest) -> ToolReceipt {
+    ToolReceipt {
+        id: request.id,
+        context: request.context.clone(),
+        operation: request.operation.kind(),
+        outcome: ToolOutcome::ContextChanged,
+        elapsed: std::time::Duration::ZERO,
+        transcript: Arc::new(ToolTranscript::new()),
+        saw_final_code: false,
+        payload_lines: 0,
+    }
+}
+
+/// A response this tool path cannot read as one text exchange.
+///
+/// The request was written but no final code was parsed. A prompt, CONNECT or broken response
+/// cannot prove a refusal or that the command had no effect. The session is retired, without retry.
+fn malformed_outcome(error: ToolParseError) -> ToolOutcome {
+    match error {
+        ToolParseError::UnsupportedInteraction
+        | ToolParseError::LineTooLong
+        | ToolParseError::ResponseTooLarge
+        | ToolParseError::TooManyLines
+        | ToolParseError::UnexpectedData => ToolOutcome::OutcomeUnknown,
+    }
+}
+
+#[cfg(test)]
+mod tool_outcome_regressions {
+    use super::*;
+
+    #[test]
+    fn malformed_response_without_a_final_code_does_not_claim_a_known_effect() {
+        for error in [
+            ToolParseError::UnsupportedInteraction,
+            ToolParseError::LineTooLong,
+            ToolParseError::ResponseTooLarge,
+            ToolParseError::TooManyLines,
+            ToolParseError::UnexpectedData,
+        ] {
+            assert_eq!(malformed_outcome(error), ToolOutcome::OutcomeUnknown);
+        }
+    }
+}
+
+/// No usable answer arrived. Whether anything was written decides between "nothing happened" and
+/// "the effect is unknown", and the second case is never retried automatically.
+fn unanswered_outcome(wrote: bool, reason: UnansweredReason) -> ToolOutcome {
+    if reason == UnansweredReason::SessionUnavailable && !wrote {
+        return ToolOutcome::TransportFailure;
+    }
+    if wrote {
+        return ToolOutcome::OutcomeUnknown;
+    }
+    match reason {
+        UnansweredReason::Cancelled => ToolOutcome::CancelledBeforeWrite,
+        UnansweredReason::Deadline | UnansweredReason::Transport => ToolOutcome::TransportFailure,
+        UnansweredReason::SessionUnavailable => ToolOutcome::TransportFailure,
+    }
+}
+
 /// Map one platform PDU-mode storage record into the domain message.
 ///
 /// The PDU itself carries no read state, so the `CMGL`/`CMGR` `<stat>` index is the only
@@ -946,6 +1104,8 @@ fn map_feature_failure(error: &dji4g_windows_platform::ActorError) -> FeatureSta
         | dji4g_windows_platform::ActorError::LeaseBusy
         | dji4g_windows_platform::ActorError::CloseTimeout
         | dji4g_windows_platform::ActorError::OsIo { .. } => FeatureStatus::TransportFailure,
+        // The feature probe never issues a tool transaction; the arm keeps the mapping total.
+        dji4g_windows_platform::ActorError::Tool(_) => FeatureStatus::FormatMismatch,
     }
 }
 
@@ -1054,6 +1214,7 @@ fn map_actor_error(error: &dji4g_windows_platform::ActorError) -> PortError {
             | dji4g_windows_platform::ActorError::Io(_) => ErrorCode::CapabilityUnavailable,
             dji4g_windows_platform::ActorError::FinalCode(_) => ErrorCode::VerificationFailed,
             dji4g_windows_platform::ActorError::Protocol(_) => ErrorCode::VerificationFailed,
+            dji4g_windows_platform::ActorError::Tool(_) => ErrorCode::VerificationFailed,
         },
     };
     PortError::new(category, error.code())
@@ -1276,6 +1437,9 @@ impl ProductionComposition {
                 control: WindowsHotspotControl::new(),
             })),
             sms: Some(Arc::new(ProductionSms {
+                inventory: Arc::clone(&inventory),
+            })),
+            device_tools: Some(Arc::new(ProductionDeviceTools {
                 inventory: Arc::clone(&inventory),
             })),
         };

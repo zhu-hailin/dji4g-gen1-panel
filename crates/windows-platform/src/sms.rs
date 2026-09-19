@@ -281,6 +281,8 @@ fn classify_send_outcome(
         Err(ActorError::QueueFull | ActorError::Closed | ActorError::LeaseBusy) => {
             Err(platform_error("sms:send_failed"))
         }
+        // The SMS path never issues a tool transaction; the arm keeps the mapping total.
+        Err(ActorError::Tool(_)) => Err(platform_error("sms:send_failed")),
     }
 }
 
@@ -434,6 +436,8 @@ fn map_actor_error(error: &ActorError) -> PlatformError {
             ActorError::FinalCode(AtFinalCode::Ok) => "sms:internal",
             ActorError::FinalCode(_) => "sms:verification_failed",
             ActorError::Protocol(_) => "sms:verification_failed",
+            // SMS never issues a tool transaction; the arm keeps the mapping total.
+            ActorError::Tool(_) => "sms:internal",
             ActorError::QueueFull | ActorError::Closed | ActorError::Io(_) => "sms:internal",
         },
     };

@@ -26,8 +26,8 @@ use crate::tray::{
     TrayBackend, TrayCommand, TrayController, TrayError, WindowState, off_ui_command,
 };
 use crate::ui::{
-    StatusTone, availability_reason_with_diagnostics, availability_vm, diagnostics, overview,
-    repairs, scale, settings, sms, wrapped_label,
+    StatusTone, availability_reason_with_diagnostics, availability_vm, device_tools, diagnostics,
+    overview, repairs, scale, settings, sms, wrapped_label,
 };
 use dji4g_domain::{ActionKind, Availability, DisruptionLevel, RiskLevel};
 
@@ -37,14 +37,16 @@ pub enum Page {
     Diagnostics,
     Repairs,
     Sms,
+    DeviceTools,
     Settings,
 }
 
 /// The ordered navigation tabs. Kept as one closed list so the strip and its tests can never
 /// disagree about which pages exist.
-pub(crate) const NAV_ITEMS: [(Page, TextKey); 5] = [
+pub(crate) const NAV_ITEMS: [(Page, TextKey); 6] = [
     (Page::Overview, TextKey::NavOverview),
     (Page::Sms, TextKey::NavSms),
+    (Page::DeviceTools, TextKey::NavDeviceTools),
     (Page::Diagnostics, TextKey::NavDiagnostics),
     (Page::Repairs, TextKey::NavRepairs),
     (Page::Settings, TextKey::NavSettings),
@@ -340,6 +342,9 @@ pub struct PanelApp {
     language: Language,
     page: Page,
     sms_compose: sms::SmsComposeState,
+    /// UI-local device-tools terminal state (expert unlock, drafts, history visibility). Never
+    /// persisted; the page resets it whenever the device or SIM context changes.
+    device_tools: device_tools::DeviceToolsState,
     wireless_view: bool,
     wireless_history: crate::ui::wireless::WirelessHistory,
     toast: Option<ToastState>,
@@ -417,6 +422,7 @@ impl PanelApp {
             language,
             page: Page::Overview,
             sms_compose: sms::SmsComposeState::default(),
+            device_tools: device_tools::DeviceToolsState::default(),
             wireless_view: false,
             wireless_history: crate::ui::wireless::WirelessHistory::default(),
             toast: None,
@@ -463,6 +469,7 @@ impl PanelApp {
             language,
             page: Page::Overview,
             sms_compose: sms::SmsComposeState::default(),
+            device_tools: device_tools::DeviceToolsState::default(),
             wireless_view: false,
             wireless_history: crate::ui::wireless::WirelessHistory::default(),
             toast: None,
@@ -658,10 +665,17 @@ impl PanelApp {
         self.wireless_view = true;
         self.wireless_history.review_fixture();
     }
+    /// Aim the SMS page at one inbox/outgoing tab and one selection. `selected` is the module
+    /// index for an incoming row and the local transaction id for an outgoing record.
     #[cfg(debug_assertions)]
-    pub fn set_review_sms(&mut self, outgoing: bool) {
+    pub fn set_review_sms_view(&mut self, outgoing: bool, selected: Option<u32>) {
         self.sms_compose.outgoing = outgoing;
-        self.sms_compose.selected = Some((outgoing, if outgoing { 2 } else { 1 }));
+        self.sms_compose.selected = selected.map(|index| (outgoing, index));
+    }
+    /// Type a search string so the "no results" state can be captured.
+    #[cfg(debug_assertions)]
+    pub fn set_review_sms_search(&mut self, query: &str) {
+        self.sms_compose.search = query.to_owned();
     }
     #[cfg(debug_assertions)]
     pub fn set_review_sms_editor(&mut self) {
@@ -670,6 +684,12 @@ impl PanelApp {
     #[cfg(debug_assertions)]
     pub fn set_review_sms_confirmation(&mut self) {
         self.sms_compose.review_confirmation();
+    }
+    /// Aim the device-tools page at one tab (0 预设 / 1 查询 / 2 专家) for hardware-free review.
+    #[cfg(debug_assertions)]
+    pub fn set_review_device_tools(&mut self, tab: usize) {
+        self.page = Page::DeviceTools;
+        self.device_tools.set_review_tab(tab);
     }
 
     /// Number of rate samples currently retained for the overview chart.
@@ -1118,95 +1138,134 @@ impl PanelApp {
                         RichText::new(&warning.text).color(StatusTone::Negative.color()),
                     );
                 }
-                egui::ScrollArea::vertical()
-                    .drag_to_scroll(false)
-                    .id_salt(("panel-page-scroll", self.page as u8))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match self.page {
-                        Page::Overview => {
-                            crate::ui::driver_setup::render_guide(
+                // The SMS page owns a bounded workspace: its list and its reader scroll
+                // independently inside the height the page really has, so it must not sit inside
+                // the page-wide scroll area as well (two nested scroll areas would fight over the
+                // wheel and the inner one used to be capped). Only a window too short to hold a
+                // usable workspace keeps the old whole-page scroll behaviour.
+                let sms_bounded = self.page == Page::Sms
+                    && ui.available_height() >= crate::ui::sms_layout::MIN_BOUNDED_HEIGHT;
+                if sms_bounded {
+                    sms::render(
+                        ui,
+                        &snapshot,
+                        &snapshot.sms_messages,
+                        self.language,
+                        self.commands.as_ref(),
+                        &mut self.sms_compose,
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .drag_to_scroll(false)
+                        .id_salt(("panel-page-scroll", self.page as u8))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match self.page {
+                            Page::Overview => {
+                                crate::ui::driver_setup::render_guide(
+                                    ui,
+                                    &snapshot,
+                                    now,
+                                    self.language,
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("查看诊断原因").clicked() {
+                                        self.page = Page::Diagnostics;
+                                    }
+                                    if ui.button("驱动与连接修复").clicked() {
+                                        self.page = Page::Repairs;
+                                    }
+                                    if ui.button("收发短信").clicked() {
+                                        self.page = Page::Sms;
+                                    }
+                                });
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut self.wireless_view, false, "连接概况");
+                                    ui.selectable_value(&mut self.wireless_view, true, "无线观测");
+                                });
+                                ui.add_space(10.0);
+                                if self.wireless_view {
+                                    crate::ui::wireless::render(
+                                        ui,
+                                        &snapshot,
+                                        &self.wireless_history,
+                                    );
+                                } else {
+                                    overview::render(
+                                        ui,
+                                        &snapshot,
+                                        self.language,
+                                        self,
+                                        &self.rate_history,
+                                        probe_view.as_ref(),
+                                    );
+                                }
+                            }
+                            Page::Diagnostics => {
+                                let ui_side = UiSideCommands {
+                                    inner: Arc::clone(&self.commands),
+                                    export_requested: Arc::clone(&export_requested),
+                                };
+                                diagnostics::render(ui, &snapshot, self.language, &ui_side);
+                            }
+                            Page::Repairs => {
+                                driver_install_requested =
+                                    repairs::render(ui, &snapshot, now, self.language, self);
+                            }
+                            // The stored messages ride along in the snapshot as a read-only copy
+                            // (SmsMessage redacts sender/body in Debug/Serialize, so nothing leaks
+                            // into logs or exports).
+                            Page::Sms => sms::render(
                                 ui,
                                 &snapshot,
-                                now,
+                                &snapshot.sms_messages,
                                 self.language,
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("查看诊断原因").clicked() {
-                                    self.page = Page::Diagnostics;
-                                }
-                                if ui.button("驱动与连接修复").clicked() {
-                                    self.page = Page::Repairs;
-                                }
-                                if ui.button("收发短信").clicked() {
-                                    self.page = Page::Sms;
-                                }
-                            });
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(&mut self.wireless_view, false, "连接概况");
-                                ui.selectable_value(&mut self.wireless_view, true, "无线观测");
-                            });
-                            ui.add_space(10.0);
-                            if self.wireless_view {
-                                crate::ui::wireless::render(ui, &snapshot, &self.wireless_history);
-                            } else {
-                                overview::render(
+                                self.commands.as_ref(),
+                                &mut self.sms_compose,
+                            ),
+                            Page::DeviceTools => {
+                                // The page needs the panel's confirmation entry point and its own
+                                // mutable state at once; moving the state out keeps the two
+                                // borrows disjoint.
+                                let mut tools_state = std::mem::take(&mut self.device_tools);
+                                device_tools::render(
                                     ui,
                                     &snapshot,
                                     self.language,
                                     self,
-                                    &self.rate_history,
-                                    probe_view.as_ref(),
+                                    &mut tools_state,
                                 );
+                                self.device_tools = tools_state;
                             }
-                        }
-                        Page::Diagnostics => {
-                            let ui_side = UiSideCommands {
-                                inner: Arc::clone(&self.commands),
-                                export_requested: Arc::clone(&export_requested),
-                            };
-                            diagnostics::render(ui, &snapshot, self.language, &ui_side);
-                        }
-                        Page::Repairs => {
-                            driver_install_requested =
-                                repairs::render(ui, &snapshot, now, self.language, self);
-                        }
-                        // The stored messages ride along in the snapshot as a read-only copy
-                        // (SmsMessage redacts sender/body in Debug/Serialize, so nothing leaks
-                        // into logs or exports).
-                        Page::Sms => sms::render(
-                            ui,
-                            &snapshot,
-                            &snapshot.sms_messages,
-                            self.language,
-                            self.commands.as_ref(),
-                            &mut self.sms_compose,
-                        ),
-                        Page::Settings => {
-                            let _ = settings::render(
-                                ui,
-                                &snapshot,
-                                self.language,
-                                self.commands.as_ref(),
-                            );
-                            ui.separator();
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("使用说明").clicked() {
-                                    show_help_dialog();
-                                }
-                                if ui.button("关于本应用").clicked() {
-                                    show_about_dialog();
-                                }
-                                if ui.button("退出应用").clicked() {
-                                    self.window.explicit_exit = true;
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                    if let Some(tray) = self.tray.as_mut() {
-                                        tray.acknowledge_exit();
+                            Page::Settings => {
+                                let _ = settings::render(
+                                    ui,
+                                    &snapshot,
+                                    self.language,
+                                    self.commands.as_ref(),
+                                );
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("使用说明").clicked() {
+                                        show_help_dialog();
                                     }
-                                }
-                            });
-                        }
-                    });
+                                    if ui.button("关于本应用").clicked() {
+                                        show_about_dialog();
+                                    }
+                                    if ui.button("重启面板").clicked() {
+                                        self.start_panel_restart(ctx);
+                                    }
+                                    if ui.button("退出应用").clicked() {
+                                        self.window.explicit_exit = true;
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        if let Some(tray) = self.tray.as_mut() {
+                                            tray.acknowledge_exit();
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                }
             });
 
         if export_requested.load(Ordering::Acquire) {
@@ -1244,6 +1303,75 @@ impl PanelApp {
         // runner handles that command within one poll interval (~20 ms), so the plan is usually
         // published while the user is still reading the box.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    /// Whether a serial task or an unconfirmed plan is in flight right now.
+    ///
+    /// Restarting or exiting in the middle of one would abandon a worker that still owns the
+    /// port, so the button refuses instead of interrupting it.
+    fn serial_work_busy(&self) -> bool {
+        let snapshot = &self.snapshot;
+        snapshot
+            .sms_send
+            .as_ref()
+            .is_some_and(|send| send.is_active())
+            || snapshot.device_tools.busy()
+            || snapshot
+                .operation
+                .as_ref()
+                .is_some_and(|operation| matches!(operation.state, OperationState::Running { .. }))
+            || snapshot.prepared_action.as_ref().is_some_and(|prepared| {
+                matches!(
+                    prepared.state,
+                    dji4g_application::PreparedActionState::AwaitingConfirmation
+                )
+            })
+    }
+
+    /// Restart the panel.
+    ///
+    /// The replacement is a sibling process of this same executable that waits for this one to
+    /// release the single-instance mutex (see `--restart-after`), so the restart cannot degrade
+    /// into a second copy fighting the first. This process then leaves through the ordinary
+    /// graceful path: the tray worker is acknowledged and the controller runner is dropped, which
+    /// cancels any tool transaction and lets the serial worker give its port lease back.
+    fn start_panel_restart(&mut self, ctx: &egui::Context) {
+        if self.serial_work_busy() {
+            dji4g_windows_platform::show_message_box(
+                "请等待当前任务完成",
+                "正在发送短信、执行修复或运行设备工具。完成或取消后再重启面板，避免中断当前任务。",
+            );
+            return;
+        }
+        if !dji4g_windows_platform::confirm_message_box(
+            None,
+            "重启面板",
+            "面板将关闭并立即重新启动。\n设备会在重启后重新识别；正在填写但未发送的短信草稿会丢失。\n\n现在重启？",
+        ) {
+            return;
+        }
+        let spawned = std::env::current_exe().and_then(|exe| {
+            let directory = exe.parent().map(std::path::Path::to_path_buf);
+            let mut command = std::process::Command::new(&exe);
+            command.arg(format!("--restart-after={}", std::process::id()));
+            if let Some(directory) = directory {
+                command.current_dir(directory);
+            }
+            command.spawn()
+        });
+        match spawned {
+            Ok(_) => {
+                self.window.explicit_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                if let Some(tray) = self.tray.as_mut() {
+                    tray.acknowledge_exit();
+                }
+            }
+            Err(error) => dji4g_windows_platform::show_message_box(
+                "无法重启面板",
+                &format!("面板保持运行，未重启。\n{error}\n可先退出，再手动打开程序。"),
+            ),
+        }
     }
 
     fn start_driver_install(&mut self, ctx: &egui::Context) {

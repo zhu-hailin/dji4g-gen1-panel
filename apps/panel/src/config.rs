@@ -557,6 +557,10 @@ fn decode_config(bytes: &[u8]) -> Result<ConfigV1, &'static str> {
 pub struct StartupOptions {
     pub autostart: bool,
     pub demo: Option<String>,
+    /// Set by the in-app restart button: the panel this process replaces. The new process waits
+    /// for it to release the single-instance mutex before taking over, so a restart never ends up
+    /// as "activate the instance that is already running".
+    pub restart_after: Option<u32>,
 }
 
 impl StartupOptions {
@@ -571,6 +575,17 @@ impl StartupOptions {
         while index < values.len() {
             match values[index].as_str() {
                 "--autostart" => result.autostart = true,
+                value if value.starts_with("--restart-after=") => {
+                    let raw = &value["--restart-after=".len()..];
+                    // A pid that is not a plain positive integer would make the handoff wait on
+                    // the wrong process (or on nothing), so it is refused outright.
+                    let pid = raw
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|pid| *pid != 0)
+                        .ok_or_else(|| StartupParseError::new("config:startup_invalid_pid"))?;
+                    result.restart_after = Some(pid);
+                }
                 "--demo" => {
                     index += 1;
                     let Some(value) = values.get(index) else {

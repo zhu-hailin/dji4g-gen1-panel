@@ -751,3 +751,208 @@ fn controlled_prompt_deadline_actively_cancels_blocked_native_read() {
         assert_eq!(control.submission_possible(), allow_body);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Device-tool transactions
+// ---------------------------------------------------------------------------------------------
+
+mod tool_transactions {
+    use super::*;
+    use dji4g_at_protocol::{
+        ToolParseError, ToolReadId, ToolResponse, ToolWireRequest, ValidatedToolLine,
+    };
+    use dji4g_domain::ToolTransactionControl;
+
+    fn expert(text: &str) -> ToolWireRequest {
+        ToolWireRequest::from_expert(ValidatedToolLine::parse(text).expect("valid line"))
+    }
+
+    fn receive(
+        actor: &AtSessionActor,
+        request: ToolWireRequest,
+        control: ToolTransactionControl,
+    ) -> Result<ToolResponse, ActorError> {
+        actor
+            .try_execute_tool(request, control)
+            .expect("queued")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reply within the test budget")
+    }
+
+    #[test]
+    fn a_whitelisted_read_writes_once_and_returns_the_parsed_response() {
+        let (actor, state) = actor_with_reads([Ok(b"+CSQ: 21,0\r\n\r\nOK\r\n".to_vec())]);
+        let response = receive(
+            &actor,
+            ToolWireRequest::from_read(ToolReadId::SignalQuality),
+            ToolTransactionControl::new(Duration::from_secs(5)),
+        )
+        .expect("the module answered");
+        assert_eq!(response.final_code, AtFinalCode::Ok);
+        assert_eq!(response.lines, vec!["+CSQ: 21,0"]);
+        // Exactly one write: a query is not retried, not even a read-only one.
+        assert_eq!(state.lock().unwrap().writes.len(), 1);
+        assert_eq!(
+            state.lock().unwrap().writes[0],
+            b"AT+CSQ\r".to_vec(),
+            "the wire form is the validated line plus one CR"
+        );
+    }
+
+    #[test]
+    fn a_module_refusal_comes_back_as_a_response_not_an_actor_error() {
+        let (actor, _) = actor_with_reads([Ok(b"AT+VENDOR?\r\nERROR\r\n".to_vec())]);
+        let response = receive(
+            &actor,
+            expert("AT+VENDOR?"),
+            ToolTransactionControl::new(Duration::from_secs(5)),
+        )
+        .expect("a refusal is still an answer");
+        assert_eq!(response.final_code, AtFinalCode::Error);
+        assert!(response.lines.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_is_refused_and_retires_the_actor() {
+        let (actor, state) = actor_with_reads([Ok(b"AT+VENDOR=1\r\n> ".to_vec())]);
+        let error = receive(
+            &actor,
+            expert("AT+VENDOR=1"),
+            ToolTransactionControl::new(Duration::from_secs(5)),
+        )
+        .expect_err("a prompt ends the transaction");
+        assert_eq!(
+            error,
+            ActorError::Tool(ToolParseError::UnsupportedInteraction)
+        );
+        // Nothing else was written: no body, no Ctrl-Z, no recovery sequence.
+        assert_eq!(state.lock().unwrap().writes.len(), 1);
+        // The actor is retired, so a late `OK` cannot be read as the next command's answer.
+        let second = actor.try_execute_tool(
+            expert("AT+VENDOR?"),
+            ToolTransactionControl::new(Duration::from_secs(5)),
+        );
+        assert!(second.is_err(), "a retired actor must refuse new work");
+    }
+
+    #[test]
+    fn a_timeout_retires_the_actor_so_a_late_ok_cannot_satisfy_the_next_request() {
+        // The module never answers the first command; the second command would have been answered
+        // with the first command's late OK if the actor were reused.
+        let (actor, state) = actor_with_state(FakeState {
+            quiet_when_empty: true,
+            ..FakeState::default()
+        });
+        let control = ToolTransactionControl::new(Duration::from_millis(40));
+        let error = receive(
+            &actor,
+            ToolWireRequest::from_read(ToolReadId::SignalQuality),
+            control,
+        )
+        .expect_err("no answer arrives");
+        assert!(
+            matches!(error, ActorError::Io(io::ErrorKind::TimedOut)),
+            "{error:?}"
+        );
+        assert_eq!(state.lock().unwrap().writes.len(), 1);
+        assert!(
+            actor
+                .try_execute_tool(
+                    expert("AT+VENDOR?"),
+                    ToolTransactionControl::new(Duration::from_secs(5)),
+                )
+                .is_err(),
+            "the next request must not run on the retired actor"
+        );
+    }
+
+    #[test]
+    fn a_write_failure_marks_the_attempt_and_never_resends() {
+        let (actor, state) = actor_with_state(FakeState {
+            fail_write_at: Some(0),
+            ..FakeState::default()
+        });
+        let control = ToolTransactionControl::new(Duration::from_secs(5));
+        let error =
+            receive(&actor, expert("AT+VENDOR=1"), control.clone()).expect_err("the write failed");
+        assert_eq!(error, ActorError::Io(io::ErrorKind::BrokenPipe));
+        // The attempt is recorded even though nothing reached the module: a partial write already
+        // changed the module's input, so the caller must not classify it as "nothing happened".
+        assert!(control.write_attempted());
+        assert_eq!(state.lock().unwrap().write_attempts, 1);
+        assert!(state.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_transaction_that_never_wrote_is_not_marked_as_a_write_attempt() {
+        let (actor, state) = actor_with_state(FakeState {
+            quiet_when_empty: true,
+            ..FakeState::default()
+        });
+        let control = ToolTransactionControl::new(Duration::from_secs(5));
+        control.cancel();
+        let error = receive(
+            &actor,
+            ToolWireRequest::from_read(ToolReadId::SignalQuality),
+            control.clone(),
+        )
+        .expect_err("cancelled before the write");
+        assert_eq!(error, ActorError::Io(io::ErrorKind::Interrupted));
+        assert!(!control.write_attempted());
+        assert_eq!(state.lock().unwrap().write_attempts, 0);
+    }
+
+    #[test]
+    fn cancelling_after_the_write_stops_the_wait_without_a_second_write() {
+        let (actor, state) = actor_with_state(FakeState {
+            quiet_when_empty: true,
+            ..FakeState::default()
+        });
+        let control = ToolTransactionControl::new(Duration::from_secs(5));
+        let receiver = actor
+            .try_execute_tool(expert("AT+VENDOR=1"), control.clone())
+            .expect("queued");
+        // Wait until the command is on the wire, then cancel: the module has already seen it, so
+        // the caller has to treat the effect as unknown, but nothing may be sent a second time.
+        for _ in 0..400 {
+            if state.lock().unwrap().write_attempts >= 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.lock().unwrap().write_attempts, 1);
+        control.cancel();
+        let error = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reply")
+            .expect_err("cancelled");
+        assert_eq!(error, ActorError::Io(io::ErrorKind::Interrupted));
+        assert!(control.write_attempted());
+        assert_eq!(state.lock().unwrap().write_attempts, 1);
+    }
+
+    #[test]
+    fn a_failed_tool_transaction_does_not_disturb_the_monitoring_path() {
+        // A monitoring-style `Execute` after a failed tool run reports the retirement rather than
+        // hanging, and never returns a stale success.
+        let (actor, _) = actor_with_reads([Ok(b"AT+VENDOR?\r\nERROR\r\n".to_vec())]);
+        let _ = receive(
+            &actor,
+            expert("AT+VENDOR?"),
+            ToolTransactionControl::new(Duration::from_secs(5)),
+        )
+        .expect("refusal");
+        // A refusal is a valid answer, so the actor is still usable for a normal command.
+        let follow_up = actor.try_execute(AtCommand::SignalQuality);
+        match follow_up {
+            Ok(receiver) => {
+                let result = receiver.recv_timeout(Duration::from_secs(2));
+                assert!(result.is_ok(), "the actor still answers");
+            }
+            Err(error) => assert!(matches!(
+                error,
+                ActorError::Closed | ActorError::LeaseBusy | ActorError::QueueFull
+            )),
+        }
+    }
+}

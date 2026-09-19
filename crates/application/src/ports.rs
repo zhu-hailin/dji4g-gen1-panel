@@ -508,6 +508,22 @@ pub trait SmsPort: Send + Sync {
     }
 }
 
+/// One device-tool transaction against the module's AT port.
+///
+/// The port opens its own short-lived session on the port the target names, writes the validated
+/// line once, reads until the module's final code, and returns a receipt. It never retries, never
+/// reuses another session's port name, and must honour `control` between reads: the caller uses
+/// that handle to cancel, and a task that was cancelled before its first write must come back as
+/// [`crate::ToolOutcome::CancelledBeforeWrite`] rather than as a failure.
+pub trait DeviceToolsPort: Send + Sync {
+    fn execute(
+        &self,
+        target: &TargetContext,
+        request: crate::ToolRequest,
+        control: crate::ToolControl,
+    ) -> PortFuture<'_, Result<crate::ToolReceipt, PortError>>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProbeStageDto {
     Passed,

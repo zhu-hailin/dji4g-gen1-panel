@@ -12,9 +12,13 @@ use std::{
 
 use dji4g_at_protocol::{
     AtCommand, AtEvent, AtFinalCode, AtResponse, ProtocolError, ProtocolErrorKind, RetryPolicy,
-    StreamingParser,
+    StreamingParser, ToolParseError, ToolResponse, ToolResponseParser, ToolWireRequest,
 };
 use dji4g_domain::{DeviceEpoch, SmsSendPhase, SmsTransactionControl};
+
+/// Cancellation and write-attempt handle for one tool transaction. The platform crate must not
+/// depend on the application crate, so the shared primitive comes from the domain crate.
+pub use dji4g_domain::ToolTransactionControl as ToolIoControl;
 
 use crate::SelectedPort;
 
@@ -60,6 +64,9 @@ pub enum ActorError {
     Io(io::ErrorKind),
     Protocol(ProtocolError),
     FinalCode(AtFinalCode),
+    /// A tool transaction that could not be parsed as one text command/response exchange. The
+    /// variant carries no response text, only the reason.
+    Tool(ToolParseError),
 }
 
 impl ActorError {
@@ -74,6 +81,7 @@ impl ActorError {
             Self::Io(_) => "serial_actor:io",
             Self::Protocol(error) => error.kind.code(),
             Self::FinalCode(_) => "serial_actor:at_final_error",
+            Self::Tool(error) => error.code(),
         }
     }
 
@@ -107,6 +115,11 @@ enum Request {
     },
     Handshake {
         reply: OperationReply<Vec<String>>,
+    },
+    Tool {
+        request: ToolWireRequest,
+        control: ToolIoControl,
+        reply: OperationReply<ToolResponse>,
     },
 }
 
@@ -179,6 +192,7 @@ fn os_io(error: io::Error) -> ActorError {
 
 pub type AtResponseReceiver = mpsc::Receiver<Result<AtResponse, ActorError>>;
 pub type AtHandshakeReceiver = mpsc::Receiver<Result<Vec<String>, ActorError>>;
+pub type ToolResponseReceiver = mpsc::Receiver<Result<ToolResponse, ActorError>>;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AtPortBinding {
@@ -459,6 +473,33 @@ impl AtSessionActor {
         }
     }
 
+    /// Queue one device-tool transaction.
+    ///
+    /// The request queues with every other transaction on this actor's single worker, so it can
+    /// never overlap a monitoring command or an SMS transaction on the same port. The returned
+    /// receiver yields the module's response — including a final error code, which is a valid
+    /// answer, not a transport failure.
+    ///
+    /// Cancellation is cooperative through `control`: the caller cancels the handle, and the
+    /// worker notices between reads. The worker is never force-detached, so the port lease stays
+    /// held until it really exits.
+    pub fn try_execute_tool(
+        &self,
+        request: ToolWireRequest,
+        control: ToolIoControl,
+    ) -> Result<ToolResponseReceiver, ActorError> {
+        let (reply, response) = mpsc::channel();
+        self.try_send(|state| Request::Tool {
+            request,
+            control,
+            reply: OperationReply {
+                sender: Some(reply),
+                state,
+            },
+        })?;
+        Ok(response)
+    }
+
     pub fn safe_handshake(&self) -> Result<Vec<String>, ActorError> {
         let response = self.try_safe_handshake()?;
         let identity = response.recv().map_err(|_| ActorError::Closed)??;
@@ -662,6 +703,33 @@ fn run_actor(
                 };
                 reply.send(result);
             }
+            Request::Tool {
+                request,
+                control,
+                reply,
+            } => {
+                let result = run_tool_transaction(serial.as_mut(), &state, request, &control);
+                let _gate = state
+                    .submission_gate
+                    .lock()
+                    .expect("submission gate poisoned");
+                // A concurrent invalidation must not let a stale success through; a failure keeps
+                // its own specific error so the caller can tell a refused command from a broken
+                // port.
+                let result = match result {
+                    Ok(response) if state.is_running() => Ok(response),
+                    Ok(_) => Err(state.terminal_error()),
+                    Err(error) => Err(error),
+                };
+                if result.is_err() {
+                    // Retire this actor whatever went wrong. A failed tool transaction can leave
+                    // the module waiting at a prompt, and a late `OK` from this command must never
+                    // be read as the answer to the next one. Retiring also ends the worker loop,
+                    // so the port lease is released as soon as the worker really exits.
+                    state.finish_removed_locked();
+                }
+                reply.send(result);
+            }
             Request::Handshake { reply } => {
                 let result = safe_handshake(epoch, serial.as_mut(), &state);
                 let removed = result.as_ref().is_err_and(|error| {
@@ -781,6 +849,91 @@ fn execute_once(
                 };
             }
         }
+    }
+}
+
+/// Run exactly one tool transaction: write the validated line once and read until the module's
+/// final code.
+///
+/// The command is written **at most once**, whitelisted reads included. Nothing here resends,
+/// because a second write could put the module into a state the caller never asked for; a caller
+/// that wants a retry can issue a new task deliberately.
+///
+/// A final error code (`ERROR`, `+CME ERROR: …`) is returned as `Ok(ToolResponse)`: the module
+/// answered, and the caller keeps its explanation. Only transport failures, cancellation, deadline
+/// expiry and parser refusals are errors.
+fn run_tool_transaction(
+    serial: &mut dyn SerialIo,
+    state: &ActorState,
+    request: ToolWireRequest,
+    control: &ToolIoControl,
+) -> Result<ToolResponse, ActorError> {
+    if !state.is_running() {
+        return Err(state.terminal_error());
+    }
+    if control.is_cancelled() {
+        return Err(ActorError::Io(io::ErrorKind::Interrupted));
+    }
+    if control.is_expired() {
+        return Err(ActorError::Io(io::ErrorKind::TimedOut));
+    }
+    let mut parser = ToolResponseParser::new(&request);
+    // Marked before the write call, not after it returns: a partially written line already
+    // changed the module's input, so its effect must be treated as unknown from here on.
+    control.mark_write_attempted();
+    if let Err(error) = serial.write_all(&request.wire_bytes()) {
+        return Err(io_error_raw(error));
+    }
+    read_tool_response(&mut parser, serial, state, control)
+}
+
+fn read_tool_response(
+    parser: &mut ToolResponseParser,
+    serial: &mut dyn SerialIo,
+    state: &ActorState,
+    control: &ToolIoControl,
+) -> Result<ToolResponse, ActorError> {
+    loop {
+        if control.is_cancelled() {
+            return Err(ActorError::Io(io::ErrorKind::Interrupted));
+        }
+        if control.is_expired() {
+            return Err(ActorError::Io(io::ErrorKind::TimedOut));
+        }
+        if !state.is_running() {
+            return Err(state.terminal_error());
+        }
+        match serial.read_chunk() {
+            Ok(bytes) => match parser.push(&bytes) {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => continue,
+                Err(error) => return Err(ActorError::Tool(error)),
+            },
+            Err(error) if is_quiet(&error) => continue,
+            Err(error) => return Err(io_error_raw(error)),
+        }
+    }
+}
+
+/// Map an operating-system I/O error to a stable actor error without a parser, for paths that are
+/// not driving a `StreamingParser`.
+fn io_error_raw(error: io::Error) -> ActorError {
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED) {
+        return ActorError::Io(io::ErrorKind::Interrupted);
+    }
+    match error.kind() {
+        // A quiet read interval is handled by the caller; reaching here means the deadline passed
+        // or the device stopped answering.
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+            ActorError::Io(io::ErrorKind::TimedOut)
+        }
+        io::ErrorKind::NotConnected | io::ErrorKind::UnexpectedEof => {
+            ActorError::Io(io::ErrorKind::NotConnected)
+        }
+        // A broken pipe is a write failure, not a disconnect: the caller uses the difference to
+        // tell "the module stopped answering" from "our bytes never went out".
+        kind => ActorError::Io(kind),
     }
 }
 

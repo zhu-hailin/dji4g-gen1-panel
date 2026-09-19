@@ -14,9 +14,9 @@ use dji4g_domain::{
 
 use crate::controller::RefreshSignal;
 use crate::{
-    AdapterPort, AtPort, BackendEvent, CheckResult, Controller, ControllerHandle, FeatureStatus,
-    HotspotControl, InventoryPort, NetworkProbePort, SmsListing, SmsPort, SmsRequest,
-    SmsSendResult, TargetContext, UiCommand,
+    AdapterPort, AtPort, BackendEvent, CheckResult, Controller, ControllerHandle, DeviceToolsPort,
+    FeatureStatus, HotspotControl, InventoryPort, NetworkProbePort, SmsListing, SmsPort,
+    SmsRequest, SmsSendResult, TargetContext, UiCommand,
 };
 
 /// Upper bound on one monitoring stage (inventory, AT, adapter, probe, hotspot).
@@ -39,6 +39,9 @@ pub struct MonitorPorts {
     /// SMS module transactions (list/read/delete). `None` means this build has no SMS support and
     /// queued [`SmsRequest`]s stay queued until a port is wired.
     pub sms: Option<Arc<dyn SmsPort>>,
+    /// Device-tool transactions. `None` means this build cannot run tools at all: a request is
+    /// refused as unsupported immediately instead of sitting queued forever.
+    pub device_tools: Option<Arc<dyn DeviceToolsPort>>,
 }
 
 /// How long the dedicated controller thread sleeps before re-checking the refresh signal when no
@@ -140,6 +143,14 @@ pub struct ControllerRunner {
     pending_sms: Option<PendingSms>,
     sms_timeout: Duration,
     refresh_deferred: bool,
+    pending_tool: Option<PendingTool>,
+    /// Ids for the individual transactions inside a batch. Distinct from the task id the UI
+    /// tracks, so each read's receipt and history entry can be correlated on its own.
+    next_tool_item_id: u64,
+    /// Until this instant new tool work is refused after a worker could not be reclaimed.
+    tool_busy_until: Option<Instant>,
+    /// A tool task deferred the automatic refresh; resume exactly one sweep afterwards.
+    tool_refresh_deferred: bool,
 }
 
 struct PendingSms {
@@ -150,10 +161,54 @@ struct PendingSms {
     sim_epoch: u64,
 }
 
+/// One tool task in flight on its own worker.
+struct PendingTool {
+    /// The id the UI sees. A capability sweep keeps one id for the whole batch.
+    parent_id: u64,
+    context: crate::ToolContext,
+    /// Verified target the port is allowed to touch, resolved once for the whole batch.
+    target: TargetContext,
+    /// Sub-requests still to run, including the one in flight.
+    queue: std::collections::VecDeque<crate::ToolOperation>,
+    in_flight: Option<InFlightTool>,
+    /// Absolute deadline for a capability sweep; `None` for a single command.
+    batch_deadline: Option<Instant>,
+    completed: usize,
+    total: usize,
+    /// The outcome of the most recent item. A single-command task reports exactly this, so a
+    /// command whose effect could not be confirmed is never rounded up to a completed batch.
+    last_outcome: Option<crate::ToolOutcome>,
+}
+
+struct InFlightTool {
+    request: crate::ToolRequest,
+    receiver: mpsc::Receiver<Result<crate::ToolReceipt, crate::PortError>>,
+    control: crate::ToolControl,
+    started_at: Instant,
+    /// Set while the runner is waiting for a cancelled worker to release the port.
+    cancelling_since: Option<Instant>,
+}
+
+/// How long the runner waits for a cancelled or timed-out tool worker before it reports the task
+/// finished-but-unreclaimed. The port lease stays held by the worker either way, so a new task
+/// still cannot overlap it; this only decides what the UI is told.
+const TOOL_RECLAIM_GRACE: Duration = Duration::from_secs(5);
+
+/// How long new tool work stays refused after a worker failed to release the port in time.
+const TOOL_BUSY_WINDOW: Duration = Duration::from_secs(5);
+
 impl Drop for ControllerRunner {
     fn drop(&mut self) {
         if let Some(pending) = &self.pending_sms {
             pending.control.cancel();
+        }
+        // A cancelled tool task must not outlive the runner either.
+        if let Some(in_flight) = self
+            .pending_tool
+            .as_ref()
+            .and_then(|pending| pending.in_flight.as_ref())
+        {
+            in_flight.control.cancel();
         }
     }
 }
@@ -176,6 +231,10 @@ impl ControllerRunner {
             pending_sms: None,
             sms_timeout: SMS_SEND_TIMEOUT,
             refresh_deferred: false,
+            pending_tool: None,
+            next_tool_item_id: 1,
+            tool_busy_until: None,
+            tool_refresh_deferred: false,
         };
         (handle, runner)
     }
@@ -204,6 +263,12 @@ impl ControllerRunner {
     }
     pub fn sms_pending(&self) -> bool {
         self.pending_sms.is_some()
+    }
+
+    /// Whether a device-tool task is currently in flight.
+    #[must_use]
+    pub fn tool_pending(&self) -> bool {
+        self.pending_tool.is_some() || self.controller.tool_active()
     }
 
     #[must_use]
@@ -266,12 +331,21 @@ impl ControllerRunner {
             if self.poll_sms_requests() {
                 self.publish();
             }
+            // Device-tool tasks run on their own worker and are advanced one step per iteration;
+            // the runner thread never waits inside a tool command, so the UI keeps repainting and
+            // a cancel is acted on within one poll interval.
+            if self.poll_tool_requests() {
+                self.publish();
+            }
             // An explicit user command and the automatic monitoring cadence share one scan path.
             // Relying on the signal alone left a release build permanently unscanned, because its
             // only startup `Refresh` was compiled out and no other producer sets the signal.
             let signaled = self.refresh.take();
             self.refresh_deferred |= signaled;
-            if !self.sms_pending() && (self.refresh_deferred || self.monitoring_cadence_due()) {
+            if !self.sms_pending()
+                && !self.tool_pending()
+                && (self.refresh_deferred || self.monitoring_cadence_due())
+            {
                 self.refresh_deferred = false;
                 self.run_refresh();
                 self.publish();
@@ -637,7 +711,19 @@ impl ControllerRunner {
         let now = self.controller.now();
         self.ports.is_some()
             && !self.controller.interaction_in_flight(now)
+            && !self.tool_busy()
             && periodic_refresh_due(self.last_refresh_at, now, REFRESH_INTERVAL)
+    }
+
+    /// Whether a tool task is holding the serial port, or a worker that could not be reclaimed
+    /// still may be.
+    #[must_use]
+    fn tool_busy(&self) -> bool {
+        self.pending_tool.is_some()
+            || self
+                .tool_busy_until
+                .is_some_and(|until| Instant::now() < until)
+            || self.controller.tool_active()
     }
 
     /// Whether a rates-only tick is due right now.
@@ -731,8 +817,423 @@ impl ControllerRunner {
         self.publish();
     }
 
+    // -------------------------------------------------------------------------------------
+    // Device tools
+    // -------------------------------------------------------------------------------------
+
+    /// Advance the device-tool pipeline by one step.
+    ///
+    /// Nothing here blocks: a tool transaction runs on its own worker and is polled once per loop
+    /// iteration, so the UI stays responsive and a cancel is noticed within one poll interval. A
+    /// capability sweep is expanded into its individual reads here — the port never receives a
+    /// bulk request — and the parent task stays busy across the whole batch, so no SMS or repair
+    /// transaction can slip between two sub-requests.
+    pub fn poll_tool_requests(&mut self) -> bool {
+        if self.pending_tool.is_some() {
+            return self.poll_tool_completion();
+        }
+        let port = self
+            .ports
+            .as_ref()
+            .and_then(|ports| ports.device_tools.as_ref())
+            .map(Arc::clone);
+        let Some(request) = self.controller.take_next_tool_request() else {
+            return false;
+        };
+        let Some(port) = port else {
+            // No tool port is wired in this build: say so instead of leaving the task queued
+            // forever.
+            self.controller
+                .refuse_tool_task(request.id, crate::ToolOutcome::Unsupported);
+            return true;
+        };
+        self.start_tool_task(request, port);
+        true
+    }
+
+    fn start_tool_task(&mut self, request: crate::ToolRequest, port: Arc<dyn DeviceToolsPort>) {
+        let current = (
+            self.controller.state().epoch(),
+            self.controller.snapshot().sim_epoch,
+        );
+        if (request.context.device_epoch, request.context.sim_epoch) != current {
+            self.controller
+                .refuse_tool_task(request.id, crate::ToolOutcome::ContextChanged);
+            return;
+        }
+        // The device may have been swapped, or an SMS/repair may have started, while the request
+        // waited in the queue.
+        if self.controller.tool_start_conflict() {
+            self.controller
+                .refuse_tool_task(request.id, crate::ToolOutcome::Rejected);
+            return;
+        }
+        let Some(target) = self.controller.state().target_context() else {
+            self.controller
+                .refuse_tool_task(request.id, crate::ToolOutcome::TransportFailure);
+            return;
+        };
+        let (queue, batch_deadline) = match &request.operation {
+            crate::ToolOperation::ProbeAll => (
+                dji4g_at_protocol::ToolReadId::ALL
+                    .iter()
+                    .copied()
+                    .map(crate::ToolOperation::Read)
+                    .collect::<std::collections::VecDeque<_>>(),
+                Some(Instant::now() + crate::PROBE_BATCH_BUDGET),
+            ),
+            operation => (std::collections::VecDeque::from([operation.clone()]), None),
+        };
+        let total = queue.len();
+        self.controller.record_tool_progress(request.id, 0, total);
+        self.controller
+            .set_tool_phase(request.id, crate::ToolPhase::Running);
+        self.pending_tool = Some(PendingTool {
+            parent_id: request.id,
+            context: request.context,
+            target,
+            queue,
+            in_flight: None,
+            batch_deadline,
+            completed: 0,
+            total,
+            last_outcome: None,
+        });
+        self.start_tool_item(&port);
+    }
+
+    /// Start the next sub-request, if the batch still has budget.
+    fn start_tool_item(&mut self, port: &Arc<dyn DeviceToolsPort>) {
+        let Some(pending) = self.pending_tool.as_mut() else {
+            return;
+        };
+        if pending.in_flight.is_some() {
+            return;
+        }
+        let batch_remaining = pending
+            .batch_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if batch_remaining.is_some_and(|remaining| remaining.is_zero()) {
+            // Out of budget. The remaining items are not attempted this round; the caller reports
+            // them as not executed rather than inventing a result for them.
+            return;
+        }
+        let Some(operation) = pending.queue.pop_front() else {
+            return;
+        };
+        let timeout =
+            crate::item_deadline(batch_remaining.unwrap_or(crate::TOOL_TRANSACTION_TIMEOUT));
+        let item_id = self.next_tool_item_id;
+        self.next_tool_item_id = self.next_tool_item_id.saturating_add(1);
+        let request = crate::ToolRequest {
+            id: item_id,
+            context: pending.context.clone(),
+            operation,
+        };
+        let control = crate::ToolControl::new(timeout);
+        let worker_control = control.clone();
+        let worker_request = request.clone();
+        let target = pending.target.clone();
+        let worker_port = Arc::clone(port);
+        let (sender, receiver) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("dji4g-device-tool".into())
+            .spawn(move || {
+                let outcome = poll_ready(
+                    worker_port.execute(&target, worker_request, worker_control.clone()),
+                    timeout,
+                    || {
+                        // The worker's own budget expired. Cancelling the shared handle makes the
+                        // platform side tear its session down instead of leaving it waiting.
+                        worker_control.cancel();
+                        Err(crate::PortError::new(
+                            dji4g_domain::ErrorCode::Timeout,
+                            "device_tools:timeout",
+                        ))
+                    },
+                );
+                let _ = sender.send(outcome);
+            });
+        let Some(pending) = self.pending_tool.as_mut() else {
+            return;
+        };
+        match spawned {
+            Ok(_) => {
+                pending.in_flight = Some(InFlightTool {
+                    request,
+                    receiver,
+                    control,
+                    started_at: Instant::now(),
+                    cancelling_since: None,
+                });
+            }
+            Err(_) => {
+                let parent = pending.parent_id;
+                self.controller
+                    .refuse_tool_task(parent, crate::ToolOutcome::TransportFailure);
+            }
+        }
+    }
+
+    fn poll_tool_completion(&mut self) -> bool {
+        let current = (
+            self.controller.state().epoch(),
+            self.controller.snapshot().sim_epoch,
+        );
+        let Some(mut pending) = self.pending_tool.take() else {
+            return false;
+        };
+        let context_changed = (pending.context.device_epoch, pending.context.sim_epoch) != current;
+        let cancelled = self
+            .controller
+            .device_tools()
+            .task
+            .as_ref()
+            .is_some_and(|task| {
+                task.id == pending.parent_id && task.phase == crate::ToolPhase::Cancelling
+            });
+        if cancelled || context_changed {
+            pending.queue.clear();
+        }
+        let Some(in_flight) = pending.in_flight.as_mut() else {
+            if cancelled
+                || context_changed
+                || pending.queue.is_empty()
+                || pending
+                    .batch_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.finish_tool_batch(pending, context_changed);
+                return true;
+            }
+            // Between items: nothing to collect, so start the next one.
+            self.pending_tool = Some(pending);
+            let port = self
+                .ports
+                .as_ref()
+                .and_then(|ports| ports.device_tools.as_ref())
+                .map(Arc::clone);
+            if let Some(port) = port {
+                self.start_tool_item(&port);
+            }
+            return self
+                .pending_tool
+                .as_ref()
+                .is_some_and(|pending| pending.total > 0);
+        };
+        if (cancelled || context_changed) && !in_flight.control.is_cancelled() {
+            // The result would belong to another device: stop, and let the outcome say why.
+            in_flight.control.cancel();
+        }
+        let now = Instant::now();
+        let mut outcome = None;
+        match in_flight.receiver.try_recv() {
+            Ok(result) => outcome = Some(result),
+            Err(mpsc::TryRecvError::Empty) => {
+                if in_flight.control.is_expired() && !in_flight.control.is_cancelled() {
+                    in_flight.control.cancel();
+                }
+                if in_flight.control.is_cancelled() {
+                    let since = *in_flight.cancelling_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) > TOOL_RECLAIM_GRACE {
+                        // The worker did not give the port back in time. The port lease is still
+                        // held by it, so the next task cannot overlap it; refuse new tool work for
+                        // a bounded window as well instead of hammering a wedged port.
+                        self.tool_busy_until = Some(now + TOOL_BUSY_WINDOW);
+                        outcome = Some(Err(crate::PortError::new(
+                            dji4g_domain::ErrorCode::Timeout,
+                            "device_tools:reclaim_timeout",
+                        )));
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                outcome = Some(Err(crate::PortError::new(
+                    dji4g_domain::ErrorCode::Internal,
+                    "device_tools:worker_failed",
+                )));
+            }
+        }
+        let Some(outcome) = outcome else {
+            self.pending_tool = Some(pending);
+            return false;
+        };
+        let in_flight = pending.in_flight.take().expect("in flight");
+        let written = in_flight.control.write_attempted();
+        let elapsed = in_flight.started_at.elapsed();
+        let receipt = tool_receipt(
+            &in_flight.request,
+            outcome,
+            elapsed,
+            written,
+            context_changed,
+        );
+        pending.last_outcome = Some(receipt.outcome);
+        let next = self.finish_tool_item(&pending, receipt);
+        pending.completed += 1;
+        self.controller
+            .record_tool_progress(pending.parent_id, pending.completed, pending.total);
+        if cancelled {
+            self.finish_tool_batch(pending, context_changed);
+            return true;
+        }
+        let port = self
+            .ports
+            .as_ref()
+            .and_then(|ports| ports.device_tools.as_ref())
+            .map(Arc::clone);
+        match (next, context_changed, port) {
+            (NextToolItem::Stop, _, _) => {
+                self.finish_tool_batch(pending, context_changed);
+            }
+            (NextToolItem::Continue, false, Some(port)) => {
+                self.pending_tool = Some(pending);
+                self.start_tool_item(&port);
+            }
+            (NextToolItem::Continue, _, _) => {
+                self.finish_tool_batch(pending, context_changed);
+            }
+        }
+        true
+    }
+
+    /// Publish one sub-request's evidence. Returns whether the batch should continue.
+    fn finish_tool_item(
+        &mut self,
+        pending: &PendingTool,
+        receipt: crate::ToolReceipt,
+    ) -> NextToolItem {
+        let operation = receipt.operation;
+        if let crate::ToolOperationKind::Read(id) = operation {
+            let now = self.controller.now();
+            let mut row = if receipt.outcome == crate::ToolOutcome::Ok
+                && receipt.payload_lines == 0
+                && id != dji4g_at_protocol::ToolReadId::Attention
+            {
+                crate::ToolCapabilityRow::empty(id, pending.context.clone(), now)
+            } else {
+                crate::ToolCapabilityRow::new(id, receipt.outcome, pending.context.clone(), now)
+            };
+            if let crate::ToolOutcome::Ok = row.reason {
+                self.learn_from_read(id, &receipt, &pending.context);
+            }
+            // A single item's failure stays on that item: the other rows keep their evidence.
+            row.observed_at = now;
+            self.controller.record_tool_capability(row);
+        }
+        self.controller.finish_tool_task(receipt);
+        if pending.queue.is_empty() {
+            NextToolItem::Stop
+        } else {
+            NextToolItem::Continue
+        }
+    }
+
+    /// Extract parsed values from one read's response.
+    ///
+    /// Parsing uses the transcript's response lines only; a module-originated URC arrives prefixed
+    /// and can therefore never be mistaken for this command's answer.
+    fn learn_from_read(
+        &mut self,
+        id: dji4g_at_protocol::ToolReadId,
+        receipt: &crate::ToolReceipt,
+        context: &crate::ToolContext,
+    ) {
+        use dji4g_at_protocol::ToolReadId as Id;
+        let lines = receipt.transcript.lines();
+        match id {
+            Id::Manufacturer => {
+                if let Some(value) = crate::extract_identity(lines, "+CGMI:") {
+                    self.controller
+                        .update_tool_profile(context, |profile| profile.manufacturer = Some(value));
+                }
+            }
+            Id::Model => {
+                if let Some(value) = crate::extract_identity(lines, "+CGMM:") {
+                    self.controller
+                        .update_tool_profile(context, |profile| profile.model = Some(value));
+                }
+            }
+            Id::Revision => {
+                if let Some(value) = crate::extract_identity(lines, "+CGMR:") {
+                    self.controller
+                        .update_tool_profile(context, |profile| profile.revision = Some(value));
+                }
+            }
+            Id::UsbNet => {
+                if let Some(reading) = crate::parse_usb_net(lines) {
+                    self.controller
+                        .update_tool_profile(context, |profile| profile.usb_net = Some(reading));
+                }
+            }
+            Id::PdpContexts => {
+                let contexts = crate::as_at_response(
+                    context.device_epoch,
+                    dji4g_at_protocol::AtCommand::PdpContexts,
+                    &tool_response_of(receipt),
+                );
+                if let Ok(parsed) = dji4g_at_protocol::parse_pdp_contexts(&contexts) {
+                    self.controller
+                        .update_tool_profile(context, |profile| profile.pdp_contexts = parsed);
+                }
+            }
+            Id::Temperature => {
+                let parsed = crate::parse_profile_temperature(&tool_response_of(receipt));
+                if !parsed.is_empty() {
+                    self.controller
+                        .update_tool_profile(context, |profile| profile.temperature = parsed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Close out a batch and publish its terminal state.
+    fn finish_tool_batch(&mut self, pending: PendingTool, context_changed: bool) {
+        let skipped = pending.total.saturating_sub(pending.completed);
+        let outcome = if context_changed {
+            crate::ToolOutcome::ContextChanged
+        } else if skipped > 0 {
+            // Out of budget: the items that did not run are unqueried, not failed.
+            if pending.last_outcome == Some(crate::ToolOutcome::OutcomeUnknown) {
+                crate::ToolOutcome::OutcomeUnknown
+            } else {
+                crate::ToolOutcome::CancelledBeforeWrite
+            }
+        } else if pending.total == 1 {
+            // A single command's task row reports that command's own result.
+            pending
+                .last_outcome
+                .unwrap_or(crate::ToolOutcome::OutcomeUnknown)
+        } else {
+            crate::ToolOutcome::Ok
+        };
+        self.controller
+            .set_tool_phase(pending.parent_id, crate::ToolPhase::Finished);
+        self.controller
+            .finish_tool_batch_task(pending.parent_id, outcome);
+        self.controller
+            .record_tool_progress(pending.parent_id, pending.completed, pending.total);
+        if context_changed {
+            self.tool_busy_until = None;
+        }
+        self.pending_tool = None;
+        // One deferred sweep, not one per skipped cycle.
+        if self.tool_refresh_deferred {
+            self.tool_refresh_deferred = false;
+            self.refresh_deferred = true;
+        }
+    }
+
     fn run_refresh(&mut self) {
         if self.controller.sms_active() {
+            self.refresh_deferred = true;
+            return;
+        }
+        // A device-tool task holds the module's AT port. The whole scan is deferred rather than
+        // half-run: an AT poll interleaved with a tool command would read the tool's own response.
+        if self.controller.tool_active() {
+            self.tool_refresh_deferred = true;
             self.refresh_deferred = true;
             return;
         }
@@ -744,6 +1245,7 @@ impl ControllerRunner {
             return;
         };
         let MonitorPorts {
+            device_tools: _,
             inventory: inventory_port,
             at: at_port,
             adapter: adapter_port,
@@ -1002,6 +1504,75 @@ impl SmsStageOutcome {
 
 /// Drive one inbox request. Sends use the separate controlled worker and the port owns their
 /// entire preflight and submission, without reopening the serial handle between steps.
+/// Whether a batch has more work after the item that just finished.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NextToolItem {
+    Continue,
+    Stop,
+}
+
+/// Turn a port outcome into the task receipt the controller records.
+///
+/// A port error is classified here, once: a command that was written and then lost is
+/// `OutcomeUnknown` (never retried), a command that never reached the port is a plain transport
+/// failure, and a result that arrived after the device changed belongs to the old context.
+fn tool_receipt(
+    request: &crate::ToolRequest,
+    outcome: Result<crate::ToolReceipt, crate::PortError>,
+    elapsed: Duration,
+    written: bool,
+    context_changed: bool,
+) -> crate::ToolReceipt {
+    let operation = request.operation.kind();
+    match outcome {
+        Ok(mut receipt) => {
+            if context_changed {
+                receipt.outcome = crate::ToolOutcome::ContextChanged;
+            }
+            receipt.operation = operation;
+            receipt
+        }
+        Err(_) => crate::ToolReceipt {
+            id: request.id,
+            context: request.context.clone(),
+            operation,
+            outcome: if context_changed {
+                crate::ToolOutcome::ContextChanged
+            } else if written {
+                crate::ToolOutcome::OutcomeUnknown
+            } else {
+                // A port-level failure never reached the final code, whatever its stable code.
+                crate::ToolOutcome::TransportFailure
+            },
+            elapsed,
+            transcript: Arc::new(crate::ToolTranscript::new()),
+            saw_final_code: false,
+            payload_lines: 0,
+        },
+    }
+}
+
+/// Rebuild a `ToolResponse` view from a receipt's collected response lines, for the shared
+/// parsers. URC lines are dropped: they belong to the module, not to this command.
+fn tool_response_of(receipt: &crate::ToolReceipt) -> dji4g_at_protocol::ToolResponse {
+    dji4g_at_protocol::ToolResponse {
+        lines: receipt
+            .transcript
+            .lines()
+            .iter()
+            .filter(|line| !line.starts_with("[模块主动上报]"))
+            .cloned()
+            .collect(),
+        urc_lines: Vec::new(),
+        unclassified_lines: 0,
+        final_code: if receipt.saw_final_code && receipt.outcome == crate::ToolOutcome::Ok {
+            dji4g_at_protocol::AtFinalCode::Ok
+        } else {
+            dji4g_at_protocol::AtFinalCode::Error
+        },
+    }
+}
+
 fn run_sms_port_call<'a>(
     port: &'a Arc<dyn SmsPort>,
     target: &'a TargetContext,

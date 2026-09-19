@@ -28,6 +28,41 @@ use crate::{
 pub const COMMAND_QUEUE_CAPACITY: usize = 32;
 pub const PLAN_LIFETIME: Duration = Duration::from_secs(30);
 
+/// A frozen expert command awaiting its single confirmation.
+///
+/// Confirmation carries only the id, so the text cannot be edited between the confirmation dialog
+/// and the write. The plan expires, is consumed at most once, and dies with its device context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpertToolPlan {
+    pub id: u64,
+    context: crate::ToolContext,
+    line: dji4g_at_protocol::ValidatedToolLine,
+    expires_at: SystemTime,
+    consumed: bool,
+}
+
+/// Why a frozen expert command could not be confirmed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpertToolRefusal {
+    UnknownPlan,
+    AlreadyConfirmed,
+    AlreadyFrozen,
+    Expired,
+    ContextChanged,
+}
+
+impl ExpertToolRefusal {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::UnknownPlan => "tool:unknown_plan",
+            Self::AlreadyConfirmed => "tool:already_confirmed",
+            Self::AlreadyFrozen => "tool:plan_pending",
+            Self::Expired => "tool:plan_expired",
+            Self::ContextChanged => "tool:context_changed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrepareError {
     Busy,
@@ -94,6 +129,30 @@ pub enum UiCommand {
     SmsSend {
         recipient: String,
         body: String,
+    },
+    /// Run one whitelisted tool read on the module's AT port.
+    RunToolRead {
+        id: dji4g_at_protocol::ToolReadId,
+    },
+    /// Run every whitelisted tool read as one ordered batch under a shared budget.
+    ProbeDeviceTools,
+    /// Freeze one expert command and wait for its own confirmation. The text is validated before
+    /// it is accepted and is never logged.
+    PrepareExpertTool {
+        line: dji4g_at_protocol::ValidatedToolLine,
+    },
+    /// Execute a frozen expert command. Only the id travels here, so the text cannot be changed
+    /// between the confirmation and the write.
+    ConfirmExpertTool {
+        id: u64,
+    },
+    /// Stop waiting for a running tool task. The command may already have reached the module.
+    CancelDeviceTool {
+        id: u64,
+    },
+    /// Withdraw a frozen expert command before the user confirms it.
+    CancelExpertToolPlan {
+        id: u64,
     },
     /// Terminal result of the panel-side `config.toml` write for one settings revision.
     SettingsPersisted(crate::SettingsSaveOutcome),
@@ -221,6 +280,13 @@ pub struct Controller {
     sms_inbox_failure: Option<(DeviceEpoch, u64, crate::PortError)>,
     next_sms_request_id: u64,
     sms_send_context: Option<(DeviceEpoch, u64)>,
+    /// Tool tasks the runner will execute, in request order. The controller owns the queue and the
+    /// evidence; the runner owns the worker and the port call.
+    tool_requests: VecDeque<crate::ToolRequest>,
+    device_tools: crate::DeviceToolsSnapshot,
+    next_tool_request_id: u64,
+    /// A frozen expert command awaiting its single confirmation.
+    expert_plan: Option<ExpertToolPlan>,
 }
 
 impl Controller {
@@ -247,6 +313,10 @@ impl Controller {
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
+            tool_requests: VecDeque::new(),
+            device_tools: crate::DeviceToolsSnapshot::default(),
+            next_tool_request_id: 1,
+            expert_plan: None,
         }
     }
 
@@ -275,6 +345,10 @@ impl Controller {
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
+            tool_requests: VecDeque::new(),
+            device_tools: crate::DeviceToolsSnapshot::default(),
+            next_tool_request_id: 1,
+            expert_plan: None,
         }
     }
 
@@ -295,6 +369,7 @@ impl Controller {
                 *epoch == self.state.epoch() && *sim == self.state.sim_epoch()
             })
             .map(|(_, _, error)| error.clone());
+        snapshot.device_tools = self.device_tools.clone();
         snapshot
     }
 
@@ -304,7 +379,7 @@ impl Controller {
     }
 
     pub fn prepare_action(&mut self, action: ActionRequest) -> Result<ActionPlanId, PrepareError> {
-        if self.sms_active() {
+        if self.sms_active() || self.tool_active() {
             return Err(PrepareError::Busy);
         }
         if self.prepared.as_ref().is_some_and(|plan| {
@@ -662,6 +737,9 @@ impl Controller {
                 if self.sms_active() {
                     return self.reject_sms_busy();
                 }
+                if self.tool_active() {
+                    return self.reject_sms_tool_busy();
+                }
                 if self.sms_refresh_pending {
                     return Ok(CommandReceipt::Accepted);
                 }
@@ -673,12 +751,20 @@ impl Controller {
                 if self.sms_active() {
                     return self.reject_sms_busy();
                 }
+                // A tool task holds the port: the read is refused rather than queued behind a
+                // device that may be gone by the time the tool finishes.
+                if self.tool_active() {
+                    return self.reject_sms_tool_busy();
+                }
                 self.sms_requests.push_back(SmsRequest::Read { index });
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsDelete { index } => {
                 if self.sms_active() {
                     return self.reject_sms_busy();
+                }
+                if self.tool_active() {
+                    return self.reject_sms_tool_busy();
                 }
                 self.sms_requests.push_back(SmsRequest::Delete { index });
                 // The local copy is deliberately kept until the module confirms the deletion
@@ -687,8 +773,10 @@ impl Controller {
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsSend { recipient, body } => {
-                if self.sms_active()
-                    || self.operation_pending.is_some()
+                if self.sms_active() || self.tool_active() {
+                    return self.reject_sms_tool_busy();
+                }
+                if self.operation_pending.is_some()
                     || self
                         .operation
                         .as_ref()
@@ -714,6 +802,17 @@ impl Controller {
                     .push_back(SmsRequest::Send { recipient, body });
                 Ok(CommandReceipt::Accepted)
             }
+            UiCommand::RunToolRead { id } => {
+                self.queue_tool_request(crate::ToolOperation::Read(id), 1)
+            }
+            UiCommand::ProbeDeviceTools => self.queue_tool_request(
+                crate::ToolOperation::ProbeAll,
+                dji4g_at_protocol::ToolReadId::ALL.len(),
+            ),
+            UiCommand::PrepareExpertTool { line } => self.prepare_expert_tool(line),
+            UiCommand::ConfirmExpertTool { id } => self.confirm_expert_tool(id),
+            UiCommand::CancelDeviceTool { id } => self.cancel_device_tool(id),
+            UiCommand::CancelExpertToolPlan { id } => self.cancel_expert_plan(id),
             UiCommand::SettingsPersisted(outcome) => {
                 self.state
                     .finish_settings_persistence(outcome.revision, outcome.result);
@@ -729,6 +828,335 @@ impl Controller {
             // is a dispatch bug and is rejected instead of silently accepted.
             UiCommand::ExportDiagnostics => Err(UiSendError::Closed),
         }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Device tools
+    // -------------------------------------------------------------------------------------
+
+    /// Whether a tool task is queued, running or waiting to be reclaimed.
+    ///
+    /// Every other serial work entry point consults this through `serial_work_busy`, so a tool
+    /// task, an SMS transaction and a repair can never overlap on one module.
+    #[must_use]
+    pub fn tool_active(&self) -> bool {
+        !self.tool_requests.is_empty() || self.device_tools.busy()
+    }
+
+    /// Whether any serial work is in flight: the one predicate every entry point uses.
+    #[must_use]
+    pub fn serial_work_busy(&self) -> bool {
+        self.sms_active()
+            || self.tool_active()
+            || self.operation_pending.is_some()
+            || self
+                .operation
+                .as_ref()
+                .is_some_and(|op| matches!(op.state, OperationState::Running { .. }))
+    }
+
+    #[must_use]
+    pub fn device_tools(&self) -> &crate::DeviceToolsSnapshot {
+        &self.device_tools
+    }
+
+    /// The device context a tool task must match to be allowed to run.
+    fn tool_context(&self) -> Option<crate::ToolContext> {
+        let identity = self.state.target_identity()?;
+        Some(crate::ToolContext {
+            device_epoch: self.state.epoch(),
+            sim_epoch: self.state.sim_epoch(),
+            identity,
+            at_port: self
+                .state
+                .inventory_at_port()
+                .unwrap_or_else(|| "[unknown]".to_owned()),
+        })
+    }
+
+    fn queue_tool_request(
+        &mut self,
+        operation: crate::ToolOperation,
+        total_items: usize,
+    ) -> Result<CommandReceipt, UiSendError> {
+        if self.serial_work_busy() {
+            return self.reject_tool_busy();
+        }
+        let Some(context) = self.tool_context() else {
+            self.device_tools.last_refusal = Some(crate::ToolOutcome::TransportFailure);
+            self.state.publish_only_change();
+            return Err(UiSendError::Closed);
+        };
+        let id = self.next_tool_request_id;
+        self.next_tool_request_id = self.next_tool_request_id.saturating_add(1);
+        let request = crate::ToolRequest {
+            id,
+            context,
+            operation,
+        };
+        self.device_tools.task = Some(crate::ToolTaskSnapshot::new(&request, total_items));
+        self.device_tools.last_refusal = None;
+        self.state.publish_only_change();
+        self.tool_requests.push_back(request);
+        Ok(CommandReceipt::Accepted)
+    }
+
+    fn reject_tool_busy(&mut self) -> Result<CommandReceipt, UiSendError> {
+        self.device_tools.last_refusal = Some(crate::ToolOutcome::Rejected);
+        self.report_feedback(failure(ErrorCode::Internal, "tool:busy"));
+        self.state.publish_only_change();
+        Err(UiSendError::QueueFull)
+    }
+
+    /// Freeze one expert command until the user confirms it.
+    fn prepare_expert_tool(
+        &mut self,
+        line: dji4g_at_protocol::ValidatedToolLine,
+    ) -> Result<CommandReceipt, UiSendError> {
+        if self.serial_work_busy() {
+            return self.reject_tool_busy();
+        }
+        let Some(context) = self.tool_context() else {
+            return Err(UiSendError::Closed);
+        };
+        if self.expert_plan.is_some() {
+            // One frozen command at a time: preparing another replaces nothing and is refused.
+            return self.reject_expert(ExpertToolRefusal::AlreadyFrozen);
+        }
+        let id = self.next_tool_request_id;
+        self.next_tool_request_id = self.next_tool_request_id.saturating_add(1);
+        let expires_at = self.clock.system_now() + crate::PLAN_LIFETIME;
+        self.device_tools.pending_expert = Some(crate::PendingExpertTool {
+            id,
+            line: line.clone(),
+            expires_at,
+        });
+        // The frozen request is published so a device or SIM change can withdraw it, but it is not
+        // queued yet: nothing runs until the user confirms this exact text.
+        self.expert_plan = Some(ExpertToolPlan {
+            id,
+            context,
+            line,
+            expires_at,
+            consumed: false,
+        });
+        self.device_tools.last_refusal = None;
+        self.state.publish_only_change();
+        Ok(CommandReceipt::Accepted)
+    }
+
+    fn clear_expert_plan(&mut self) {
+        self.expert_plan = None;
+        self.device_tools.pending_expert = None;
+    }
+
+    fn cancel_expert_plan(&mut self, id: u64) -> Result<CommandReceipt, UiSendError> {
+        if self.expert_plan.as_ref().is_some_and(|plan| plan.id == id) {
+            self.clear_expert_plan();
+            self.state.publish_only_change();
+        }
+        Ok(CommandReceipt::Accepted)
+    }
+
+    /// Confirm a frozen expert command exactly once.
+    ///
+    /// Everything about the request was frozen at prepare time: the text, the device epoch, the
+    /// SIM epoch, the identity and the port. Confirmation re-checks all of them, and an expired,
+    /// already-confirmed, or context-mismatched plan is refused with a distinct reason.
+    fn confirm_expert_tool(&mut self, id: u64) -> Result<CommandReceipt, UiSendError> {
+        let Some(plan) = self.expert_plan.as_ref() else {
+            return self.reject_expert(ExpertToolRefusal::UnknownPlan);
+        };
+        if plan.id != id {
+            return self.reject_expert(ExpertToolRefusal::UnknownPlan);
+        }
+        if plan.consumed {
+            return self.reject_expert(ExpertToolRefusal::AlreadyConfirmed);
+        }
+        if self.clock.system_now() > plan.expires_at {
+            self.clear_expert_plan();
+            return self.reject_expert(ExpertToolRefusal::Expired);
+        }
+        let frozen_context = plan.context.clone();
+        let line = plan.line.clone();
+        let Some(context) = self.tool_context() else {
+            return self.reject_expert(ExpertToolRefusal::ContextChanged);
+        };
+        if context != frozen_context {
+            self.clear_expert_plan();
+            return self.reject_expert(ExpertToolRefusal::ContextChanged);
+        }
+        if self.serial_work_busy() {
+            return self.reject_tool_busy();
+        }
+        self.clear_expert_plan();
+        // Reuse the ordinary queue so an expert command obeys the same mutual exclusion as every
+        // other serial transaction.
+        let request = crate::ToolRequest {
+            id,
+            context,
+            operation: crate::ToolOperation::Expert(line),
+        };
+        self.device_tools.task = Some(crate::ToolTaskSnapshot::new(&request, 1));
+        self.tool_requests.push_back(request);
+        self.state.publish_only_change();
+        Ok(CommandReceipt::Accepted)
+    }
+
+    fn reject_expert(&mut self, refusal: ExpertToolRefusal) -> Result<CommandReceipt, UiSendError> {
+        self.device_tools.last_refusal = Some(crate::ToolOutcome::Rejected);
+        self.report_feedback(failure(ErrorCode::Internal, refusal.code()));
+        Err(UiSendError::Closed)
+    }
+
+    fn cancel_device_tool(&mut self, id: u64) -> Result<CommandReceipt, UiSendError> {
+        // Dropping a queued request is an application-side decision; a running task is cancelled
+        // by the runner through the same control handle the user's button reaches.
+        self.tool_requests.retain(|request| request.id != id);
+        if let Some(task) = self.device_tools.task.as_mut() {
+            if task.id == id {
+                if task.phase == crate::ToolPhase::Queued {
+                    task.phase = crate::ToolPhase::Finished;
+                    task.outcome = Some(crate::ToolOutcome::CancelledBeforeWrite);
+                } else if task.phase.is_active() {
+                    task.phase = crate::ToolPhase::Cancelling;
+                }
+            }
+        }
+        self.state.publish_only_change();
+        Ok(CommandReceipt::Accepted)
+    }
+
+    /// Take the next queued tool request. The runner calls this only when no task is in flight.
+    pub fn take_next_tool_request(&mut self) -> Option<crate::ToolRequest> {
+        self.tool_requests.pop_front()
+    }
+
+    pub fn set_tool_phase(&mut self, id: u64, phase: crate::ToolPhase) {
+        if let Some(task) = self.device_tools.task.as_mut() {
+            if task.id == id {
+                task.phase = phase;
+            }
+        }
+        self.state.publish_only_change();
+    }
+
+    pub fn record_tool_progress(&mut self, id: u64, completed: usize, total: usize) {
+        if let Some(task) = self.device_tools.task.as_mut() {
+            if task.id == id {
+                task.completed_items = completed;
+                task.total_items = total;
+            }
+        }
+        self.state.publish_only_change();
+    }
+
+    pub fn record_tool_capability(&mut self, row: crate::ToolCapabilityRow) {
+        self.device_tools.record_capability(row);
+        self.state.publish_only_change();
+    }
+
+    /// Apply one partial profile update.
+    ///
+    /// The closure receives only the fields the caller actually learned, so a read that failed
+    /// leaves the previous value alone instead of overwriting it with a default. Only parsed
+    /// values are ever stored.
+    pub fn update_tool_profile(
+        &mut self,
+        context: &crate::ToolContext,
+        update: impl FnOnce(&mut crate::ModuleProfile),
+    ) {
+        update(&mut self.device_tools.profile);
+        self.device_tools.profile.observed_at = Some(self.clock.system_now());
+        self.device_tools.profile.context = Some(context.clone());
+        self.state.publish_only_change();
+    }
+
+    /// Whether any *other* serial work would conflict with starting a tool task right now.
+    ///
+    /// Re-checked at start time, not only when the request was queued: an SMS transaction or a
+    /// repair can have begun while the tool request waited.
+    #[must_use]
+    pub fn tool_start_conflict(&self) -> bool {
+        let now = self.clock.system_now();
+        self.sms_active()
+            || !self.sms_requests.is_empty()
+            || self.operation_pending.is_some()
+            || self
+                .operation
+                .as_ref()
+                .is_some_and(|op| matches!(op.state, OperationState::Running { .. }))
+            || self.prepared.as_ref().is_some_and(|stored| {
+                matches!(
+                    stored.summary.state,
+                    PreparedActionState::AwaitingConfirmation
+                ) && now <= stored.plan.expires_at
+            })
+    }
+
+    /// Finish one tool task and publish its evidence.
+    pub fn finish_tool_task(&mut self, receipt: crate::ToolReceipt) {
+        let finished_at = self.clock.system_now();
+        self.device_tools.history.push(crate::ToolHistoryEntry {
+            id: receipt.id,
+            operation: receipt.operation,
+            outcome: receipt.outcome,
+            elapsed: receipt.elapsed,
+            finished_at,
+            transcript: std::sync::Arc::clone(&receipt.transcript),
+        });
+        if self
+            .device_tools
+            .task
+            .as_ref()
+            .is_some_and(|task| task.id == receipt.id)
+        {
+            if let Some(task) = self.device_tools.task.as_mut() {
+                task.phase = crate::ToolPhase::Finished;
+                task.outcome = Some(receipt.outcome);
+            }
+        }
+        self.state.publish_only_change();
+    }
+
+    /// Record a refusal that happened before any command was written.
+    pub fn refuse_tool_task(&mut self, id: u64, outcome: crate::ToolOutcome) {
+        self.device_tools.last_refusal = Some(outcome);
+        if let Some(task) = self.device_tools.task.as_mut() {
+            if task.id == id {
+                task.phase = crate::ToolPhase::Finished;
+                task.outcome = Some(outcome);
+            }
+        }
+        self.state.publish_only_change();
+    }
+
+    /// Mark a batch's task row finished with its terminal outcome.
+    pub fn finish_tool_batch_task(&mut self, id: u64, outcome: crate::ToolOutcome) {
+        if let Some(task) = self.device_tools.task.as_mut() {
+            if task.id == id {
+                task.phase = crate::ToolPhase::Finished;
+                task.outcome = Some(outcome);
+            }
+        }
+        self.state.publish_only_change();
+    }
+
+    pub fn clear_tool_task(&mut self) {
+        self.device_tools.task = None;
+        self.state.publish_only_change();
+    }
+
+    pub fn clear_tool_history(&mut self) {
+        self.device_tools.history.clear();
+        self.state.publish_only_change();
+    }
+
+    /// Drop every conclusion tied to the previous device or SIM.
+    fn invalidate_tool_context(&mut self) {
+        self.tool_requests.clear();
+        self.device_tools.invalidate_context();
+        self.expert_plan = None;
     }
 
     pub fn advance_time(&mut self, by: Duration) {
@@ -837,6 +1265,13 @@ impl Controller {
         self.report_feedback(failure(ErrorCode::Internal, "sms:busy"));
         Err(UiSendError::QueueFull)
     }
+
+    /// The module's port is occupied by a device-tool task. The message is distinct from a busy
+    /// SMS transaction so the UI can say which one is holding the port.
+    fn reject_sms_tool_busy(&mut self) -> Result<CommandReceipt, UiSendError> {
+        self.report_feedback(failure(ErrorCode::Internal, "tool:busy"));
+        Err(UiSendError::QueueFull)
+    }
     pub fn set_sms_refresh_pending(&mut self, pending: bool) {
         self.sms_refresh_pending = pending;
         self.state.publish_only_change();
@@ -883,6 +1318,9 @@ impl Controller {
                     ConfirmationInvalidationReason::EpochChanged
                 },
             );
+            // Capability evidence and a frozen expert command belong to one device and one SIM:
+            // neither may survive a swap.
+            self.invalidate_tool_context();
         }
     }
 

@@ -391,6 +391,7 @@ pub enum TextKey {
     DemoRejectedRelease,
     DemoInvalidScenario,
     NavSms,
+    NavDeviceTools,
     SmsTitle,
     SmsIntro,
     ButtonSmsRefresh,
@@ -821,6 +822,7 @@ impl TextKey {
         Self::DemoRejectedRelease,
         Self::DemoInvalidScenario,
         Self::NavSms,
+        Self::NavDeviceTools,
         Self::SmsTitle,
         Self::SmsIntro,
         Self::ButtonSmsRefresh,
@@ -1398,7 +1400,7 @@ pub fn template(_language: Language, key: TextKey) -> &'static str {
         TextKey::LoggingRotationFailed => "日志轮换失败；应用仍可运行。",
         TextKey::RepairsTitle => "修复操作",
         TextKey::RepairsReadOnlyNotice => "只有在目标身份和当前证据均有效时，才会启用相应操作。",
-        TextKey::RepairsDriverNotIncluded => "本应用不下载或安装驱动程序。",
+        TextKey::RepairsDriverNotIncluded => "驱动安装需单独确认；正常工作的接口无需重装。",
         TextKey::ConfirmationTitle => "确认执行",
         TextKey::ConfirmationOperation => "操作：{operation}",
         TextKey::ConfirmationTarget => "目标：DJI 一代 4G 模块（VID 2CA3、PID 4006）",
@@ -1453,6 +1455,7 @@ pub fn template(_language: Language, key: TextKey) -> &'static str {
             "未知演示场景，请使用 available、limited、unavailable、absent 或 detecting。"
         }
         TextKey::NavSms => "短信",
+        TextKey::NavDeviceTools => "设备工具",
         TextKey::SmsTitle => "短信",
         TextKey::SmsIntro => {
             "短信功能首次启用会把模块短信格式设为 PDU；读取消息可能将未读标记为已读。"

@@ -17,12 +17,14 @@ use crate::localization::{
     hotspot_title, hotspot_unsupported_reason, rollback_outcome, unexecuted_reason,
 };
 
+pub mod device_tools;
 pub mod diagnostics;
 pub(crate) mod driver_setup;
 pub mod overview;
 pub mod repairs;
 pub mod settings;
 pub mod sms;
+pub(crate) mod sms_layout;
 pub(crate) mod wireless;
 
 pub use diagnostics::{DiagnosticRowVm, DiagnosticsVm, diagnostics_vm};

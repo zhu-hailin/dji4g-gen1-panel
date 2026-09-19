@@ -96,6 +96,38 @@ fn autostart_flag_forces_start_to_tray_without_mutating_config_intent() {
     assert!(normal.start_to_tray(true));
 }
 
+#[test]
+fn the_restart_handoff_takes_a_real_pid_and_refuses_anything_else() {
+    let options = StartupOptions::parse(["--restart-after=4321".to_owned()]).expect("parse args");
+    assert_eq!(options.restart_after, Some(4321));
+    assert!(!options.autostart);
+    assert_eq!(options.demo, None);
+
+    // A restart waits on a process. A missing, empty, negative, zero or out-of-range pid would
+    // make it wait on the wrong thing (or on nothing), so it is refused rather than defaulted.
+    for argument in [
+        "--restart-after=",
+        "--restart-after=0",
+        "--restart-after=-1",
+        "--restart-after=abc",
+        "--restart-after=4294967296",
+        "--restart-after=12x",
+    ] {
+        let parsed = StartupOptions::parse([argument.to_owned()]);
+        assert!(
+            parsed.is_err(),
+            "{argument} must not be accepted as a handoff pid"
+        );
+        assert_eq!(
+            parsed.expect_err("refused").stable_code(),
+            "config:startup_invalid_pid"
+        );
+    }
+
+    // A plain start has no handoff.
+    assert_eq!(StartupOptions::default().restart_after, None);
+}
+
 fn saving_settings(desired_enabled: bool) -> SettingsSnapshot {
     SettingsSnapshot {
         revision: 7,

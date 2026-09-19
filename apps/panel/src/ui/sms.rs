@@ -19,7 +19,7 @@ use dji4g_application::{ControllerSnapshot, UiCommand};
 use dji4g_domain::{FeatureStatus, SmsDirection, SmsEncoding, SmsMessage, SmsStatus};
 use eframe::egui::{self, RichText, Ui};
 
-use super::{StatusTone, meta_text, scale, wrapped_label};
+use super::{StatusTone, meta_text, scale, sms_layout, wrapped_label};
 use crate::app::UiCommandSink;
 use crate::localization::{
     Language, LocalizedText, TextArgs, TextKey, feature_status_note, format_text_in,
@@ -223,6 +223,17 @@ pub fn sms_vm(snapshot: &ControllerSnapshot, messages: &[SmsMessage], language: 
 /// How long a delete confirmation stays armed. Sending uses a persistent confirmation window.
 pub(crate) const CONFIRM_ARM_WINDOW: Duration = Duration::from_secs(3);
 
+/// The height the workspace really received this frame. Recorded in egui's temp memory so the
+/// layout tests can observe the rendered geometry instead of re-deriving it from the arithmetic.
+fn workspace_height_id() -> egui::Id {
+    egui::Id::new("sms-workspace-height")
+}
+
+/// The height the message list really received inside its column, after the search field.
+fn list_viewport_id() -> egui::Id {
+    egui::Id::new("sms-list-viewport")
+}
+
 pub(crate) fn render(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
@@ -286,8 +297,13 @@ fn badge(ui: &mut Ui, text: impl Into<String>, color: egui::Color32) {
 }
 
 fn empty_panel(ui: &mut Ui, title: &str, note: &str, height: f32) {
+    let height = if height.is_finite() {
+        height.max(0.0)
+    } else {
+        0.0
+    };
     ui.vertical_centered(|ui| {
-        ui.add_space((height * 0.20).max(24.0));
+        ui.add_space((height * 0.20).clamp(8.0, 96.0));
         ui.horizontal(|ui| {
             ui.add_space(((ui.available_width() - 68.0) / 2.0).max(0.0));
             egui::Frame::none()
@@ -336,8 +352,19 @@ fn render_inbox(
     } else {
         "设备连接后自动同步短信"
     }));
+    // A sync failure is real information, but it used to print a full paragraph above the list
+    // and eat the space the messages needed. It stays one click away instead.
     if let Some(error) = &state.refresh_error {
-        wrapped_label(ui, RichText::new(error).color(StatusTone::Caution.color()));
+        egui::CollapsingHeader::new(
+            RichText::new("短信同步遇到问题")
+                .size(13.0)
+                .color(StatusTone::Caution.color()),
+        )
+        .id_salt("sms-refresh-error")
+        .default_open(false)
+        .show(ui, |ui| {
+            wrapped_label(ui, RichText::new(error).color(StatusTone::Caution.color()));
+        });
     }
     if vm.has_incomplete {
         wrapped_label(
@@ -355,7 +382,6 @@ fn render_inbox(
         );
     }
     ui.add_space(12.0);
-    let height = (ui.ctx().screen_rect().bottom() - ui.cursor().top() - 170.0).clamp(210.0, 340.0);
     egui::Frame::none()
         .fill(egui::Color32::WHITE)
         .rounding(14.0)
@@ -415,51 +441,80 @@ fn render_inbox(
             }) {
                 state.selected = None;
             }
-            let wide = ui.available_width() >= 720.0;
-            if wide {
-                let width = ui.available_width();
-                let list_width = (width * 0.38).clamp(270.0, 340.0);
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(list_width, height - 88.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            list_panel(ui, &rows, snapshot, language, sink, state, height - 88.0);
-                        },
-                    );
-                    let (divider, _) = ui
-                        .allocate_exact_size(egui::vec2(1.0, height - 88.0), egui::Sense::hover());
-                    ui.painter().line_segment(
-                        [divider.center_top(), divider.center_bottom()],
-                        egui::Stroke::new(1.0_f32, scale::LINE),
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2((width - list_width - 26.0).max(180.0), height - 88.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_min_height(height - 88.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("sms-reader")
-                                .max_height(height - 88.0)
-                                .show(ui, |ui| {
-                                    render_detail(ui, &rows, language, sink, state);
-                                });
-                        },
-                    );
-                });
-            } else if state.selected.is_some() {
-                if ui.button("返回消息列表").clicked() {
-                    state.selected = None;
-                }
-                render_detail(ui, &rows, language, sink, state);
-            } else {
-                list_panel(ui, &rows, snapshot, language, sink, state, height - 88.0);
-            }
+            // Everything the frame has left, minus the footer note, is the workspace. One
+            // subtraction, from the container's real height — no screen-coordinate estimate and
+            // no fixed cap, so a taller window really does show more messages.
+            let workspace_height = (ui.available_height() - sms_layout::FOOTER_RESERVE).max(0.0);
+            let layout = sms_layout::workspace_layout(
+                ui.available_width(),
+                workspace_height,
+                sms_layout::COLUMN_GAP,
+            );
+            ui.data_mut(|data| {
+                data.insert_temp(workspace_height_id(), layout.body_height);
+            });
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), layout.body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    if layout.wide {
+                        ui.horizontal_top(|ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(layout.list_width, layout.body_height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    list_panel(ui, &rows, snapshot, language, sink, state);
+                                },
+                            );
+                            let (divider, _) = ui.allocate_exact_size(
+                                egui::vec2(1.0, layout.body_height),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().line_segment(
+                                [divider.center_top(), divider.center_bottom()],
+                                egui::Stroke::new(1.0_f32, scale::LINE),
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(layout.detail_width, layout.body_height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("sms-reader")
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            render_detail(ui, &rows, language, sink, state);
+                                        });
+                                },
+                            );
+                        });
+                    } else if state.selected.is_some() {
+                        // Narrow layout: the reader replaces the list, the back button stays
+                        // pinned above its own bounded scroll area so a long message scrolls
+                        // inside the reader instead of moving the page.
+                        if ui.button("返回消息列表").clicked() {
+                            state.selected = None;
+                        }
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("sms-reader-narrow")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                render_detail(ui, &rows, language, sink, state);
+                            });
+                    } else {
+                        list_panel(ui, &rows, snapshot, language, sink, state);
+                    }
+                },
+            );
             ui.add_space(14.0);
             ui.separator();
-            ui.label(meta_text(
-                "模块接受发送 ≠ 收件人已收到  ·  短信内容不会写入诊断日志",
-            ));
+            // Truncated to one line so the reserved footer height above stays exact.
+            ui.add(
+                egui::Label::new(meta_text(
+                    "模块接受发送 ≠ 收件人已收到  ·  短信内容不会写入诊断日志",
+                ))
+                .truncate(),
+            );
         });
 }
 
@@ -470,9 +525,10 @@ fn list_panel(
     language: Language,
     sink: &dyn UiCommandSink,
     state: &mut SmsComposeState,
-    height: f32,
 ) {
-    ui.set_min_height(height);
+    // The search field is part of the list column, so the list gets the column's leftover height
+    // directly instead of receiving "height - 88 - 48" from the caller.
+    let column_height = ui.available_height();
     ui.add(
         egui::TextEdit::singleline(&mut state.search)
             .hint_text("搜索号码或短信内容")
@@ -480,6 +536,11 @@ fn list_panel(
             .margin(egui::vec2(12.0, 10.0)),
     );
     ui.add_space(10.0);
+    let search_consumed = (column_height - ui.available_height()).max(0.0);
+    let viewport = sms_layout::list_viewport_height(column_height, search_consumed);
+    ui.data_mut(|data| {
+        data.insert_temp(list_viewport_id(), viewport);
+    });
     if rows.is_empty() {
         let (title, note) = if !state.search.trim().is_empty() {
             ("没有找到相关短信", "试试其他号码或关键词")
@@ -496,7 +557,7 @@ fn list_panel(
                 _ => ("暂时无法读取短信", "请查看上方的具体错误，检查连接后重试"),
             }
         };
-        empty_panel(ui, title, note, height - 60.0);
+        empty_panel(ui, title, note, viewport);
         if !state.outgoing && state.search.is_empty() && !snapshot.sms_refresh_pending {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
@@ -508,7 +569,8 @@ fn list_panel(
     } else {
         egui::ScrollArea::vertical()
             .id_salt("sms-message-list")
-            .max_height(height - 48.0)
+            .auto_shrink([false, false])
+            .max_height(viewport)
             .show(ui, |ui| {
                 render_list(ui, rows, language, sink, state);
             });
@@ -599,7 +661,7 @@ fn render_detail(
             ui,
             "消息阅读区",
             "从左侧选择一条短信，即可在这里查看完整内容",
-            300.0,
+            ui.available_height(),
         );
         return;
     };
@@ -744,6 +806,7 @@ mod tests {
             sms_send: None,
             sms_refresh_pending: false,
             sms_inbox_failure: None,
+            device_tools: Default::default(),
         }
     }
 
@@ -1087,5 +1150,109 @@ mod tests {
                 });
             },
         );
+    }
+
+    struct NoopSink;
+    impl UiCommandSink for NoopSink {
+        fn try_send(&self, _command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+            Ok(())
+        }
+    }
+
+    /// Render the page into a window of `width` x `height` logical points and report the heights
+    /// the workspace and the message list really received. Two passes are run so the values from
+    /// the first frame (used by egui to size scroll areas) are settled by the second.
+    fn measured_heights(width: f32, height: f32) -> (f32, f32) {
+        let snapshot = snapshot(SmsInboxSummary {
+            message_count: 3,
+            unread_count: 1,
+            capacity: Some((2, 30)),
+            status: FeatureStatus::Supported,
+            has_incomplete: false,
+            evicted: 0,
+        });
+        let messages = vec![
+            message(1, Some(true), SmsStatus::Received),
+            message(2, Some(false), SmsStatus::Received),
+            message(3, Some(false), SmsStatus::Received),
+        ];
+        let sink = NoopSink;
+        let mut state = SmsComposeState::default();
+        let context = egui::Context::default();
+        for _ in 0..2 {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        render(ui, &snapshot, &messages, Language::ZhCn, &sink, &mut state);
+                    });
+                },
+            );
+        }
+        context.data(|data| {
+            (
+                data.get_temp::<f32>(workspace_height_id()).unwrap_or(0.0),
+                data.get_temp::<f32>(list_viewport_id()).unwrap_or(0.0),
+            )
+        })
+    }
+
+    /// The user-visible regression: the list viewport used to be capped, so making the window
+    /// taller did not show more messages. It must now track the window one-for-one.
+    #[test]
+    fn the_list_viewport_grows_with_the_window_instead_of_hitting_a_cap() {
+        let (short_workspace, short_list) = measured_heights(1100.0, 760.0);
+        let (tall_workspace, tall_list) = measured_heights(1100.0, 1000.0);
+        let workspace_gain = tall_workspace - short_workspace;
+        let list_gain = tall_list - short_list;
+        eprintln!(
+            "1100x760 -> workspace {short_workspace}, list {short_list}; \
+             1100x1000 -> workspace {tall_workspace}, list {tall_list}"
+        );
+        assert!(
+            (workspace_gain - 240.0).abs() <= 16.0,
+            "workspace gain {workspace_gain} (short {short_workspace}, tall {tall_workspace})"
+        );
+        assert!(
+            (list_gain - 240.0).abs() <= 16.0,
+            "list gain {list_gain} (short {short_list}, tall {tall_list})"
+        );
+        // The old implementation froze the body at 340 - 88 - 48 = 204 points.
+        assert!(
+            short_list > 204.0 + 16.0,
+            "760-point window still looks capped: {short_list}"
+        );
+    }
+
+    #[test]
+    fn the_workspace_stays_inside_the_page_and_never_panics_at_odd_sizes() {
+        for (width, height) in [
+            (320.0_f32, 600.0_f32),
+            (719.0, 600.0),
+            (720.0, 600.0),
+            (800.0, 600.0),
+            (1440.0, 1000.0),
+            (1100.0, 300.0),
+        ] {
+            let (workspace, list) = measured_heights(width, height);
+            assert!(
+                workspace >= 0.0 && workspace.is_finite(),
+                "{width}x{height} workspace {workspace}"
+            );
+            assert!(
+                list >= 0.0 && list.is_finite(),
+                "{width}x{height} list {list}"
+            );
+            assert!(
+                list <= workspace + 0.5,
+                "{width}x{height} list {list} exceeds workspace {workspace}"
+            );
+        }
     }
 }

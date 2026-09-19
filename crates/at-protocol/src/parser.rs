@@ -357,7 +357,7 @@ fn response_is_complete(command: &AtCommand, line_count: usize, sms_records: usi
     }
 }
 
-fn is_known_urc(line: &str) -> bool {
+pub(crate) fn is_known_urc(line: &str) -> bool {
     if ["+CEREG:", "+CGREG:", "+CREG:"]
         .iter()
         .any(|prefix| is_registration_urc(line, prefix))

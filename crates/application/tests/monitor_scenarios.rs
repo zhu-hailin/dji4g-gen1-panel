@@ -871,6 +871,7 @@ fn runner_executes_inventory_at_adapter_probe_dag_and_publishes_one_snapshot() {
         probe: Arc::clone(&probe) as Arc<dyn NetworkProbePort>,
         hotspot: None,
         sms: None,
+        device_tools: None,
     });
     runner.run_one_refresh();
     let snapshot = handle.subscribe().borrow();
@@ -954,6 +955,7 @@ fn stage_watchdog_bounds_a_blocked_stage_and_the_next_cycle_recovers() {
             }) as Arc<dyn NetworkProbePort>,
             hotspot: None,
             sms: None,
+            device_tools: None,
         })
         .with_stage_timeout(Duration::from_millis(100));
 
@@ -1045,6 +1047,7 @@ fn present_device_with_broken_at_port_is_recognised_and_explained() {
         }) as Arc<dyn NetworkProbePort>,
         hotspot: None,
         sms: None,
+        device_tools: None,
     });
 
     assert!(
@@ -1102,6 +1105,7 @@ fn monitoring_cadence_rescans_without_any_user_command() {
         probe: Arc::clone(&probe) as Arc<dyn NetworkProbePort>,
         hotspot: None,
         sms: None,
+        device_tools: None,
     });
 
     assert!(
@@ -1569,6 +1573,7 @@ fn rate_tick_updates_rates_without_touching_observed_at_or_freshness() {
         }) as Arc<dyn NetworkProbePort>,
         hotspot: None,
         sms: None,
+        device_tools: None,
     });
 
     // The first evidence refresh binds the adapter and lays down the rate baseline (no rate yet).

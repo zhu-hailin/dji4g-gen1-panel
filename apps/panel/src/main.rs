@@ -26,6 +26,12 @@ use dji4g_windows_platform::{AcquireResult, ActivationRequest, AutostartControl,
 #[cfg(debug_assertions)]
 use dji4g_panel::demo::{DemoScenario, demo_snapshot};
 
+/// How long a restarted panel waits for the process it replaces to release the single-instance
+/// mutex. Long enough for a graceful shutdown (the tray worker and the serial actor both get
+/// their own bounded close), short enough that a wedged shutdown still ends up in front of the
+/// user as an activated window rather than a process that never starts.
+const RESTART_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The 256 px brand icon shown on the window, taskbar, and Alt-Tab switcher.
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/brand/icon.png");
 
@@ -107,6 +113,20 @@ fn main() {
                 }
             }
         });
+
+    // A restart hands the single-instance mutex over: wait (bounded) for the process this one
+    // replaces, then take it. If the wait fails — it exited and its pid was reused, or it is
+    // still busy — the ordinary single-instance path below decides, which at worst activates the
+    // running instance instead of starting a second one.
+    if let Some(previous) = startup.restart_after {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = dji4g_windows_platform::driver_setup::wait_for_panel_exit(
+                previous,
+                &exe,
+                RESTART_HANDOFF_TIMEOUT,
+            );
+        }
+    }
 
     let instance = match SingleInstance::acquire() {
         Ok(AcquireResult::Primary(instance)) => Some(instance),

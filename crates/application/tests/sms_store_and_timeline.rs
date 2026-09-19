@@ -1164,6 +1164,7 @@ fn sms_runner(
         probe: Arc::new(QuietProbe) as Arc<dyn NetworkProbePort>,
         hotspot: None,
         sms: Some(Arc::clone(&sms) as Arc<dyn SmsPort>),
+        device_tools: None,
     });
     (clock, runner)
 }
@@ -1373,6 +1374,7 @@ fn runner_without_a_wired_sms_port_keeps_requests_queued() {
         probe: Arc::new(QuietProbe) as Arc<dyn NetworkProbePort>,
         hotspot: None,
         sms: None,
+        device_tools: None,
     });
 
     runner

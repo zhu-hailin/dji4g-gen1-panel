@@ -2,7 +2,7 @@
 
 面向 Windows 的 DJI 第一代 4G 模块管理工具，使用 Rust + egui 构建。集中查看连接、无线参数、短信、诊断与修复操作。
 
-[下载开发版](https://github.com/zhu-hailin/dji4g-gen1-panel/releases) · [使用说明](docs/使用说明.txt) · [更新记录](docs/RELEASE_NOTES_20260915.md) · [安全说明](SECURITY.md)
+[下载最新版](https://github.com/zhu-hailin/dji4g-gen1-panel/releases/latest) · [使用说明](docs/使用说明.txt) · [更新记录](docs/RELEASE_NOTES_0.1.2.md) · [安全说明](SECURITY.md)
 
 ## 短信工作区
 

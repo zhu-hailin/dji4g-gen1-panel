@@ -257,6 +257,10 @@ pub struct ControllerSnapshot {
     pub sms_send: Option<dji4g_domain::SmsSendSnapshot>,
     pub sms_refresh_pending: bool,
     pub sms_inbox_failure: Option<crate::PortError>,
+    /// Device-tool task, capability evidence, module profile and bounded transcript history
+    /// (§7). The type redacts request and response text from `Debug` and never implements
+    /// `Serialize`, so this section can ride in the snapshot without reaching a log or an export.
+    pub device_tools: crate::DeviceToolsSnapshot,
 }
 
 impl ControllerSnapshot {
@@ -674,6 +678,11 @@ impl ReducerState {
         self.publication_revision = self.publication_revision.saturating_add(1);
     }
 
+    /// The AT port the inventory proved for the current device, if one was observed.
+    pub(crate) fn inventory_at_port(&self) -> Option<String> {
+        self.inventory_at_port.clone()
+    }
+
     pub(crate) fn target_identity(&self) -> Option<StableDeviceIdentity> {
         self.target_identity
             .as_ref()
@@ -828,6 +837,7 @@ impl ReducerState {
             sms_send: None,
             sms_refresh_pending: false,
             sms_inbox_failure: None,
+            device_tools: crate::DeviceToolsSnapshot::default(),
         }
     }
 

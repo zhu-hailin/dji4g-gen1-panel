@@ -4,6 +4,7 @@
 
 mod confirmation;
 mod controller;
+mod device_tools;
 mod features;
 mod monitor;
 mod ports;
@@ -21,6 +22,15 @@ pub use controller::{
     COMMAND_QUEUE_CAPACITY, CommandReceipt, Controller, ControllerHandle, PLAN_LIFETIME,
     PrepareError, SmsRequest, UiCommand, UiSendError,
 };
+pub use device_tools::{
+    DeviceToolsSnapshot, EXPERT_PLAN_LIFETIME, MAX_TOOL_HISTORY_BYTES, MAX_TOOL_HISTORY_ITEMS,
+    MAX_TRANSCRIPT_BYTES, ModuleProfile, PROBE_BATCH_BUDGET, PendingExpertTool,
+    TOOL_TRANSACTION_TIMEOUT, ToolCapabilityRow, ToolContext, ToolControl, ToolHistory,
+    ToolHistoryEntry, ToolMode, ToolOperation, ToolOperationKind, ToolOutcome, ToolPhase,
+    ToolReceipt, ToolRequest, ToolTaskSnapshot, ToolTranscript, UsbNetReading, as_at_response,
+    extract_identity, extract_payload, item_deadline, parse_profile_temperature, parse_usb_net,
+    transcript_from_response,
+};
 pub use features::{FeatureCapability, FeatureKey};
 pub use monitor::{
     ControllerRunner, MonitorPorts, RATE_READ_TIMEOUT, RATE_TICK_INTERVAL, REFRESH_INTERVAL,
@@ -30,13 +40,13 @@ pub use ports::{
     ActionExecutor, ActionPreconditions, AdapterContext, AdapterMetrics, AdapterObservationDto,
     AdapterPort, AdapterStateDto, AtObservation, AtPort, AutostartApplyOutcome, AutostartControl,
     AutostartKnownState, AutostartStatus, Clock, CommandState, CommandStateSnapshot,
-    DefaultRouteDto, DevicePresenceDto, ExecutionReceipt, ExecutionReceiptOutcome, FailureCode,
-    FakeActionExecutor, FakeClock, HotspotControl, HotspotObservation, InventoryObservation,
-    InventoryPort, LanguageCode, LogLevel, MonoTime, NetworkProbePort, NormalizedNetworkEvidence,
-    PortError, PortFuture, PrivilegedExecutor, ProbeObservationDto, ProbeStageDto,
-    SettingsPersistenceState, SettingsSaveOutcome, SettingsSnapshot, SmsListing, SmsPort,
-    SmsSendReceipt, SmsSendResult, StableCode, StableCodeError, SystemRouteDto, TargetContext,
-    mask_recipient,
+    DefaultRouteDto, DevicePresenceDto, DeviceToolsPort, ExecutionReceipt, ExecutionReceiptOutcome,
+    FailureCode, FakeActionExecutor, FakeClock, HotspotControl, HotspotObservation,
+    InventoryObservation, InventoryPort, LanguageCode, LogLevel, MonoTime, NetworkProbePort,
+    NormalizedNetworkEvidence, PortError, PortFuture, PrivilegedExecutor, ProbeObservationDto,
+    ProbeStageDto, SettingsPersistenceState, SettingsSaveOutcome, SettingsSnapshot, SmsListing,
+    SmsPort, SmsSendReceipt, SmsSendResult, StableCode, StableCodeError, SystemRouteDto,
+    TargetContext, mask_recipient,
 };
 pub use reducer::{
     ActionReadiness, ActionReadinessKey, BackendEvent, CheckMask, CheckResult, ControllerSnapshot,

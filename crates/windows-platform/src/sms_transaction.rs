@@ -245,6 +245,9 @@ fn actor_failure(error: ActorError, control: &SmsTransactionControl) -> SmsSubmi
         ActorError::Closed => detail.code = "sms:device_removed".into(),
         ActorError::QueueFull => detail.code = "sms:port_busy".into(),
         ActorError::FinalCode(_) => detail.code = "sms:unexpected_final_code".into(),
+        // The SMS path never issues a tool transaction; the arm keeps the mapping total without
+        // pretending this error can occur here.
+        ActorError::Tool(_) => detail.code = "sms:internal".into(),
     }
     receipt
 }

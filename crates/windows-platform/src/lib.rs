@@ -4,6 +4,7 @@
 
 mod adapter;
 pub mod autostart;
+mod device_tools;
 pub mod driver_setup;
 pub mod hotspot;
 mod pnp;
@@ -45,6 +46,7 @@ pub fn driver_setup_powershell() -> std::io::Result<std::path::PathBuf> {
 }
 pub use autostart::atomic_replace_file_public as atomic_replace_file;
 pub use autostart::*;
+pub use device_tools::*;
 pub use hotspot::*;
 pub use pnp::*;
 pub use privilege::*;
