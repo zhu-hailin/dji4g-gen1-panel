@@ -91,6 +91,8 @@ fn captured_view(numbers_status: FeatureStatus, iccid_status: FeatureStatus) -> 
         serving_cell_status: FeatureStatus::NotProbed,
         iccid_full: Some("89860123456789012345".to_owned()),
         serving_cell_raw: None,
+        temperature_sensors: Vec::new(),
+        temperature_raw: None,
     }
 }
 

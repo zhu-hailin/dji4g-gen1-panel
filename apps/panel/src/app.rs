@@ -360,6 +360,12 @@ pub struct PanelApp {
     /// Wall clock of the last ring sample, so the chart records exactly one point per second
     /// regardless of how often the snapshot's rates change.
     last_rate_sample_at: Option<SystemTime>,
+    /// Module-temperature trend of the current device (§7.5): one point per published evidence
+    /// cycle, cleared when the device epoch changes so two modules are never charted as one line.
+    temperature_history: crate::ui::TemperatureHistory,
+    /// Device epoch and observation time of the newest ring sample, so a cycle that produced no
+    /// new evidence adds nothing and a repaint alone never duplicates a point.
+    last_temperature_sample: Option<(u64, SystemTime)>,
     notifier: AvailabilityNotifier,
     tray_wake_installed: bool,
     /// The panel's real viewport window (raw Win32 `HWND` value), located once at startup and
@@ -439,6 +445,8 @@ impl PanelApp {
             tray_tooltip_last: None,
             rate_history: crate::ui::RateHistory::default(),
             last_rate_sample_at: None,
+            temperature_history: crate::ui::TemperatureHistory::default(),
+            last_temperature_sample: None,
             notifier: AvailabilityNotifier::default(),
             tray_wake_installed: false,
             panel_hwnd: panel_window_handle(),
@@ -486,6 +494,8 @@ impl PanelApp {
             tray_tooltip_last: None,
             rate_history: crate::ui::RateHistory::default(),
             last_rate_sample_at: None,
+            temperature_history: crate::ui::TemperatureHistory::default(),
+            last_temperature_sample: None,
             notifier: AvailabilityNotifier::default(),
             tray_wake_installed: false,
             panel_hwnd: None,
@@ -919,6 +929,44 @@ impl PanelApp {
         ));
     }
 
+    /// Record one module-temperature point per published evidence cycle, stamped with that cycle's
+    /// `observed_at` rather than the frame time.
+    ///
+    /// The value and its timestamp both come from the applied snapshot, so the trend and the
+    /// 温度 row can never disagree, and a repaint alone adds nothing: a cycle that produced no new
+    /// evidence (or was skipped because the port was busy) leaves an honest gap in the line.
+    /// Changing device clears the ring, because readings from two modules are not one trend.
+    pub fn sample_temperature_on_observation(&mut self) {
+        let Some(device_epoch) = self
+            .snapshot
+            .app
+            .device
+            .as_ref()
+            .map(|device| device.epoch.0)
+        else {
+            return;
+        };
+        let observed_at = self.snapshot.app.observed_at;
+        if self.last_temperature_sample == Some((device_epoch, observed_at)) {
+            return;
+        }
+        if self
+            .last_temperature_sample
+            .is_some_and(|(last_epoch, _)| last_epoch != device_epoch)
+        {
+            self.temperature_history = crate::ui::TemperatureHistory::default();
+        }
+        self.last_temperature_sample = Some((device_epoch, observed_at));
+        self.temperature_history.push((
+            observed_at,
+            self.snapshot
+                .app
+                .cellular
+                .as_ref()
+                .and_then(|cellular| cellular.temperature_celsius),
+        ));
+    }
+
     /// Announce a hidden-window availability transition through the tray.  Title carries the
     /// verdict, body the precise reason sentence — both from the closed localization catalog, so
     /// no identifier or raw code ever reaches the shell.
@@ -1197,6 +1245,7 @@ impl PanelApp {
                                         self.language,
                                         self,
                                         &self.rate_history,
+                                        &self.temperature_history,
                                         probe_view.as_ref(),
                                     );
                                 }
@@ -1569,6 +1618,7 @@ impl eframe::App for PanelApp {
         // just finished a box and cleared the busy flag without a state change yet.
         self.drive_native_dialogs();
         self.sample_rates_on_cadence(SystemTime::now());
+        self.sample_temperature_on_observation();
         self.render(ctx, frame);
     }
 }
@@ -1951,6 +2001,133 @@ mod tests {
         assert_eq!(app.rate_history_len(), 2);
         app.sample_rates_on_cadence(start + Duration::from_secs(2));
         assert_eq!(app.rate_history_len(), 3);
+    }
+
+    /// A snapshot with a bound device and one temperature reading, for the trend-sampling tests.
+    fn temperature_snapshot(
+        epoch: u64,
+        observed_at: SystemTime,
+        celsius: Option<i16>,
+    ) -> Arc<ControllerSnapshot> {
+        use dji4g_domain::{
+            AppSnapshot, AttachState, CellularSnapshot, DeviceEpoch, DeviceSnapshot, FeatureStatus,
+            Freshness, HotspotStatus, RegistrationState, SimState, StableDeviceIdentity,
+        };
+        let mut snapshot = ReducerState::new(SystemTime::UNIX_EPOCH).snapshot();
+        snapshot.app = Arc::new(AppSnapshot {
+            revision: 1,
+            observed_at,
+            freshness: Freshness::Fresh,
+            availability: Availability::Available,
+            hotspot: HotspotStatus::Off,
+            device: Some(DeviceSnapshot {
+                epoch: DeviceEpoch(epoch),
+                identity: StableDeviceIdentity {
+                    container_id: "container".to_owned(),
+                    device_instance_id: "instance".to_owned(),
+                    vid: 0x2ca3,
+                    pid: 0x4006,
+                },
+                problem_code: None,
+                at_port: Some("COM7".to_owned()),
+                adapter_id: None,
+            }),
+            cellular: Some(CellularSnapshot {
+                sim: SimState::Ready,
+                registration: RegistrationState::RegisteredHome,
+                attached: AttachState::Attached,
+                carrier: None,
+                radio_access_technology: None,
+                signal_rssi_dbm: None,
+                apn: None,
+                pdp_address: None,
+                pdp_state: None,
+                firmware: None,
+                serving_cell: None,
+                sim_identity: None,
+                numbers: None,
+                temperature_celsius: celsius,
+                temperature_status: FeatureStatus::Supported,
+            }),
+            network: None,
+            active_operation: None,
+            issues: Vec::new(),
+        });
+        Arc::new(snapshot)
+    }
+
+    fn panel_with_temperature(
+        epoch: u64,
+        observed_at: SystemTime,
+        celsius: Option<i16>,
+    ) -> PanelApp {
+        PanelApp::from_snapshot(
+            temperature_snapshot(epoch, observed_at, celsius),
+            Arc::new(NoopSink),
+        )
+    }
+
+    #[test]
+    fn temperature_sampling_records_one_point_per_observation_cycle() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut app = panel_with_temperature(1, start, Some(57));
+        app.sample_temperature_on_observation();
+        assert_eq!(app.temperature_history.len(), 1);
+        assert_eq!(
+            app.temperature_history.last(),
+            Some(&(start, Some(57))),
+            "the sample is stamped with the observation time, not the frame time"
+        );
+        // A repaint, or any snapshot republish without new evidence, adds nothing.
+        app.sample_temperature_on_observation();
+        assert_eq!(app.temperature_history.len(), 1);
+        // The next evidence cycle carries its own observation time.
+        let mut next = (*app.snapshot).clone();
+        let mut app_snapshot = (*next.app).clone();
+        app_snapshot.observed_at = start + Duration::from_secs(10);
+        next.app = Arc::new(app_snapshot);
+        app.snapshot = Arc::new(next);
+        app.sample_temperature_on_observation();
+        assert_eq!(app.temperature_history.len(), 2);
+        assert_eq!(app.temperature_history.previous_reading(), Some(57));
+    }
+
+    #[test]
+    fn a_cycle_without_a_reading_stays_an_honest_gap() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut app = panel_with_temperature(1, start, Some(57));
+        app.sample_temperature_on_observation();
+        // The probe could not read the module this cycle: the ring records the gap, never a zero.
+        app.snapshot = temperature_snapshot(1, start + Duration::from_secs(10), None);
+        app.sample_temperature_on_observation();
+        assert_eq!(
+            app.temperature_history.last(),
+            Some(&(start + Duration::from_secs(10), None))
+        );
+    }
+
+    #[test]
+    fn another_module_never_continues_the_previous_trend() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut app = panel_with_temperature(1, start, Some(57));
+        app.sample_temperature_on_observation();
+        assert_eq!(app.temperature_history.len(), 1);
+        // A device change clears the ring: two modules are not one trend line.
+        app.snapshot = temperature_snapshot(2, start + Duration::from_secs(10), Some(40));
+        app.sample_temperature_on_observation();
+        assert_eq!(app.temperature_history.len(), 1);
+        assert_eq!(
+            app.temperature_history.last(),
+            Some(&(start + Duration::from_secs(10), Some(40)))
+        );
+        assert!(app.temperature_history.previous_reading().is_none());
+    }
+
+    #[test]
+    fn a_panel_without_a_device_records_no_temperature_points() {
+        let mut app = panel();
+        app.sample_temperature_on_observation();
+        assert!(app.temperature_history.is_empty());
     }
 
     #[test]

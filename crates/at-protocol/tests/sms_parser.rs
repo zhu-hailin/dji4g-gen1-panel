@@ -1,6 +1,6 @@
 use dji4g_at_protocol::{
-    AtCommand, AtEvent, AtFinalCode, AtResponse, ProtocolErrorKind, StreamingParser,
-    decode_deliver_pdu, parse_cmti_line, parse_qtemp_lines,
+    AtCommand, AtEvent, AtFinalCode, AtResponse, ProtocolErrorKind, SensorTemperature,
+    StreamingParser, decode_deliver_pdu, parse_cmti_line, parse_qtemp_lines,
 };
 use dji4g_domain::{DeviceEpoch, SmsStorageId};
 
@@ -16,6 +16,9 @@ fn fixture(name: &str) -> Vec<u8> {
             include_str!("../../../tests/fixtures/at/sms_cmti_interleaved.txt")
         }
         "sms_qtemp_multi" => include_str!("../../../tests/fixtures/at/sms_qtemp_multi.txt"),
+        "qtemp_unnamed_multi" => {
+            include_str!("../../../tests/fixtures/at/qtemp_unnamed_multi.txt")
+        }
         "sms_cmgl_empty" => include_str!("../../../tests/fixtures/at/sms_cmgl_empty.txt"),
         "sms_cmgl_66_lines" => include_str!("../../../tests/fixtures/at/sms_cmgl_66_lines.txt"),
         other => panic!("unknown fixture {other}"),
@@ -139,12 +142,137 @@ fn parses_qtemp_multiple_sensor_lines() {
     assert_eq!(
         parse_qtemp_lines(&lines),
         [
-            ("modem".to_owned(), 41),
-            ("pa".to_owned(), 39),
-            ("wifi".to_owned(), -5),
+            SensorTemperature {
+                name: Some("modem".to_owned()),
+                celsius: 41,
+            },
+            SensorTemperature {
+                name: Some("pa".to_owned()),
+                celsius: 39,
+            },
+            SensorTemperature {
+                name: Some("wifi".to_owned()),
+                celsius: -5,
+            },
         ]
     );
     assert_eq!(response.final_code, AtFinalCode::Ok);
+}
+
+#[test]
+fn parses_the_unnamed_positional_qtemp_layout() {
+    // The DJI Gen-1 firmware answers `AT+QTEMP` with a bare positional list rather than the
+    // `"name",value` pairs other modules use.  The values are read in report order and the
+    // channels stay unnamed — the position is the only identity the device gave.
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
+    let response = one_response(
+        parser
+            .push(&fixture("qtemp_unnamed_multi"))
+            .expect("the unnamed positional layout is a valid response"),
+    );
+    assert_eq!(response.lines, ["+QTEMP: 57,51,51"]);
+    assert_eq!(response.final_code, AtFinalCode::Ok);
+    let lines: Vec<&str> = response.lines.iter().map(String::as_str).collect();
+    assert_eq!(
+        parse_qtemp_lines(&lines),
+        [
+            SensorTemperature {
+                name: None,
+                celsius: 57,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+        ]
+    );
+}
+
+#[test]
+fn temperature_keeps_an_unmodelled_line_without_failing_the_transaction() {
+    // A firmware-defined sensor read must not be decided by one line's shape: an extra unknown
+    // line is collected (and shown to the user) while the readable `+QTEMP:` answer still lands.
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
+    let response = one_response(
+        parser
+            .push(b"+QTEMP: 57,51,51\r\n+QTEMP: \"modem\"\r\nsome vendor notice\r\nOK\r\n")
+            .expect("an unmodelled line is tolerated, not fatal"),
+    );
+    assert_eq!(
+        response.lines,
+        [
+            "+QTEMP: 57,51,51",
+            "+QTEMP: \"modem\"",
+            "some vendor notice"
+        ]
+    );
+    let lines: Vec<&str> = response.lines.iter().map(String::as_str).collect();
+    assert_eq!(
+        parse_qtemp_lines(&lines),
+        [
+            SensorTemperature {
+                name: None,
+                celsius: 57,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+        ]
+    );
+}
+
+#[test]
+fn temperature_accepts_an_empty_and_a_long_sensor_list() {
+    // Sensor count is firmware-defined: a plain OK is a clean no-data answer...
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
+    let response = one_response(
+        parser
+            .push(b"OK\r\n")
+            .expect("an OK without sensor lines is a valid empty result"),
+    );
+    assert!(response.lines.is_empty());
+
+    // ...and a long multi-channel report must not be cut off at an arbitrary count.
+    let nine = "+QTEMP: \"s\",1\r\n".repeat(9) + "OK\r\n";
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
+    let response = one_response(
+        parser
+            .push(nine.as_bytes())
+            .expect("nine sensor lines are a valid report"),
+    );
+    assert_eq!(response.lines.len(), 9);
+}
+
+#[test]
+fn temperature_still_rejects_foreign_wire_data() {
+    // Tolerance is about an unmodelled *answer*, never about the wrong port: binary noise and
+    // NMEA sentences keep failing closed.
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
+    assert_eq!(
+        parser
+            .push(b"+QTEMP: 57,51,51\r\n\x01\x02\x03\r\nOK\r\n")
+            .expect_err("binary noise must fail closed")
+            .kind,
+        ProtocolErrorKind::WrongPortData
+    );
+
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
+    assert_eq!(
+        parser
+            .push(b"$GPGGA,123519,4807.038,N\r\nOK\r\n")
+            .expect_err("NMEA data must fail closed")
+            .kind,
+        ProtocolErrorKind::WrongPortData
+    );
 }
 
 #[test]
@@ -177,29 +305,7 @@ fn sms_list_accepts_sixty_six_records_and_rejects_above_two_hundred() {
 }
 
 #[test]
-fn temperature_accepts_up_to_eight_sensor_lines_and_rejects_more() {
-    let eight = "+QTEMP: \"s\",1\r\n".repeat(8) + "OK\r\n";
-    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
-    let response = one_response(
-        parser
-            .push(eight.as_bytes())
-            .expect("eight sensors are valid"),
-    );
-    assert_eq!(response.lines.len(), 8);
-
-    let nine = "+QTEMP: \"s\",1\r\n".repeat(9) + "OK\r\n";
-    let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
-    assert_eq!(
-        parser
-            .push(nine.as_bytes())
-            .expect_err("nine sensors fail")
-            .kind,
-        ProtocolErrorKind::WrongPortData
-    );
-}
-
-#[test]
-fn rejects_malformed_sms_and_temperature_response_shapes() {
+fn rejects_malformed_sms_response_shapes() {
     let cases = [
         (AtCommand::SmsMessageFormat, "+CMGF: 2"),
         (AtCommand::SmsStorageQuery, "+CPMS: \"SM\""),
@@ -207,8 +313,6 @@ fn rejects_malformed_sms_and_temperature_response_shapes() {
         (AtCommand::SmsList, "+CMGL: 10000,1,,24"),
         (AtCommand::SmsList, "+CMGL: x,1,,24"),
         (AtCommand::SmsRead { index: 1 }, "+CMGR: 5,,24"),
-        (AtCommand::Temperature, "+QTEMP: \"modem\""),
-        (AtCommand::Temperature, "+QTEMP: modem,41"),
     ];
 
     for (command, line) in cases {
@@ -220,6 +324,28 @@ fn rejects_malformed_sms_and_temperature_response_shapes() {
                 .kind,
             ProtocolErrorKind::WrongPortData,
             "command: {command:?}, line: {line}"
+        );
+    }
+}
+
+#[test]
+fn unmodelled_temperature_lines_complete_without_readings() {
+    // An unreadable QTEMP line no longer aborts the transaction — the streaming layer only decides
+    // attribution. Interpreting it yields no reading, which the probe reports as a format
+    // mismatch and the UI shows together with the raw line.
+    for line in ["+QTEMP: \"modem\"", "+QTEMP: modem,41", "+QTEMP: 57,x"] {
+        let mut parser = StreamingParser::new(EPOCH, AtCommand::Temperature);
+        let response = one_response(
+            parser
+                .push(format!("{line}\r\nOK\r\n").as_bytes())
+                .expect("an unmodelled line is collected, not fatal"),
+        );
+        assert_eq!(response.lines, [line]);
+        assert_eq!(response.final_code, AtFinalCode::Ok);
+        let lines: Vec<&str> = response.lines.iter().map(String::as_str).collect();
+        assert!(
+            parse_qtemp_lines(&lines).is_empty(),
+            "line: {line} carries no reading"
         );
     }
 }
@@ -277,13 +403,37 @@ fn parse_qtemp_lines_skips_malformed_lines_without_panicking() {
         "+QTEMP: \"pa\",-10",
         "+QTEMP: modem,1",
         "+QTEMP: \"sensor with space\",0",
+        "+QTEMP: 57,51,51",
+        "+QTEMP: 57,x",
+        "+QTEMP: 1,\"modem\",2",
     ];
     assert_eq!(
         parse_qtemp_lines(&lines),
         [
-            ("modem".to_owned(), 42),
-            ("pa".to_owned(), -10),
-            ("sensor with space".to_owned(), 0),
+            SensorTemperature {
+                name: Some("modem".to_owned()),
+                celsius: 42,
+            },
+            SensorTemperature {
+                name: Some("pa".to_owned()),
+                celsius: -10,
+            },
+            SensorTemperature {
+                name: Some("sensor with space".to_owned()),
+                celsius: 0,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 57,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
         ]
     );
 }

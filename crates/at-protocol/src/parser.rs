@@ -4,7 +4,7 @@ use dji4g_domain::DeviceEpoch;
 
 use crate::{
     AtCommand, AtEvent, AtFinalCode, AtResponse, AtUrc, PdpContextId, ProtocolError,
-    ProtocolErrorKind,
+    ProtocolErrorKind, SensorTemperature,
 };
 
 const MAX_LINE_BYTES: usize = 4096;
@@ -18,6 +18,9 @@ const SMS_MAX_INDEX: u32 = 9999;
 const MAX_SMS_LIST_RECORDS: usize = 200;
 /// Upper bound for one PDU hex line inside a transaction (140-octet user data plus headers).
 const MAX_PDU_HEX_CHARS: usize = 1024;
+/// Upper bound for the channels of one `+QTEMP:` positional list.  A longer run of bare numbers
+/// is not a plausible sensor report and is skipped whole rather than read as temperatures.
+const MAX_QTEMP_CHANNELS: usize = 8;
 
 pub struct StreamingParser {
     epoch: DeviceEpoch,
@@ -240,6 +243,23 @@ enum LineClassification {
 }
 
 fn classify_line(command: &AtCommand, line: &str, expecting_pdu: bool) -> LineClassification {
+    if matches!(command, AtCommand::Temperature) {
+        // The QTEMP sensor layout is firmware-defined (research §7.5) and this module answers with
+        // an unnamed positional list.  The streaming boundary therefore decides *attribution*
+        // only: a `+QTEMP:` answer carrying at least one readable value is this command's
+        // response, and any other text line is collected as an unattributable free-form line
+        // (bounded by MAX_UNRECOGNIZED_LINES) instead of failing the whole optional probe.
+        // Interpreting the layout stays `parse_qtemp_lines`'s job.  Wire-level faults (NMEA,
+        // binary noise, oversized lines) are still rejected above this point.
+        if is_known_urc(line) {
+            return LineClassification::Urc;
+        }
+        return if is_qtemp_response(line) {
+            LineClassification::Response
+        } else {
+            LineClassification::FreeFormResponse
+        };
+    }
     if matches!(command, AtCommand::ServingCellInfo) && line.starts_with("+QENG:") {
         // Unsolicited +QENG reports and other shapes stay Invalid for this command; only the
         // strict modeled response is trusted.
@@ -352,8 +372,10 @@ fn response_is_complete(command: &AtCommand, line_count: usize, sms_records: usi
         AtCommand::SmsSetPduMode | AtCommand::SmsDelete { .. } => line_count == 0,
         // Submission: the `+CMGS: <reference>` line is optional; the final OK still gates.
         AtCommand::SmsSend { .. } => line_count <= 1,
-        // Multi-sensor QTEMP layouts are firmware-defined; more than eight is not trusted.
-        AtCommand::Temperature => (1..=8).contains(&line_count),
+        // Sensor count and channel layout are firmware-defined; a plain OK is a clean "no data"
+        // result rather than a protocol fault, and the unattributable-line bound already caps how
+        // much unrecognised text one transaction may collect.
+        AtCommand::Temperature => line_count <= MAX_UNRECOGNIZED_LINES,
     }
 }
 
@@ -781,15 +803,11 @@ fn is_cmgr_response(line: &str) -> bool {
     !fields.is_empty() && parse_u8(fields[0]).is_some_and(|stat| stat <= 4)
 }
 
-/// `+QTEMP: "<name>",<value>`; the name must be a non-empty quoted string.
+/// Whether a line is attributable to an `AtCommand::Temperature` transaction.  Attribution asks
+/// only whether this is a `+QTEMP:` answer carrying at least one readable value; the layout is
+/// interpreted by [`parse_qtemp_line`], never guessed here.
 fn is_qtemp_response(line: &str) -> bool {
-    let Some(payload) = nonempty_payload(line, "+QTEMP:") else {
-        return false;
-    };
-    let Some([name, value]) = exactly_two_fields(payload) else {
-        return false;
-    };
-    is_nonempty_quoted(name) && parse_i16(value).is_some()
+    !parse_qtemp_line(line).is_empty()
 }
 
 /// The PDU hex line that follows a `+CMGL:`/`+CMGR:` header in PDU mode.
@@ -837,20 +855,65 @@ pub fn parse_cmti_line(line: &str) -> Option<(dji4g_domain::SmsStorageId, u32)> 
     ))
 }
 
-/// Parse `+QTEMP: "<name>",<value>` lines (research §7.5). Malformed lines are skipped, never
-/// guessed; sensor names and thresholds remain firmware-defined.
-pub fn parse_qtemp_lines(lines: &[&str]) -> Vec<(String, i16)> {
+/// Parse `+QTEMP` readings (research §7.5).  Malformed lines are skipped, never guessed; sensor
+/// names and thresholds remain firmware-defined, and an unnamed channel keeps `None`.
+pub fn parse_qtemp_lines(lines: &[&str]) -> Vec<SensorTemperature> {
     lines
         .iter()
-        .filter_map(|line| {
-            let payload = nonempty_payload(line, "+QTEMP:")?;
-            let [name, value] = exactly_two_fields(payload)?;
-            if !is_nonempty_quoted(name) {
-                return None;
-            }
-            Some((unquote(name).to_owned(), parse_i16(value)?))
-        })
+        .flat_map(|line| parse_qtemp_line(line))
         .collect()
+}
+
+/// One `+QTEMP:` line's readings, in report order.  Two shapes are modelled:
+///
+/// * the named form `+QTEMP: "<name>",<degrees>` — exactly one name/value pair;
+/// * the unnamed positional form `+QTEMP: <degrees>[,<degrees>...]`, which the DJI Gen-1 firmware
+///   answers with (`+QTEMP: 57,51,51`).
+///
+/// Anything else yields no readings — the raw line is still shown to the user, but nothing is
+/// derived from a shape this build has not verified.
+fn parse_qtemp_line(line: &str) -> Vec<SensorTemperature> {
+    let Some(payload) = nonempty_payload(line, "+QTEMP:") else {
+        return Vec::new();
+    };
+    if let Some([name, value]) = exactly_two_fields(payload) {
+        if is_nonempty_quoted(name) {
+            return match parse_i16(value) {
+                Some(celsius) => vec![SensorTemperature {
+                    name: Some(unquote(name).to_owned()),
+                    celsius,
+                }],
+                None => Vec::new(),
+            };
+        }
+    }
+    positional_qtemp_readings(payload)
+}
+
+/// The unnamed positional form: one to [`MAX_QTEMP_CHANNELS`] bare integers, no quoting.  Every
+/// field must be a value — a partially numeric list is not a layout this build has seen, so it is
+/// skipped whole rather than trimmed into a plausible-looking reading.
+fn positional_qtemp_readings(payload: &str) -> Vec<SensorTemperature> {
+    if payload.contains('"') {
+        return Vec::new();
+    }
+    let Some(fields) = split_csv(payload) else {
+        return Vec::new();
+    };
+    if fields.is_empty() || fields.len() > MAX_QTEMP_CHANNELS {
+        return Vec::new();
+    }
+    let mut readings = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Some(celsius) = parse_i16(field) else {
+            return Vec::new();
+        };
+        readings.push(SensorTemperature {
+            name: None,
+            celsius,
+        });
+    }
+    readings
 }
 
 fn nonempty_payload<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {

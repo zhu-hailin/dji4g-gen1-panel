@@ -556,6 +556,97 @@ impl RateHistory {
     }
 }
 
+/// Presentation-side ring of the module-temperature samples (§7.5) behind the overview's
+/// 「模块温度」 trend.
+///
+/// One sample is recorded per published evidence cycle, stamped with that cycle's `observed_at`
+/// rather than the frame time, so the horizontal axis is real elapsed time: a cycle that was
+/// skipped (the port was busy with SMS or a tool task) leaves a wider gap instead of a fabricated
+/// point.  `None` is an honest 「本次未读取到」 and stays a gap — never a zero.
+#[derive(Debug, Default)]
+pub struct TemperatureHistory {
+    samples: std::collections::VecDeque<(SystemTime, Option<i16>)>,
+    capacity: usize,
+}
+
+/// Ring capacity: one sample per observation cycle covers roughly the last ten minutes.
+pub(crate) const TEMPERATURE_HISTORY_CAPACITY: usize = 60;
+
+/// The cadence behind the ring: the panel records at most one sample per evidence cycle, which the
+/// monitoring DAG publishes every [`crate::ui::TEMPERATURE_SAMPLE_PERIOD`]-worth of time.  The
+/// displayed window is derived from `capacity × period` instead of being hardcoded.
+pub(crate) const TEMPERATURE_SAMPLE_PERIOD: Duration = Duration::from_secs(10);
+
+/// Chart height of the temperature trend — compact, because it lives inside the overview section
+/// rather than in the rate dashboard.
+pub(crate) const TEMPERATURE_CHART_HEIGHT: f32 = 72.0;
+
+impl TemperatureHistory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::with_capacity(TEMPERATURE_HISTORY_CAPACITY),
+            capacity: TEMPERATURE_HISTORY_CAPACITY,
+        }
+    }
+
+    pub fn push(&mut self, sample: (SystemTime, Option<i16>)) {
+        if self.samples.len() == self.capacity {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(SystemTime, Option<i16>)> {
+        self.samples.iter()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    #[must_use]
+    pub fn last(&self) -> Option<&(SystemTime, Option<i16>)> {
+        self.samples.back()
+    }
+
+    /// The most recent reading *before* the newest sample, i.e. what 「较上次」 compares against.
+    /// A sample that could not be read is skipped rather than read as a change, and a ring with
+    /// only one sample has nothing to compare with.
+    #[must_use]
+    pub fn previous_reading(&self) -> Option<i16> {
+        let mut samples = self.samples.iter().rev();
+        samples.next()?;
+        samples.find_map(|(_, value)| *value)
+    }
+}
+
+/// How the newest module temperature compares with the previous reading.  `None` means there is no
+/// earlier reading to compare with, so the view shows no delta at all instead of a fabricated one.
+#[must_use]
+pub fn temperature_delta(current: i16, previous: Option<i16>) -> Option<TemperatureDelta> {
+    let previous = previous?;
+    Some(match current - previous {
+        0 => TemperatureDelta::Flat,
+        delta if delta > 0 => TemperatureDelta::Up(delta),
+        delta => TemperatureDelta::Down(-delta),
+    })
+}
+
+/// A temperature change since the previous reading, in whole degrees.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemperatureDelta {
+    Up(i16),
+    Down(i16),
+    Flat,
+}
+
 /// Closed-set throughput formatting: 1024-based units, one decimal below 10, none at or above.
 #[must_use]
 pub fn format_rate(bytes_per_sec: u64) -> String {
@@ -639,12 +730,8 @@ pub(crate) const RATE_CHART_HEIGHT: f32 = 218.0;
 /// X-axis span in seconds: the ring covers `capacity × cadence` ending at 现在.
 const RATE_CHART_X_SPAN_SECS: f32 = RATE_SAMPLE_PERIOD.as_secs_f32() * RATE_HISTORY_CAPACITY as f32;
 
-/// Adaptive y-axis of the rate chart: a ceiling, an interval count, and the unit shared by the
-/// tick labels and the axis name.
-///
-/// The bands keep the reference's compact 0–160 KB/s scale for quiet windows and grow through
-/// 400 KB/s and 1 MB/s to a nice MB/s ceiling, so a fast 4G window (MB/s) is drawn to scale
-/// instead of being clipped by the old fixed 160 KB/s limit.
+/// Axis ceiling follows the visible window peak on every frame, with 8% headroom.
+/// Grid labels never determine the ceiling: rounded bands must not leave excess empty space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RateAxis {
     pub(crate) max_bytes: f32,
@@ -653,101 +740,47 @@ pub(crate) struct RateAxis {
 }
 
 impl RateAxis {
-    /// Bytes per grid interval (`max_bytes / step_count`), the distance between two gridlines.
     #[must_use]
     pub(crate) fn step_bytes(self) -> f32 {
         self.max_bytes / self.step_count as f32
     }
 
-    /// Label of gridline `index` (0 is the baseline) in the axis unit: whole KB/s numbers for the
-    /// compact bands, one decimal for MB/s, matching the reference's axis-label style.
     #[must_use]
     pub(crate) fn tick_label(self, index: u32) -> String {
-        let value = self.step_bytes() * index as f32;
-        if self.unit == "MB/s" {
-            format!("{:.1}", f64::from(value) / (1024.0 * 1024.0))
+        let divisor = match self.unit {
+            "MB/s" => 1024.0 * 1024.0,
+            "KB/s" => 1024.0,
+            _ => 1.0,
+        };
+        let value = f64::from(self.step_bytes() * index as f32) / divisor;
+        let decimals = if f64::from(self.step_bytes()) / divisor < 1.0 {
+            2
         } else {
-            format!("{}", (value / 1024.0).round() as u32)
-        }
+            1
+        };
+        let label = format!("{value:.decimals$}");
+        label.trim_end_matches('0').trim_end_matches('.').to_owned()
     }
 }
 
-/// Nice MB/s grid steps (1/2/2.5/5 × 10ⁿ): decimal steps whose one-decimal labels are exact.
-const MB_RATE_STEPS: [f64; 26] = [
-    0.5,
-    1.0,
-    2.0,
-    2.5,
-    5.0,
-    10.0,
-    20.0,
-    25.0,
-    50.0,
-    100.0,
-    200.0,
-    250.0,
-    500.0,
-    1_000.0,
-    2_000.0,
-    2_500.0,
-    5_000.0,
-    10_000.0,
-    20_000.0,
-    25_000.0,
-    50_000.0,
-    100_000.0,
-    200_000.0,
-    250_000.0,
-    500_000.0,
-    1_000_000.0,
-];
-
-/// Smallest nice step that divides `peak_mb` into at most five intervals.
-fn nice_rate_step_mb(peak_mb: f64) -> f64 {
-    let target = peak_mb / 5.0;
-    MB_RATE_STEPS
-        .iter()
-        .copied()
-        .find(|step| *step >= target)
-        .unwrap_or(MB_RATE_STEPS[MB_RATE_STEPS.len() - 1])
-}
-
-/// Axis for a window peak. `None` (no samples yet) and anything up to 160 KB/s keep the
-/// reference's default 0–160 KB/s axis; the ceiling then steps through 400 KB/s and 1 MB/s and
-/// switches to a nice MB/s ceiling, so 4G rates of many MB/s are drawn to scale, never clipped.
 #[must_use]
 pub(crate) fn rate_axis(peak_bytes: Option<u64>) -> RateAxis {
-    const KB: f32 = 1024.0;
-    const MB: f32 = 1024.0 * KB;
-    let peak = peak_bytes.unwrap_or(0) as f32;
-    if peak <= 160.0 * KB {
-        RateAxis {
-            max_bytes: 160.0 * KB,
-            step_count: 4,
-            unit: "KB/s",
-        }
-    } else if peak <= 400.0 * KB {
-        RateAxis {
-            max_bytes: 400.0 * KB,
-            step_count: 4,
-            unit: "KB/s",
-        }
-    } else if peak <= MB {
-        // 1 MB / 4 = 256 KB, the binary form of the reference's 250 KB/s step.
-        RateAxis {
-            max_bytes: MB,
-            step_count: 4,
-            unit: "KB/s",
-        }
+    let peak = peak_bytes.unwrap_or(0);
+    let unit = if peak >= 1024 * 1024 {
+        "MB/s"
+    } else if peak >= 1024 {
+        "KB/s"
     } else {
-        let peak_mb = f64::from(peak) / f64::from(MB);
-        let step_mb = nice_rate_step_mb(peak_mb);
-        let step_count = (peak_mb / step_mb).ceil() as u32;
-        RateAxis {
-            max_bytes: (step_mb * f64::from(step_count)) as f32 * MB,
-            step_count,
-            unit: "MB/s",
-        }
+        "B/s"
+    };
+    RateAxis {
+        max_bytes: if peak == 0 {
+            1.0
+        } else {
+            (peak as f64 * 1.08) as f32
+        },
+        step_count: 4,
+        unit,
     }
 }
 
@@ -795,8 +828,7 @@ pub fn format_rate_peak(bytes_per_sec: u64) -> String {
 
 /// The overview page's live rate section, matching the HTML reference: hero numbers (34px, one
 /// decimal) under the captioned series colours, a 218px white chart whose y-axis follows the
-/// window peak (the reference's 0–160 KB/s default, growing through 400 KB/s and 1 MB/s to
-/// MB/s ceilings for fast links) over a −60s…现在 x-scale, and a peak caption under the plot.
+/// visible-window peak with 8% headroom over a −60s…现在 x-scale, and a peak caption below.
 /// The values come from the same snapshot and ring the rest of the panel uses, so every surface
 /// agrees.
 pub fn render_rate_section(
@@ -946,8 +978,7 @@ fn rate_hero_block(
 }
 
 /// Hand-rolled dual-series line chart matching the reference's ECharts options: white plot,
-/// adaptive y-scale (0–160 KB/s by default, stepping through 400 KB/s and 1 MB/s to nice MB/s
-/// ceilings, always covered by 4–5 grid intervals with a label each), a −60s…现在 x-scale with
+/// adaptive y-scale (visible peak plus 8%, with four labelled grid intervals), a −60s…现在 x-scale with
 /// a label every 15 seconds, download as a solid 2px blue line, upload as a dashed 1.8px orange
 /// line, no fill, no animation, no symbols. `None` samples stay honest gaps; a partially filled
 /// ring right-anchors its samples against 现在.
@@ -1070,6 +1101,125 @@ fn paint_rate_chart(ui: &mut Ui, history: &RateHistory, language: Language) {
                 }
             }
         }
+    }
+}
+
+/// Hand-rolled compact trend for the measured module temperature: white plot, the window's own
+/// min/max as the y-range (padded by one degree so a flat run draws as a line instead of hugging an
+/// edge), three labelled gridlines in degrees, one violet series, no fill, no animation.  Samples
+/// are placed by their real timestamps, so a cycle that reported nothing leaves an honest gap
+/// rather than a fabricated point, and the newest reading keeps a dot so 现在 is unambiguous.
+pub(crate) fn paint_temperature_chart(
+    ui: &mut Ui,
+    history: &TemperatureHistory,
+    language: Language,
+) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(
+        egui::Vec2::new(width, TEMPERATURE_CHART_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, Color32::WHITE);
+    let plot = egui::Rect::from_min_max(
+        egui::Pos2::new(rect.left() + 42.0, rect.top() + 8.0),
+        egui::Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0),
+    );
+
+    let samples: Vec<(SystemTime, Option<i16>)> = history.iter().copied().collect();
+    let readings: Vec<i16> = samples.iter().filter_map(|(_, value)| *value).collect();
+    if readings.len() < 2 {
+        painter.text(
+            plot.center(),
+            egui::Align2::CENTER_CENTER,
+            LocalizedText::new(language, TextKey::TemperatureTrendSampling).text,
+            egui::FontId::proportional(scale::RATE_AUX),
+            scale::SECONDARY,
+        );
+        return;
+    }
+    let low = f32::from(readings.iter().copied().min().expect("non-empty")) - 1.0;
+    let high = f32::from(readings.iter().copied().max().expect("non-empty")) + 1.0;
+    let span = (high - low).max(1.0);
+    let y_of = |value: i16| plot.bottom() - ((f32::from(value) - low) / span) * plot.height();
+    for (fraction, label) in [(0.0_f32, low), (0.5, (low + high) / 2.0), (1.0, high)] {
+        let y = plot.bottom() - fraction * plot.height();
+        painter.line_segment(
+            [
+                egui::Pos2::new(plot.left(), y),
+                egui::Pos2::new(plot.right(), y),
+            ],
+            Stroke::new(
+                1.0_f32,
+                if fraction == 0.0 {
+                    scale::AXIS
+                } else {
+                    scale::GRID
+                },
+            ),
+        );
+        painter.text(
+            egui::Pos2::new(plot.left() - 6.0, y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{label:.0}"),
+            egui::FontId::proportional(scale::META),
+            scale::AXIS_LABEL,
+        );
+    }
+    painter.text(
+        egui::Pos2::new(plot.right(), plot.top()),
+        egui::Align2::RIGHT_TOP,
+        "°C",
+        egui::FontId::proportional(scale::META),
+        scale::AXIS_LABEL,
+    );
+
+    let newest = samples
+        .last()
+        .map(|(at, _)| *at)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let window_secs = TEMPERATURE_SAMPLE_PERIOD.as_secs_f32() * TEMPERATURE_HISTORY_CAPACITY as f32;
+    let x_of = |at: SystemTime| {
+        let age = newest
+            .duration_since(at)
+            .map(|age| age.as_secs_f32())
+            .unwrap_or(0.0);
+        plot.right() - (age / window_secs).min(1.0) * plot.width()
+    };
+
+    let series_painter = painter.with_clip_rect(plot);
+    let mut runs: Vec<Vec<egui::Pos2>> = Vec::new();
+    let mut points: Vec<egui::Pos2> = Vec::new();
+    for (at, value) in &samples {
+        match value {
+            Some(value) => points.push(egui::Pos2::new(x_of(*at), y_of(*value))),
+            None if !points.is_empty() => runs.push(std::mem::take(&mut points)),
+            None => {}
+        }
+    }
+    if !points.is_empty() {
+        runs.push(points);
+    }
+    for run in &runs {
+        match run.as_slice() {
+            [point] => {
+                series_painter.circle_filled(*point, 2.0, scale::TEMPERATURE);
+            }
+            [_, _, ..] => {
+                series_painter.add(Shape::line(
+                    run.clone(),
+                    Stroke::new(2.0_f32, scale::TEMPERATURE),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if let Some((at, Some(value))) = samples.last() {
+        series_painter.circle_filled(
+            egui::Pos2::new(x_of(*at), y_of(*value)),
+            3.0,
+            scale::TEMPERATURE,
+        );
     }
 }
 
@@ -1196,70 +1346,67 @@ mod tests {
     }
 
     #[test]
-    fn rate_axis_chooses_nice_bands_and_units() {
-        fn assert_axis(peak: Option<u64>, max_kb: f32, step_count: u32, unit: &str) {
-            let axis = rate_axis(peak);
-            assert_eq!(axis.max_bytes, max_kb * 1024.0, "peak {peak:?}");
-            assert_eq!(axis.step_count, step_count, "peak {peak:?}");
-            assert_eq!(axis.unit, unit, "peak {peak:?}");
-        }
-        // The default and the compact band keep the reference's 0-160 KB/s axis.
-        assert_axis(None, 160.0, 4, "KB/s");
-        assert_axis(Some(0), 160.0, 4, "KB/s");
-        assert_axis(Some(46 * 1024), 160.0, 4, "KB/s");
-        assert_axis(Some(160 * 1024), 160.0, 4, "KB/s");
-        // Above 160 KB/s the axis grows in the documented KB/s bands...
-        assert_axis(Some(200 * 1024), 400.0, 4, "KB/s");
-        assert_axis(Some(400 * 1024), 400.0, 4, "KB/s");
-        assert_axis(Some(1024 * 1024), 1024.0, 4, "KB/s");
-        // ...and switches to the MB/s unit with nice ceilings once a megabyte is passed.
-        assert_axis(Some(3 * 1024 * 1024 / 2), 1536.0, 3, "MB/s");
-        assert_axis(Some(5 * 1024 * 1024), 5.0 * 1024.0, 5, "MB/s");
-        assert_axis(Some(30 * 1024 * 1024), 30.0 * 1024.0, 3, "MB/s");
-    }
-
-    #[test]
-    fn rate_axis_tick_labels_follow_the_axis_unit() {
-        // KB/s axes label whole numbers, so the 0.25 MB binary step reads 256/512/768/1024.
-        let kb_axis = rate_axis(Some(1024 * 1024));
-        assert_eq!(kb_axis.tick_label(0), "0");
-        assert_eq!(kb_axis.tick_label(1), "256");
-        assert_eq!(kb_axis.tick_label(2), "512");
-        assert_eq!(kb_axis.tick_label(3), "768");
-        assert_eq!(kb_axis.tick_label(4), "1024");
-        // MB/s axes label one decimal, so 0.5 MB ceilings stay honest instead of rounding away.
-        let mb_axis = rate_axis(Some(5 * 1024 * 1024));
-        assert_eq!(mb_axis.tick_label(0), "0.0");
-        assert_eq!(mb_axis.tick_label(1), "1.0");
-        assert_eq!(mb_axis.tick_label(5), "5.0");
-        let half_mb_axis = rate_axis(Some(3 * 1024 * 1024 / 2));
-        assert_eq!(half_mb_axis.tick_label(1), "0.5");
-        assert_eq!(half_mb_axis.tick_label(3), "1.5");
-    }
-
-    #[test]
-    fn the_rate_axis_never_clips_a_sample_at_or_below_the_peak_it_was_built_from() {
+    fn rate_axis_preserves_small_headroom_and_follows_the_visible_window() {
         for peak in [
             1_u64,
-            46 * 1024,
-            160 * 1024,
-            161 * 1024,
+            50,
+            307,
+            1023,
+            1024,
+            5600,
+            19000,
+            88_269,
+            121_600,
+            208_077,
             400 * 1024,
+            1024 * 1024,
             1024 * 1024 + 1,
             5 * 1024 * 1024,
-            29 * 1024 * 1024,
-            1024 * 1024 * 1024,
+            u64::MAX,
         ] {
             let axis = rate_axis(Some(peak));
+            let ratio = axis.max_bytes as f64 / peak as f64;
             assert!(
-                axis.max_bytes >= peak as f32,
-                "peak {peak} escaped the axis: {axis:?}"
+                (1.07999..=1.08001).contains(&ratio),
+                "peak {peak}: {axis:?}"
             );
-            assert!(
-                (3..=5).contains(&axis.step_count),
-                "implausible grid density for peak {peak}: {axis:?}"
-            );
+            assert!(axis.max_bytes.is_finite());
+            assert!((3..=5).contains(&axis.step_count));
+            let divisor = match axis.unit {
+                "MB/s" => 1024.0 * 1024.0,
+                "KB/s" => 1024.0,
+                _ => 1.0,
+            };
+            let mut previous = -1.0_f64;
+            for index in 0..=axis.step_count {
+                let label = axis.tick_label(index).parse::<f64>().unwrap();
+                let actual = (axis.step_bytes() * index as f32) as f64 / divisor;
+                assert!(label > previous);
+                assert!((label - actual).abs() <= 0.051_f64.max(actual.abs() * 1e-6));
+                previous = label;
+            }
         }
+        for peak in [None, Some(0)] {
+            assert_eq!(rate_axis(peak).max_bytes, 1.0);
+        }
+        let mut history = RateHistory::new();
+        let now = SystemTime::UNIX_EPOCH;
+        history.push((now, Some(100 * 1024), Some(203 * 1024)));
+        let high = rate_axis(rate_history_peak(&history));
+        for tick in 1..=RATE_HISTORY_CAPACITY {
+            history.push((
+                now + Duration::from_secs(tick as u64),
+                Some(6 * 1024),
+                Some(121 * 1024),
+            ));
+        }
+        let low = rate_axis(rate_history_peak(&history));
+        assert_eq!(rate_history_peak(&history), Some(121 * 1024));
+        assert!(low.max_bytes < high.max_bytes);
+        assert!((low.max_bytes / 1024.0 - 130.68).abs() < 0.001);
+        history.push((now + Duration::from_secs(61), Some(300 * 1024), None));
+        assert_eq!(rate_history_peak(&history), Some(300 * 1024));
+        assert!(rate_axis(rate_history_peak(&history)).max_bytes > high.max_bytes);
     }
 
     #[test]
@@ -1300,5 +1447,95 @@ mod tests {
         assert_eq!(format_mbps(54_000_000), "54.0 Mbps");
         assert_eq!(format_mbps(1_000_000_000), "1000.0 Mbps");
         assert_eq!(format_mbps(1_500_000), "1.5 Mbps");
+    }
+
+    #[test]
+    fn temperature_history_keeps_one_point_per_cycle_and_an_honest_gap() {
+        let mut history = TemperatureHistory::new();
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert!(history.is_empty());
+        assert!(history.previous_reading().is_none());
+        history.push((start, Some(57)));
+        assert_eq!(history.len(), 1);
+        assert!(
+            history.previous_reading().is_none(),
+            "a single reading has nothing to compare with"
+        );
+        history.push((start + Duration::from_secs(10), Some(57)));
+        assert_eq!(history.previous_reading(), Some(57));
+        // A cycle that reported nothing stays a gap and is skipped when comparing readings.
+        history.push((start + Duration::from_secs(20), None));
+        assert_eq!(history.previous_reading(), Some(57));
+        assert_eq!(
+            history.last(),
+            Some(&(start + Duration::from_secs(20), None))
+        );
+        // The ring is bounded and drops the oldest samples first.
+        for step in 0..TEMPERATURE_HISTORY_CAPACITY + 5 {
+            history.push((start + Duration::from_secs(30 + step as u64 * 10), Some(60)));
+        }
+        assert_eq!(history.len(), TEMPERATURE_HISTORY_CAPACITY);
+    }
+
+    #[test]
+    fn temperature_delta_reports_only_real_changes() {
+        assert_eq!(temperature_delta(57, None), None);
+        assert_eq!(
+            temperature_delta(57, Some(57)),
+            Some(TemperatureDelta::Flat)
+        );
+        assert_eq!(
+            temperature_delta(58, Some(57)),
+            Some(TemperatureDelta::Up(1))
+        );
+        assert_eq!(
+            temperature_delta(51, Some(57)),
+            Some(TemperatureDelta::Down(6))
+        );
+    }
+
+    #[test]
+    fn the_temperature_chart_paints_every_window_shape() {
+        // An empty ring, a single reading, a window with a gap and a full ring must all paint
+        // without panicking; the first two states show the sampling caption instead of a curve.
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let shapes: [Vec<(SystemTime, Option<i16>)>; 4] = [
+            Vec::new(),
+            vec![(start, Some(57))],
+            vec![
+                (start, Some(57)),
+                (start + Duration::from_secs(10), None),
+                (start + Duration::from_secs(20), Some(58)),
+            ],
+            (0..TEMPERATURE_HISTORY_CAPACITY)
+                .map(|step| {
+                    (
+                        start + Duration::from_secs(step as u64 * 10),
+                        Some(50 + (step % 7) as i16),
+                    )
+                })
+                .collect(),
+        ];
+        for samples in shapes {
+            let mut history = TemperatureHistory::new();
+            for sample in samples {
+                history.push(sample);
+            }
+            let context = egui::Context::default();
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(420.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        paint_temperature_chart(ui, &history, Language::ZhCn);
+                    });
+                },
+            );
+        }
     }
 }

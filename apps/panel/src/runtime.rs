@@ -26,8 +26,8 @@ use dji4g_application::{
 };
 use dji4g_at_protocol::{
     Apn, AtCommand, AtFinalCode, AtResponse, PdpContextId, PdpContextState, ProtocolErrorKind,
-    ToolParseError, ToolWireRequest, VerifiedUsbNetProfile, parse_cnum_lines, parse_iccid_line,
-    parse_pdp_contexts_with_activity, parse_qtemp_lines, parse_serving_cell_line,
+    SensorTemperature, ToolParseError, ToolWireRequest, VerifiedUsbNetProfile, parse_cnum_lines,
+    parse_iccid_line, parse_pdp_contexts_with_activity, parse_qtemp_lines, parse_serving_cell_line,
 };
 use dji4g_domain::{
     ActionKind, AdapterBinding, AfterStateHash, DefaultRouteOwner, DnsProfile, ErrorCode,
@@ -54,6 +54,11 @@ use dji4g_windows_platform::{
 /// covers the UAC prompt plus one execution and readback; `validate_request` rejects anything
 /// longer, so this is set to the protocol maximum.
 const OPERATION_LIFETIME_MS: u64 = 60_000;
+
+/// Display bound for the raw `+QTEMP:` line kept beside a temperature reading.  The line is
+/// firmware chatter shown on hover, so it is stored bounded rather than whole.
+#[cfg(windows)]
+const TEMPERATURE_RAW_MAX_CHARS: usize = 128;
 
 /// A real wall/monotonic clock used by the production controller.
 #[derive(Debug)]
@@ -928,15 +933,19 @@ fn observe_at_session(
     };
     // Module temperature is another optional, firmware-defined probe (research §7.5).  QTEMP is a
     // module-level query rather than a SIM read, so it runs whenever the handshake succeeded; a
-    // missing command, a refusal or a malformed layout degrades exactly like the other optional
-    // probes and never fails the observation.  Only the first reported sensor value is stored —
-    // sensor names and thresholds stay firmware-defined and the UI labels the row as a module
-    // reading, never as case temperature.
-    let (temperature_status, temperature_celsius) = feature_probe(
+    // missing command, a refusal or an unreadable layout degrades exactly like the other optional
+    // probes and never fails the observation.  Only the first reported value is stored as the row's
+    // value — the sensor layout and thresholds stay firmware-defined, so the UI labels the row as a
+    // module reading and shows the readings it came from, never a case-temperature claim.
+    let (temperature_status, temperature_probe) = feature_probe(
         true,
         || actor.execute(AtCommand::Temperature),
         parse_temperature_probe,
     );
+    let (temperature_celsius, temperature_sensors, temperature_raw) = match temperature_probe {
+        Some(probe) => (Some(probe.celsius), probe.sensors, probe.raw),
+        None => (None, Vec::new(), None),
+    };
 
     let primary_context = parse_pdp_for_display(&contexts_response, &activity_response)?;
     let primary = primary_context.as_ref();
@@ -994,6 +1003,9 @@ fn observe_at_session(
             serving_cell_status,
             iccid_full: iccid_probe,
             serving_cell_raw,
+            temperature_celsius,
+            temperature_sensors,
+            temperature_raw,
         };
     }
     Ok(observation)
@@ -1171,22 +1183,58 @@ fn parse_serving_cell_probe(
         .ok_or(())
 }
 
-/// Parse a successful QTEMP response.  The first recognised sensor value becomes the module
-/// temperature; sensor names and thresholds stay firmware-defined (research §7.5), so the name is
-/// deliberately not stored.  A response with content but no recognised `+QTEMP:` line is a format
-/// mismatch; a genuinely empty response is a clean empty result.
+/// A successful QTEMP probe: the value the overview shows plus the evidence its rows explain
+/// themselves with.
 #[cfg(windows)]
-fn parse_temperature_probe(response: &AtResponse) -> Result<Option<i16>, ()> {
+#[derive(Clone, Debug, PartialEq)]
+struct TemperatureProbe {
+    /// The first reported value — the module temperature the overview row shows.  Which sensor that
+    /// is stays firmware-defined, so the UI never claims more than "the first reported value".
+    celsius: i16,
+    /// Every reading of this observation, in report order, for the 「模块温度」 area.
+    sensors: Vec<SensorTemperature>,
+    /// The raw `+QTEMP:` line as reported, for the row's hover detail.
+    raw: Option<String>,
+}
+
+/// Parse a successful QTEMP response.  The first reported value becomes the module temperature
+/// (research §7.5), while the readings and the raw line travel with it so the UI can say exactly
+/// what the module sent instead of guessing.  A response with content but no readable reading is a
+/// format mismatch; a genuinely empty response is a clean empty result.
+#[cfg(windows)]
+fn parse_temperature_probe(response: &AtResponse) -> Result<Option<TemperatureProbe>, ()> {
     let lines = response
         .lines
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    match parse_qtemp_lines(&lines).first() {
-        Some((_sensor, value)) => Ok(Some(*value)),
+    let sensors = parse_qtemp_lines(&lines);
+    match sensors.first() {
+        Some(first) => Ok(Some(TemperatureProbe {
+            celsius: first.celsius,
+            raw: temperature_raw_line(response),
+            sensors,
+        })),
         None if response.lines.is_empty() => Ok(None),
         None => Err(()),
     }
+}
+
+/// The first raw `+QTEMP:` line of a response, bounded for display.  It is UI-local detail — never
+/// logged, serialized or exported — and a longer line is cut on a character boundary.
+#[cfg(windows)]
+fn temperature_raw_line(response: &AtResponse) -> Option<String> {
+    let line = response
+        .lines
+        .iter()
+        .map(String::as_str)
+        .find(|line| line.trim_start().starts_with("+QTEMP:"))?;
+    let mut chars = line.chars();
+    let mut raw: String = chars.by_ref().take(TEMPERATURE_RAW_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        raw.push('…');
+    }
+    Some(raw)
 }
 
 #[cfg(windows)]
@@ -2207,7 +2255,7 @@ mod tests {
         same_guid, sms_message, system_route,
     };
     use dji4g_application::{AdapterMetrics, AtPort, Clock, ProbeStageDto};
-    use dji4g_at_protocol::{AtFinalCode, DecodedSms, VerifiedUsbNetProfile};
+    use dji4g_at_protocol::{AtFinalCode, DecodedSms, SensorTemperature, VerifiedUsbNetProfile};
     use dji4g_domain::{
         ActionKind, DefaultRouteOwner, DeviceEpoch, DnsProfile, ErrorCode, FeatureStatus,
         NumberLookup, ProtocolCoverage, SmsEncoding, SmsStatus, SmsStorageId, UsbNetworkProfile,
@@ -2840,30 +2888,103 @@ mod tests {
 
     #[test]
     fn temperature_probe_keeps_the_first_reported_sensor_value() {
-        // Sensor names stay firmware-defined and are deliberately not stored; the first reported
-        // value becomes the module temperature (research §7.5).
+        // Sensor names stay firmware-defined: the first reported value becomes the module
+        // temperature (research §7.5), while every reading travels with it for the rows' evidence.
         let response = probe_response(&["+QTEMP: \"mdm-case\",42", "+QTEMP: \"pa-therm\",45"]);
-        let (status, value) = super::feature_probe(true, || Ok(response), parse_temperature_probe);
+        let (status, probe) = super::feature_probe(true, || Ok(response), parse_temperature_probe);
         assert_eq!(status, FeatureStatus::Supported);
-        assert_eq!(value, Some(42));
+        let probe = probe.expect("a reading");
+        assert_eq!(probe.celsius, 42);
+        assert_eq!(
+            probe.sensors,
+            [
+                SensorTemperature {
+                    name: Some("mdm-case".to_owned()),
+                    celsius: 42,
+                },
+                SensorTemperature {
+                    name: Some("pa-therm".to_owned()),
+                    celsius: 45,
+                },
+            ]
+        );
+        assert_eq!(probe.raw.as_deref(), Some("+QTEMP: \"mdm-case\",42"));
+    }
+
+    #[test]
+    fn temperature_probe_reads_the_unnamed_positional_layout() {
+        // The DJI Gen-1 firmware reports its channels positionally (`+QTEMP: 57,51,51`): the first
+        // value is the shown module temperature and no channel is given an invented name.
+        let response = probe_response(&["+QTEMP: 57,51,51"]);
+        let (status, probe) = super::feature_probe(true, || Ok(response), parse_temperature_probe);
+        assert_eq!(status, FeatureStatus::Supported);
+        let probe = probe.expect("a reading");
+        assert_eq!(probe.celsius, 57);
+        assert_eq!(
+            probe.sensors,
+            [
+                SensorTemperature {
+                    name: None,
+                    celsius: 57,
+                },
+                SensorTemperature {
+                    name: None,
+                    celsius: 51,
+                },
+                SensorTemperature {
+                    name: None,
+                    celsius: 51,
+                },
+            ]
+        );
+        assert_eq!(probe.raw.as_deref(), Some("+QTEMP: 57,51,51"));
+    }
+
+    #[test]
+    fn temperature_probe_survives_a_line_the_build_does_not_model() {
+        // Regression for the reported symptom: the overview showed 「未读取到 / 格式不匹配」 while
+        // the device-tools query answered fine, because one unmodelled line aborted the whole
+        // optional probe.  An unreadable line is now carried along (and shown) while the readable
+        // answer still lands.
+        let response = probe_response(&[
+            "+QTEMP: 57,51,51",
+            "+QTEMP: \"modem\"",
+            "some vendor notice",
+        ]);
+        let (status, probe) = super::feature_probe(true, || Ok(response), parse_temperature_probe);
+        assert_eq!(status, FeatureStatus::Supported);
+        assert_eq!(probe.expect("a reading").celsius, 57);
     }
 
     #[test]
     fn temperature_probe_distinguishes_empty_from_unrecognized_content() {
         // A genuinely empty OK is a clean no-data result...
-        let (status, value) =
+        let (status, probe) =
             super::feature_probe(true, || Ok(probe_response(&[])), parse_temperature_probe);
         assert_eq!(status, FeatureStatus::Empty);
-        assert_eq!(value, None);
-        // ...while content that carries no recognised QTEMP line is a format mismatch, never
+        assert_eq!(probe, None);
+        // ...while content that carries no readable QTEMP line is a format mismatch, never
         // conflated with "no data".
-        let (status, value) = super::feature_probe(
+        let (status, probe) = super::feature_probe(
             true,
             || Ok(probe_response(&["+QTEMP: malformed"])),
             parse_temperature_probe,
         );
         assert_eq!(status, FeatureStatus::FormatMismatch);
-        assert_eq!(value, None);
+        assert_eq!(probe, None);
+    }
+
+    #[test]
+    fn temperature_raw_line_is_bounded_and_kept_for_display() {
+        // The raw line is firmware chatter shown on hover: it is kept bounded, and a line that has
+        // to be cut says so instead of silently losing its tail.
+        let long = format!("+QTEMP: {}", "5".repeat(400));
+        let response = probe_response(&[long.as_str()]);
+        let raw = super::temperature_raw_line(&response).expect("a raw QTEMP line");
+        assert_eq!(raw.chars().count(), super::TEMPERATURE_RAW_MAX_CHARS + 1);
+        assert!(raw.ends_with('…'));
+        // A response without a QTEMP line has no raw detail to show.
+        assert_eq!(super::temperature_raw_line(&probe_response(&["OK"])), None);
     }
 
     #[test]

@@ -10,8 +10,8 @@ use eframe::egui::{self, RichText, Ui};
 
 use super::{
     DisplayValue, HotspotAction, HotspotVm, carrier_display_name, clock_hms, field_label,
-    format_mbps, hotspot_vm, info_grid, meta_text, render_rate_section, scale, section_frame,
-    section_heading, speed_grade, wrapped_label,
+    format_age, format_mbps, hotspot_vm, info_grid, meta_text, render_rate_section, scale,
+    section_frame, section_heading, speed_grade, wrapped_label,
 };
 use crate::app::PanelCommandSink;
 use crate::feature_probe::FeatureProbeView;
@@ -43,6 +43,14 @@ pub struct OverviewVm {
     pub serving_cell_provisional: bool,
     pub temperature: DisplayValue,
     pub temperature_note: Option<LocalizedText>,
+    /// The numeric reading behind [`Self::temperature`], for the trend section's delta.
+    pub temperature_celsius: Option<i16>,
+    /// How many channels the firmware reported and in which order — only for a correlated
+    /// observation that reported more than one reading.
+    pub temperature_sensors_note: Option<LocalizedText>,
+    /// Raw `+QTEMP:` line of the correlated observation, shown on hover so a layout this build
+    /// cannot read is still visible to the user instead of being hidden behind 「格式不匹配」.
+    pub temperature_raw: Option<String>,
     pub adapter_metrics: AdapterMetricsVm,
     pub timeline: Vec<TimelineRowVm>,
     pub identity: IdentityVm,
@@ -70,6 +78,10 @@ pub struct TimelineRowVm {
 
 /// How many newest timeline entries the overview shows; the store keeps the full bounded ring.
 pub const TIMELINE_VISIBLE: usize = 10;
+
+/// How many reported sensor values the 温度 note lists before it marks the list as cut.  The raw
+/// `+QTEMP:` line stays available on hover, so a long list never has to be guessed at.
+pub const MAX_LISTED_TEMPERATURE_VALUES: usize = 6;
 
 /// View data for the 「身份信息」 area (research §4.1/§4.3): reported phone numbers and the SIM
 /// ICCID, both defaulting to masked display with explicit user-action reveal.
@@ -187,6 +199,9 @@ pub fn overview_vm_with_probes(
         |network| LocalizedText::new(language, default_route_owner(network.system_default_route)),
     );
     let (temperature, temperature_note) = temperature_vm(cellular, language);
+    let temperature_sensors_note = probes
+        .map(|view| view.temperature_sensors.as_slice())
+        .and_then(|readings| temperature_sensors_note(readings, language));
     OverviewVm {
         question: LocalizedText::new(language, TextKey::OverviewQuestion),
         device,
@@ -209,6 +224,9 @@ pub fn overview_vm_with_probes(
         serving_cell_provisional,
         temperature,
         temperature_note,
+        temperature_celsius: cellular.and_then(|value| value.temperature_celsius),
+        temperature_sensors_note,
+        temperature_raw: probes.and_then(|view| view.temperature_raw.clone()),
         adapter_metrics: adapter_metrics_vm(snapshot.adapter_metrics, language),
         timeline: timeline_rows(&snapshot.timeline, language),
         identity: identity_vm(cellular, probes, language),
@@ -244,6 +262,42 @@ pub fn temperature_vm(
             )
         }
     }
+}
+
+/// How many sensor values the module reported with this reading, in report order.
+///
+/// The channel order and meaning belong to the firmware (§7.5), so the note says exactly what came
+/// back and claims nothing about which sensor is which.  A single reading needs no list — the row
+/// already shows it with the firmware-defined sensor note.
+#[must_use]
+pub fn temperature_sensors_note(
+    readings: &[dji4g_at_protocol::SensorTemperature],
+    language: Language,
+) -> Option<LocalizedText> {
+    if readings.len() < 2 {
+        return None;
+    }
+    let values = readings
+        .iter()
+        .take(MAX_LISTED_TEMPERATURE_VALUES)
+        .map(|reading| reading.celsius.to_string())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    // A cut list says so, instead of looking like the module reported exactly this many values.
+    let values = if readings.len() > MAX_LISTED_TEMPERATURE_VALUES {
+        format!("{values} / …")
+    } else {
+        values
+    };
+    Some(format_text_in(
+        language,
+        TextKey::TemperatureSensorsReported,
+        &TextArgs {
+            count: Some(readings.len()),
+            detail: Some(values),
+            ..TextArgs::default()
+        },
+    ))
 }
 
 /// The Windows-network interface metrics rows. `None` is an honest 未获取 on every row — never a
@@ -451,6 +505,7 @@ pub(crate) fn render(
     language: Language,
     sink: &dyn PanelCommandSink,
     rate_history: &crate::ui::RateHistory,
+    temperature_history: &crate::ui::TemperatureHistory,
     probes: Option<&FeatureProbeView>,
 ) {
     let vm = overview_vm_with_probes(snapshot, language, probes);
@@ -523,6 +578,15 @@ pub(crate) fn render(
         connection(ui);
         rates(ui);
     }
+    section_frame(ui, |ui| {
+        render_temperature_section(
+            ui,
+            &vm,
+            temperature_history,
+            snapshot.app.observed_at,
+            language,
+        );
+    });
     section_frame(ui, |ui| {
         egui::CollapsingHeader::new("设备与 SIM 详情").show(ui, |ui| {
             info_grid(ui, "overview-device-details", |ui| {
@@ -652,14 +716,156 @@ pub(crate) fn render(
     });
 }
 
-/// The 温度 value cell: the reading (or the honest 未读取到) plus its firmware-scope note.
+/// The 温度 value cell: the reading (or the honest 未读取到) plus its firmware-scope note, the
+/// reported channel count, and — on hover — the raw `+QTEMP:` line the reading came from.
 fn render_temperature_value(ui: &mut Ui, vm: &OverviewVm) {
     ui.vertical(|ui| {
-        wrapped_label(ui, vm.temperature.text.clone());
+        let response = wrapped_label(ui, vm.temperature.text.clone());
+        if let Some(raw) = &vm.temperature_raw {
+            let _ = response.on_hover_text(raw.clone());
+        }
+        if let Some(note) = &vm.temperature_sensors_note {
+            wrapped_label(ui, meta_text(note.text.clone()));
+        }
         if let Some(note) = &vm.temperature_note {
             wrapped_label(ui, meta_text(note.text.clone()));
         }
     });
+}
+
+/// The 「较上次」 phrase for one measured change.  The magnitude is carried with its sign so a rise
+/// and a fall can never be read as each other.
+#[must_use]
+pub fn temperature_delta_text(
+    delta: crate::ui::TemperatureDelta,
+    language: Language,
+) -> LocalizedText {
+    match delta {
+        crate::ui::TemperatureDelta::Up(value) => format_text_in(
+            language,
+            TextKey::TemperatureDeltaUp,
+            &TextArgs::detail(value.to_string()),
+        ),
+        crate::ui::TemperatureDelta::Down(value) => format_text_in(
+            language,
+            TextKey::TemperatureDeltaDown,
+            &TextArgs::detail(value.to_string()),
+        ),
+        crate::ui::TemperatureDelta::Flat => {
+            LocalizedText::new(language, TextKey::TemperatureDeltaFlat)
+        }
+    }
+}
+
+/// The 「模块温度」 section (§7.5): the current reading with its change since the previous cycle
+/// and the age of that reading, over the trend line of the recent observations.
+///
+/// A cycle that reported nothing keeps the row's own wording (未读取到 with its classified note,
+/// or 未获取 without cellular evidence) — the panel never draws a curve it did not measure.
+fn render_temperature_section(
+    ui: &mut Ui,
+    vm: &OverviewVm,
+    history: &crate::ui::TemperatureHistory,
+    observed_at: std::time::SystemTime,
+    language: Language,
+) {
+    let window = format_age(
+        crate::ui::TEMPERATURE_SAMPLE_PERIOD * crate::ui::TEMPERATURE_HISTORY_CAPACITY as u32,
+        language,
+    )
+    .text;
+    let window_text = format_text_in(
+        language,
+        TextKey::TemperatureTrendWindow,
+        &TextArgs::age(window),
+    )
+    .text;
+    let sample_period = format_age(crate::ui::TEMPERATURE_SAMPLE_PERIOD, language).text;
+    let width = ui.available_width();
+    ui.set_min_width(width);
+    ui.set_max_width(width);
+    ui.horizontal(|ui| {
+        ui.label(section_heading(
+            LocalizedText::new(language, TextKey::TemperatureSectionHeading).text,
+        ));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            wrapped_label(
+                ui,
+                RichText::new(window_text)
+                    .size(scale::RATE_AUX)
+                    .color(scale::SECONDARY),
+            );
+        });
+    });
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 16.0;
+        match vm.temperature_celsius {
+            Some(celsius) => wrapped_label(
+                ui,
+                RichText::new(format!("{celsius} °C"))
+                    .size(scale::RATE_NUMBER)
+                    .color(scale::INK),
+            ),
+            None => wrapped_label(
+                ui,
+                RichText::new(vm.temperature.text.clone())
+                    .size(scale::RATE_NUMBER)
+                    .color(scale::FAINT),
+            ),
+        };
+        if let Some(delta) = vm
+            .temperature_celsius
+            .and_then(|current| crate::ui::temperature_delta(current, history.previous_reading()))
+        {
+            wrapped_label(
+                ui,
+                RichText::new(temperature_delta_text(delta, language).text)
+                    .size(scale::RATE_AUX)
+                    .color(scale::SECONDARY),
+            );
+        }
+        if let Ok(age) = std::time::SystemTime::now().duration_since(observed_at) {
+            let age_text = format_text_in(
+                language,
+                TextKey::ObservedAgo,
+                &TextArgs::age(format_age(age, language).text),
+            )
+            .text;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                wrapped_label(
+                    ui,
+                    RichText::new(age_text)
+                        .size(scale::RATE_AUX)
+                        .color(scale::SECONDARY),
+                );
+            });
+        }
+    });
+    ui.add_space(8.0);
+    crate::ui::paint_temperature_chart(ui, history, language);
+    ui.add_space(8.0);
+    let trend_note = format_text_in(
+        language,
+        TextKey::TemperatureTrendNote,
+        &TextArgs::age(sample_period),
+    )
+    .text;
+    wrapped_label(ui, meta_text(trend_note));
+    if let Some(note) = &vm.temperature_sensors_note {
+        wrapped_label(ui, meta_text(note.text.clone()));
+    }
+    if let Some(note) = &vm.temperature_note {
+        wrapped_label(ui, meta_text(note.text.clone()));
+    }
+    // An answer this build could not read is described by its own bytes: the raw `+QTEMP:` line
+    // stays on screen below the classified note.  A parsed reading keeps it on the row's hover
+    // instead, so device chatter never becomes page furniture.
+    if vm.temperature_celsius.is_none() {
+        if let Some(raw) = &vm.temperature_raw {
+            wrapped_label(ui, meta_text(raw.clone()));
+        }
+    }
 }
 
 /// The 服务小区 value cell: the compact report line, the provisional-layout note (research §10),
@@ -962,6 +1168,7 @@ mod tests {
                             crate::localization::Language::ZhCn,
                             &sink,
                             &crate::ui::RateHistory::default(),
+                            &crate::ui::TemperatureHistory::default(),
                             None,
                         );
                         assert!(
@@ -975,12 +1182,14 @@ mod tests {
     }
 
     use super::{
-        adapter_metrics_vm, identity_vm, serving_cell_text, serving_state_phrase, temperature_vm,
+        MAX_LISTED_TEMPERATURE_VALUES, adapter_metrics_vm, identity_vm, serving_cell_text,
+        serving_state_phrase, temperature_delta_text, temperature_sensors_note, temperature_vm,
         timeline_rows,
     };
     use crate::feature_probe::FeatureProbeView;
     use crate::localization::{Language, TextKey, template};
     use dji4g_application::AdapterMetrics;
+    use dji4g_at_protocol::SensorTemperature;
     use dji4g_domain::{
         AttachState, CellularSnapshot, FeatureStatus, NumberLookup, PhoneNumber, RegistrationState,
         SimIdentity, SimState, Timeline, TimelineEvent, TimelineEventKind,
@@ -1064,6 +1273,8 @@ mod tests {
             serving_cell_status: FeatureStatus::Supported,
             iccid_full: Some("89860123456789012345".to_owned()),
             serving_cell_raw: None,
+            temperature_sensors: Vec::new(),
+            temperature_raw: None,
         };
         let vm = identity_vm(Some(&cell), Some(&probes), Language::ZhCn);
         let number_note = vm.number_note.expect("a timed-out read needs a note");
@@ -1087,6 +1298,8 @@ mod tests {
             serving_cell_status: FeatureStatus::NotProbed,
             iccid_full: Some("89860123456789012345".to_owned()),
             serving_cell_raw: None,
+            temperature_sensors: Vec::new(),
+            temperature_raw: None,
         };
         let vm = identity_vm(Some(&cell), Some(&probes), Language::ZhCn);
         assert!(
@@ -1228,6 +1441,69 @@ mod tests {
         let (value, note) = temperature_vm(None, Language::ZhCn);
         assert_eq!(value.text, "未获取");
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn temperature_delta_phrases_carry_the_magnitude_with_its_sign() {
+        use crate::ui::TemperatureDelta;
+        assert_eq!(
+            temperature_delta_text(TemperatureDelta::Up(1), Language::ZhCn).text,
+            "较上次 +1 °C"
+        );
+        assert_eq!(
+            temperature_delta_text(TemperatureDelta::Down(6), Language::ZhCn).text,
+            "较上次 -6 °C"
+        );
+        assert_eq!(
+            temperature_delta_text(TemperatureDelta::Flat, Language::ZhCn).text,
+            "与上次相同"
+        );
+    }
+
+    #[test]
+    fn temperature_sensors_note_lists_the_reported_channels_in_order() {
+        let readings = [
+            SensorTemperature {
+                name: None,
+                celsius: 57,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+        ];
+        let note = temperature_sensors_note(&readings, Language::ZhCn).expect("three readings");
+        assert!(
+            note.text.contains('3'),
+            "the count is stated: {}",
+            note.text
+        );
+        assert!(
+            note.text.contains("57 / 51 / 51"),
+            "the values stay in report order: {}",
+            note.text
+        );
+        assert!(
+            note.text.contains("以固件为准"),
+            "the meaning of the channels is never claimed: {}",
+            note.text
+        );
+        // One reading needs no list — the row already shows it.
+        assert!(temperature_sensors_note(&readings[..1], Language::ZhCn).is_none());
+        assert!(temperature_sensors_note(&[], Language::ZhCn).is_none());
+        // A long report is visibly cut instead of looking complete.
+        let long: Vec<SensorTemperature> = (0..MAX_LISTED_TEMPERATURE_VALUES + 2)
+            .map(|index| SensorTemperature {
+                name: None,
+                celsius: 40 + index as i16,
+            })
+            .collect();
+        let note = temperature_sensors_note(&long, Language::ZhCn).expect("a long report");
+        assert!(note.text.contains('…'), "a cut list says so: {}", note.text);
     }
 
     #[test]

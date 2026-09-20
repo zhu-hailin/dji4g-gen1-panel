@@ -15,7 +15,8 @@ use dji4g_application::{
     transcript_from_response,
 };
 use dji4g_at_protocol::{
-    AtCommand, AtFinalCode, ToolReadId, ToolResponse, ValidatedToolLine, VerifiedUsbNetProfile,
+    AtCommand, AtFinalCode, SensorTemperature, ToolReadId, ToolResponse, ValidatedToolLine,
+    VerifiedUsbNetProfile,
 };
 use dji4g_domain::{DeviceEpoch, StableDeviceIdentity};
 
@@ -291,9 +292,39 @@ fn identity_and_usb_mode_come_from_their_own_answers() {
 fn a_missing_temperature_sensor_is_absent_rather_than_zero() {
     let reading = response(&["+QTEMP: \"XO_THERM\",42"], AtFinalCode::Ok);
     let parsed = parse_profile_temperature(&reading);
-    assert_eq!(parsed, vec![("XO_THERM".to_owned(), 42)]);
+    assert_eq!(
+        parsed,
+        vec![SensorTemperature {
+            name: Some("XO_THERM".to_owned()),
+            celsius: 42,
+        }]
+    );
     let empty = response(&[], AtFinalCode::Ok);
     assert!(parse_profile_temperature(&empty).is_empty());
+}
+
+#[test]
+fn an_unnamed_positional_temperature_list_keeps_its_report_order() {
+    // The DJI Gen-1 firmware names no channel: the values stay in report order and the labels stay
+    // absent, so the page can only ever show them by index.
+    let reading = response(&["+QTEMP: 57,51,51"], AtFinalCode::Ok);
+    assert_eq!(
+        parse_profile_temperature(&reading),
+        vec![
+            SensorTemperature {
+                name: None,
+                celsius: 57,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+            SensorTemperature {
+                name: None,
+                celsius: 51,
+            },
+        ]
+    );
 }
 
 #[test]

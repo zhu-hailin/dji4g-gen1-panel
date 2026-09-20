@@ -15,6 +15,7 @@
 //! observation; [`FeatureProbeView`] hands it to the UI exclusively while correlated.
 
 use dji4g_application::DeviceEpoch;
+use dji4g_at_protocol::SensorTemperature;
 use dji4g_domain::{CellularSnapshot, FeatureStatus, NumberLookup, ServingCell, SimIdentity};
 
 /// Masked ICCID display (research §4.3): first four and last four digits around an ellipsis.
@@ -225,6 +226,13 @@ pub struct FeatureProbeState {
     pub iccid_full: Option<String>,
     /// Raw `+QENG` serving-cell line as reported, for the row's hover/copy detail.
     pub serving_cell_raw: Option<String>,
+    /// The module temperature stored into the matching snapshot, so the temperature rows can prove
+    /// that the readings below belong to the value being displayed.
+    pub temperature_celsius: Option<i16>,
+    /// Every QTEMP reading of this cycle, in report order (§7.5).
+    pub temperature_sensors: Vec<SensorTemperature>,
+    /// Raw `+QTEMP:` line as reported, for the temperature rows' hover detail.
+    pub temperature_raw: Option<String>,
 }
 
 impl std::fmt::Debug for FeatureProbeState {
@@ -242,6 +250,9 @@ impl std::fmt::Debug for FeatureProbeState {
             .field("serving_cell_status", &self.serving_cell_status)
             .field("iccid_full", &"[REDACTED]")
             .field("serving_cell_raw", &"[REDACTED]")
+            .field("temperature_celsius", &self.temperature_celsius)
+            .field("temperature_sensors", &self.temperature_sensors)
+            .field("temperature_raw", &"[REDACTED]")
             .finish()
     }
 }
@@ -258,6 +269,9 @@ impl Default for FeatureProbeState {
             serving_cell_status: FeatureStatus::NotProbed,
             iccid_full: None,
             serving_cell_raw: None,
+            temperature_celsius: None,
+            temperature_sensors: Vec::new(),
+            temperature_raw: None,
         }
     }
 }
@@ -276,6 +290,9 @@ pub struct FeatureProbeView {
     pub serving_cell_status: FeatureStatus,
     pub iccid_full: Option<String>,
     pub serving_cell_raw: Option<String>,
+    /// Every QTEMP reading of the correlated observation, in report order.
+    pub temperature_sensors: Vec<SensorTemperature>,
+    pub temperature_raw: Option<String>,
 }
 
 /// Correlate a probe record against the snapshot being rendered.
@@ -289,6 +306,7 @@ pub fn probe_view(
         cell.numbers == state.numbers
             && cell.sim_identity == state.sim_identity
             && cell.serving_cell == state.serving_cell
+            && cell.temperature_celsius == state.temperature_celsius
     });
     let captured = values_match && device_epoch.is_some_and(|epoch| epoch == state.epoch);
     if !captured {
@@ -299,6 +317,8 @@ pub fn probe_view(
             serving_cell_status: FeatureStatus::NotProbed,
             iccid_full: None,
             serving_cell_raw: None,
+            temperature_sensors: Vec::new(),
+            temperature_raw: None,
         };
     }
     FeatureProbeView {
@@ -308,6 +328,8 @@ pub fn probe_view(
         serving_cell_status: state.serving_cell_status,
         iccid_full: state.iccid_full.clone(),
         serving_cell_raw: state.serving_cell_raw.clone(),
+        temperature_sensors: state.temperature_sensors.clone(),
+        temperature_raw: state.temperature_raw.clone(),
     }
 }
 
@@ -315,6 +337,7 @@ pub fn probe_view(
 mod tests {
     use super::{FeatureProbeState, mask_iccid, probe_view, sha256};
     use dji4g_application::DeviceEpoch;
+    use dji4g_at_protocol::SensorTemperature;
     use dji4g_domain::{
         AttachState, CellularSnapshot, FeatureStatus, NumberLookup, PhoneNumber, RegistrationState,
         SimIdentity, SimState,
@@ -412,6 +435,9 @@ mod tests {
             serving_cell_status: FeatureStatus::NotProbed,
             iccid_full: None,
             serving_cell_raw: None,
+            temperature_celsius: None,
+            temperature_sensors: Vec::new(),
+            temperature_raw: None,
         };
         let view = probe_view(&state, Some(&cell), Some(DeviceEpoch(3)));
         assert!(view.captured);
@@ -435,6 +461,12 @@ mod tests {
             serving_cell_status: FeatureStatus::NotProbed,
             iccid_full: Some("89860123456789012345".to_owned()),
             serving_cell_raw: Some("+QENG: raw".to_owned()),
+            temperature_celsius: None,
+            temperature_sensors: vec![SensorTemperature {
+                name: None,
+                celsius: 57,
+            }],
+            temperature_raw: Some("+QTEMP: 57,51,51".to_owned()),
         };
         // A different epoch breaks the correlation even when the values match.
         let view = probe_view(&state, Some(&cellular_with(Some(numbers.clone()))), None);
@@ -444,10 +476,23 @@ mod tests {
             view.serving_cell_raw, None,
             "raw line must not leak on mismatch"
         );
+        assert_eq!(
+            view.temperature_raw, None,
+            "raw temperature line must not leak on mismatch"
+        );
+        assert!(view.temperature_sensors.is_empty());
         // A cellular snapshot whose values differ breaks the correlation too.
         let view = probe_view(&state, Some(&cellular_with(None)), Some(DeviceEpoch(3)));
         assert!(!view.captured);
         assert_eq!(view.numbers_status, FeatureStatus::NotProbed);
+        // So does a snapshot whose temperature differs from the recorded reading.
+        let mut drifted = cellular_with(Some(numbers.clone()));
+        drifted.temperature_celsius = Some(59);
+        let view = probe_view(&state, Some(&drifted), Some(DeviceEpoch(3)));
+        assert!(
+            !view.captured,
+            "a reading from another cycle must not describe this snapshot"
+        );
         // Matching snapshot and epoch expose the correlated secrets.
         let mut cell = cellular_with(Some(numbers));
         cell.sim_identity = Some(SimIdentity {
@@ -458,6 +503,14 @@ mod tests {
         assert!(view.captured);
         assert_eq!(view.iccid_full.as_deref(), Some("89860123456789012345"));
         assert_eq!(view.serving_cell_raw.as_deref(), Some("+QENG: raw"));
+        assert_eq!(view.temperature_raw.as_deref(), Some("+QTEMP: 57,51,51"));
+        assert_eq!(
+            view.temperature_sensors,
+            [SensorTemperature {
+                name: None,
+                celsius: 57,
+            }]
+        );
         // Without any cellular evidence there is nothing to annotate.
         let view = probe_view(&state, None, Some(DeviceEpoch(3)));
         assert!(!view.captured);

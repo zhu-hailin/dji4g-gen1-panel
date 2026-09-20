@@ -127,6 +127,16 @@ mod capture {
             }
         }
 
+        /// Frames to wait before capturing this screen.  The overview runs one simulated
+        /// observation cycle per tick, so it needs enough ticks for the temperature trend to fill
+        /// its window before the picture is taken.
+        fn settle_ticks(self) -> usize {
+            match self {
+                Self::Overview => 65,
+                _ => 5,
+            }
+        }
+
         fn apply(self, app: &mut PanelApp) {
             app.set_review_page(self.page());
             match self {
@@ -168,6 +178,7 @@ mod capture {
                 Screen::SmsConfirmation,
             ],
             "wireless" => vec![Screen::Wireless],
+            "overview" => vec![Screen::Overview],
             "tools" => vec![
                 Screen::ToolsPreset,
                 Screen::ToolsQuery,
@@ -202,6 +213,12 @@ mod capture {
         page_started: std::time::Instant,
         requested: bool,
         screens: Vec<Screen>,
+        /// Observation cycles already published for the overview review, and the wall clock the
+        /// first one is dated from; together they give the temperature trend a real timeline.
+        overview_cycles: usize,
+        review_base: SystemTime,
+        /// The simulated optional-probe record the overview correlates its rows against.
+        probe: Arc<std::sync::Mutex<dji4g_panel::feature_probe::FeatureProbeState>>,
     }
 
     impl Capture {
@@ -228,6 +245,117 @@ mod capture {
                     }),
                     ..(*snapshot.app).clone()
                 });
+            }
+            let _ = self.snapshot_tx.send(Arc::new(snapshot));
+        }
+
+        /// Publish one simulated observation cycle per tick for the overview review.
+        ///
+        /// Every tick is a cycle dated ten seconds after the previous one, so the 「模块温度」 trend
+        /// is drawn from the very ring the panel builds in production — including two cycles that
+        /// reported nothing, which stay an honest gap.  The reading mimics the DJI positional
+        /// layout (`+QTEMP: v,v-6,v-6`) the module really answers with.  The same cycle carries a
+        /// simulated throughput pair (a quiet link with a late upload burst), so the rate chart is
+        /// reviewed with data in it too.  No device is contacted: the screenshots are evidence
+        /// about layout only.
+        fn publish_overview_fixture(&mut self) {
+            if !matches!(self.screens[self.page], Screen::Overview) {
+                return;
+            }
+            let cycle = self.overview_cycles;
+            self.overview_cycles += 1;
+            // A warm-up ramp that plateaus, with two cycles that could not be read.
+            let reading = match cycle {
+                40..=41 => None,
+                _ => Some(48 + (cycle / 8).min(9) as i16),
+            };
+            let observed_at = self.review_base + Duration::from_secs(cycle as u64 * 10);
+            let mut snapshot = demo_snapshot(DemoScenario::Available, SystemTime::now());
+            let mut app = (*snapshot.app).clone();
+            app.observed_at = observed_at;
+            // The demo scenarios carry no cellular block, so the review supplies the module the
+            // temperature belongs to.  Every value here is invented.
+            app.cellular = Some(dji4g_domain::CellularSnapshot {
+                sim: dji4g_domain::SimState::Ready,
+                registration: dji4g_domain::RegistrationState::RegisteredHome,
+                attached: dji4g_domain::AttachState::Attached,
+                carrier: Some("CHN-UNICOM".to_owned()),
+                radio_access_technology: Some("LTE".to_owned()),
+                signal_rssi_dbm: Some(-63),
+                apn: Some("cmnet".to_owned()),
+                pdp_address: Some("10.1.2.3".to_owned()),
+                pdp_state: Some("active".to_owned()),
+                firmware: Some("QDC507GLEFM21".to_owned()),
+                serving_cell: None,
+                sim_identity: None,
+                numbers: None,
+                temperature_celsius: reading,
+                temperature_status: dji4g_domain::FeatureStatus::Supported,
+            });
+            // A quiet downlink and a late uplink burst: the rate chart must follow these numbers
+            // with its own y-axis instead of a fixed ceiling.
+            // The reported case: a 86.2 KB/s burst inside the minute, ~47.5 KB/s now.
+            let down = if (24..28).contains(&cycle) {
+                86_200
+            } else {
+                47_500 - (cycle as u64 % 5) * 240
+            };
+            let up = if cycle >= 52 {
+                8_700
+            } else {
+                1_100 + (cycle as u64 % 5) * 210
+            };
+            app.network = Some(dji4g_domain::NetworkSnapshot {
+                adapter_id: "{adapter}".to_owned(),
+                addresses: vec!["192.168.225.30".to_owned()],
+                gateways: vec!["192.168.225.1".to_owned()],
+                dns_servers: vec!["192.168.225.1".to_owned()],
+                adapter_state: dji4g_domain::AdapterState::UsableAddressAndRoute,
+                bound_public: dji4g_domain::BoundPublicStatus::Succeeded,
+                bound_dns: dji4g_domain::BoundDnsStatus::Succeeded,
+                protocol_coverage: dji4g_domain::ProtocolCoverage::AllRequiredFamilies,
+                system_default_route: dji4g_domain::DefaultRouteOwner::TargetAdapter,
+                down_bytes_per_sec: Some(down),
+                up_bytes_per_sec: Some(up),
+            });
+            snapshot.app = Arc::new(app);
+            let probe = {
+                let cellular = snapshot.app.cellular.as_ref();
+                dji4g_panel::feature_probe::FeatureProbeState {
+                    epoch: snapshot
+                        .app
+                        .device
+                        .as_ref()
+                        .map_or(dji4g_domain::DeviceEpoch(0), |device| device.epoch),
+                    numbers: cellular.and_then(|cellular| cellular.numbers.clone()),
+                    sim_identity: cellular.and_then(|cellular| cellular.sim_identity.clone()),
+                    serving_cell: cellular.and_then(|cellular| cellular.serving_cell.clone()),
+                    temperature_celsius: reading,
+                    temperature_sensors: reading.map_or_else(Vec::new, |celsius| {
+                        vec![
+                            dji4g_at_protocol::SensorTemperature {
+                                name: None,
+                                celsius,
+                            },
+                            dji4g_at_protocol::SensorTemperature {
+                                name: None,
+                                celsius: celsius - 6,
+                            },
+                            dji4g_at_protocol::SensorTemperature {
+                                name: None,
+                                celsius: celsius - 6,
+                            },
+                        ]
+                    }),
+                    temperature_raw: reading.map(|celsius| {
+                        let low = celsius - 6;
+                        format!("+QTEMP: {celsius},{low},{low}")
+                    }),
+                    ..dji4g_panel::feature_probe::FeatureProbeState::default()
+                }
+            };
+            if let Ok(mut slot) = self.probe.lock() {
+                *slot = probe;
             }
             let _ = self.snapshot_tx.send(Arc::new(snapshot));
         }
@@ -274,14 +402,22 @@ mod capture {
                 self.resized = true;
             }
             self.publish_fixture();
+            self.publish_overview_fixture();
             self.app.receive_latest_nonblocking(ctx);
+            // This harness drives `render` directly instead of `PanelApp::update`, so the UI-side
+            // rings are fed through the same public entry points the update loop uses, on the
+            // fixture's synthetic clock (one second and one observation cycle per tick).
+            self.app.sample_rates_on_cadence(
+                self.review_base + Duration::from_secs(self.overview_cycles as u64),
+            );
+            self.app.sample_temperature_on_observation();
             self.screens[self.page].apply(&mut self.app);
             egui::TopBottomPanel::top("simulated-review").show(ctx, |ui| {
                 ui.label("界面验收 · 模拟数据 · 不连接设备 / 不发送短信");
             });
             self.app.render(ctx, frame);
             self.ticks += 1;
-            if self.ticks >= 5
+            if self.ticks >= self.screens[self.page].settle_ticks()
                 && !self.requested
                 && self.page_started.elapsed() >= Duration::from_millis(500)
             {
@@ -432,7 +568,7 @@ mod capture {
     fn tools_fixture(kind: ToolsFixture) -> dji4g_application::DeviceToolsSnapshot {
         use dji4g_application::*;
         use dji4g_at_protocol::{
-            AtCommand, AtFinalCode, AtResponse, ToolReadId, ValidatedToolLine,
+            AtCommand, AtFinalCode, AtResponse, SensorTemperature, ToolReadId, ValidatedToolLine,
             VerifiedUsbNetProfile,
         };
 
@@ -461,7 +597,16 @@ mod capture {
                 revision: Some("EC200ACNAAR02A05M08".to_owned()),
                 usb_net: Some(UsbNetReading::Verified(VerifiedUsbNetProfile::DjiNdis)),
                 pdp_contexts,
-                temperature: vec![("cpu".to_owned(), 42), ("pa".to_owned(), 37)],
+                temperature: vec![
+                    SensorTemperature {
+                        name: Some("cpu".to_owned()),
+                        celsius: 42,
+                    },
+                    SensorTemperature {
+                        name: Some("pa".to_owned()),
+                        celsius: 37,
+                    },
+                ],
                 observed_at: Some(now - Duration::from_secs(12)),
                 context: Some(context.clone()),
             },
@@ -611,7 +756,14 @@ mod capture {
                 }
                 let snapshot = Arc::new(snapshot);
                 let (snapshot_tx, rx) = dji4g_application::sync::watch::channel(snapshot);
-                let app = PanelApp::new(PanelInputs::new(rx, Arc::new(Noop), None, None), cc);
+                let probe = Arc::new(std::sync::Mutex::new(
+                    dji4g_panel::feature_probe::FeatureProbeState::default(),
+                ));
+                let app = PanelApp::new(
+                    PanelInputs::new(rx, Arc::new(Noop), None, None)
+                        .with_feature_probe(Arc::clone(&probe)),
+                    cc,
+                );
                 Ok(Box::new(Capture {
                     app,
                     snapshot_tx,
@@ -625,6 +777,11 @@ mod capture {
                     page_started: std::time::Instant::now(),
                     requested: false,
                     screens,
+                    // The simulated timeline ends at "now": the newest cycle is the current
+                    // reading, and the window covers the ten minutes before it.
+                    review_base: SystemTime::now() - Duration::from_secs(660),
+                    overview_cycles: 0,
+                    probe,
                 }))
             }),
         )

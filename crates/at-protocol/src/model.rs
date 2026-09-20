@@ -202,6 +202,20 @@ impl fmt::Debug for PdpContext {
     }
 }
 
+/// One module temperature reading from `AT+QTEMP` (research §7.5).
+///
+/// The sensor layout is firmware-defined.  Some modules name every channel
+/// (`+QTEMP: "modem",41`); the DJI Gen-1 module reports an unnamed positional list
+/// (`+QTEMP: 57,51,51`).  An unnamed channel keeps `None` here — the position is the only identity
+/// the device gave, so nothing is invented and the UI labels such a channel by index instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SensorTemperature {
+    /// Firmware channel name, exactly when the module reports one.
+    pub name: Option<String>,
+    /// Reported degrees Celsius, exactly as sent.
+    pub celsius: i16,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VerifiedUsbNetProfile {
     DjiNdis,

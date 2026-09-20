@@ -742,8 +742,18 @@ fn render_connection_section(ui: &mut Ui, profile: &dji4g_application::ModulePro
         } else {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                for (sensor, celsius) in &profile.temperature {
-                    badge(ui, format!("{sensor} {celsius} ℃"), scale::SECONDARY);
+                for (index, reading) in profile.temperature.iter().enumerate() {
+                    // A firmware channel without a name is shown by its position — the module gave
+                    // no identity for it, and this page never invents one.
+                    let label = reading
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("传感器{}", index + 1));
+                    badge(
+                        ui,
+                        format!("{label} {} ℃", reading.celsius),
+                        scale::SECONDARY,
+                    );
                 }
             });
             wrapped_label(ui, meta_text("传感器定义以固件为准。"));
@@ -1297,6 +1307,7 @@ mod tests {
 
     use super::*;
     use dji4g_application::{ToolCapabilityRow, ToolContext, ToolHistoryEntry, ToolTranscript};
+    use dji4g_at_protocol::SensorTemperature;
     use dji4g_domain::StableDeviceIdentity;
 
     fn identity() -> StableDeviceIdentity {
@@ -1332,7 +1343,10 @@ mod tests {
                 revision: Some("EC200ACNAAR02A05M08".to_owned()),
                 usb_net: Some(UsbNetReading::Verified(VerifiedUsbNetProfile::DjiNdis)),
                 pdp_contexts: Vec::new(),
-                temperature: vec![("cpu".to_owned(), 42)],
+                temperature: vec![SensorTemperature {
+                    name: Some("cpu".to_owned()),
+                    celsius: 42,
+                }],
                 observed_at: Some(now),
                 context: Some(context()),
             },

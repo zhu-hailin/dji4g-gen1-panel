@@ -15,7 +15,7 @@ pub use command::{AtCommand, Effect, EncodedAtCommand, RetryPolicy, Sensitivity}
 pub use model::{
     Apn, ApnError, AtEvent, AtFinalCode, AtResponse, AtUrc, PdpContext, PdpContextId,
     PdpContextIdError, PdpContextState, PdpType, ProtocolError, ProtocolErrorKind,
-    VerifiedUsbNetProfile,
+    SensorTemperature, VerifiedUsbNetProfile,
 };
 pub use parser::{
     CnumParseError, StreamingParser, at_csv, parse_cmti_line, parse_cnum_lines, parse_iccid_line,

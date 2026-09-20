@@ -8,6 +8,10 @@ pub(crate) mod scale {
     pub(crate) const LINE: Color32 = Color32::from_rgb(0xe2, 0xe6, 0xec);
     pub(crate) const DOWNLOAD: Color32 = Color32::from_rgb(0x4c, 0x6f, 0xff);
     pub(crate) const UPLOAD: Color32 = Color32::from_rgb(0xb2, 0x67, 0x00);
+    /// Measured module temperature.  A hue of its own: the rate chart's blue and amber already mean
+    /// download and upload, and the status tones own green/amber/red, so a violet line can never be
+    /// read as a throughput series or as a verdict.
+    pub(crate) const TEMPERATURE: Color32 = Color32::from_rgb(0x6b, 0x4f, 0xb5);
     pub(crate) const WARNING: Color32 = Color32::from_rgb(0x91, 0x61, 0x00);
     pub(crate) const AXIS_LABEL: Color32 = Color32::from_rgb(0x73, 0x73, 0x73);
     pub(crate) const GRID: Color32 = Color32::from_rgb(0xeb, 0xeb, 0xeb);

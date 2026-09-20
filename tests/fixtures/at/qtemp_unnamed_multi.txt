@@ -1,0 +1,3 @@
+AT+QTEMP
++QTEMP: 57,51,51
+OK

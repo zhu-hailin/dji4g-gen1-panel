@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use dji4g_at_protocol::{
-    AtFinalCode, PdpContext, ToolReadId, ToolResponse, ValidatedToolLine, VerifiedUsbNetProfile,
-    parse_qtemp_lines,
+    AtFinalCode, PdpContext, SensorTemperature, ToolReadId, ToolResponse, ValidatedToolLine,
+    VerifiedUsbNetProfile, parse_qtemp_lines,
 };
 use dji4g_domain::{DeviceEpoch, FeatureStatus, StableDeviceIdentity};
 
@@ -424,9 +424,10 @@ pub struct ModuleProfile {
     pub revision: Option<String>,
     pub usb_net: Option<UsbNetReading>,
     pub pdp_contexts: Vec<PdpContext>,
-    /// Sensor name and degrees Celsius, exactly as the module reported them; a missing sensor is
-    /// absent rather than reported as zero.
-    pub temperature: Vec<(String, i16)>,
+    /// Sensor readings in report order, exactly as the module reported them; a missing sensor is
+    /// absent rather than reported as zero, and a channel the firmware did not name keeps
+    /// `name: None`.
+    pub temperature: Vec<SensorTemperature>,
     pub observed_at: Option<SystemTime>,
     pub context: Option<ToolContext>,
 }
@@ -664,9 +665,10 @@ pub fn as_at_response(
     }
 }
 
-/// Temperatures using the existing parser. Missing sensors stay missing.
+/// Temperatures using the existing parser. Missing sensors stay missing, and channels the firmware
+/// left unnamed stay unnamed instead of being given invented labels here.
 #[must_use]
-pub fn parse_profile_temperature(response: &ToolResponse) -> Vec<(String, i16)> {
+pub fn parse_profile_temperature(response: &ToolResponse) -> Vec<SensorTemperature> {
     let refs = response
         .lines
         .iter()
