@@ -15,6 +15,9 @@ pub mod repair;
 mod serial;
 pub mod single_instance;
 pub mod sms;
+pub mod sms_archive_crypto;
+mod sms_history;
+pub use sms_history::sms_list_controlled;
 pub mod tray;
 
 pub use adapter::*;

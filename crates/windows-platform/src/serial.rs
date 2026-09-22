@@ -15,8 +15,8 @@ use dji4g_at_protocol::{
     StreamingParser, ToolParseError, ToolResponse, ToolResponseParser, ToolWireRequest,
 };
 use dji4g_domain::{
-    DeviceEpoch, SmsDeleteControl, SmsDeleteReceipt, SmsFragmentKey, SmsSendPhase,
-    SmsTransactionControl,
+    DeviceEpoch, SmsDeleteControl, SmsDeleteReceipt, SmsFragmentKey, SmsReadControl, SmsReadPhase,
+    SmsSendPhase, SmsStorageId, SmsTransactionControl,
 };
 
 /// Cancellation and write-attempt handle for one tool transaction. The platform crate must not
@@ -106,6 +106,12 @@ impl fmt::Display for ActorError {
 impl std::error::Error for ActorError {}
 
 enum Request {
+    SmsHistory {
+        expected_sim: Option<[u8; 8]>,
+        storage: Option<SmsStorageId>,
+        control: SmsReadControl,
+        reply: OperationReply<Result<crate::SmsListing, crate::PlatformError>>,
+    },
     CheckedDelete {
         expected: SmsFragmentKey,
         control: SmsDeleteControl,
@@ -521,6 +527,78 @@ impl AtSessionActor {
         })
     }
 
+    pub(crate) fn execute_sms_history(
+        &self,
+        expected_sim: Option<[u8; 8]>,
+        storage: Option<SmsStorageId>,
+        control: SmsReadControl,
+    ) -> Result<crate::SmsListing, crate::PlatformError> {
+        let (reply, response) = mpsc::channel();
+        self.try_send(|state| Request::SmsHistory {
+            expected_sim,
+            storage,
+            control: control.clone(),
+            reply: OperationReply {
+                sender: Some(reply),
+                state,
+            },
+        })
+        .map_err(|e| crate::sms_history::actor_failure(e, &control))?;
+        let mut cleanup_deadline = None;
+        loop {
+            match response.try_recv() {
+                Ok(result) => {
+                    return result
+                        .unwrap_or_else(|e| Err(crate::sms_history::actor_failure(e, &control)));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return Err(crate::sms_history::actor_failure(
+                        ActorError::Closed,
+                        &control,
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            if (control.is_cancelled()
+                || control.is_expired()
+                || control.phase() == SmsReadPhase::RestoringStorage)
+                && cleanup_deadline.is_none()
+            {
+                cleanup_deadline = Some(Instant::now() + Duration::from_secs(4));
+                // Keep actor state live for restoration. Interrupt only the original blocked I/O.
+                if control.phase() != SmsReadPhase::RestoringStorage {
+                    let _ = self.cancellation.cancel();
+                }
+            }
+            if cleanup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.invalidate_epoch();
+                return Err(
+                    if control.restoration() == dji4g_domain::SmsStorageRestoration::Unknown {
+                        crate::PlatformError {
+                            code: "sms:storage_restore_unknown",
+                            os_code: None,
+                        }
+                    } else {
+                        crate::sms_history::actor_failure(ActorError::CloseTimeout, &control)
+                    },
+                );
+            }
+            match response.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) => {
+                    return result
+                        .unwrap_or_else(|e| Err(crate::sms_history::actor_failure(e, &control)));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(crate::sms_history::actor_failure(
+                        ActorError::Closed,
+                        &control,
+                    ));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
     pub(crate) fn execute_checked_delete(
         &self,
         expected: SmsFragmentKey,
@@ -856,6 +934,43 @@ fn run_actor(
         }
         let Some(request) = request else { break };
         match request {
+            Request::SmsHistory {
+                expected_sim,
+                storage,
+                control,
+                reply,
+            } => {
+                let mut cleanup_control = None;
+                let result = crate::sms_history::list_in_session(
+                    epoch,
+                    expected_sim,
+                    storage,
+                    &control,
+                    |command, cleanup| {
+                        let transaction_control = if cleanup {
+                            cleanup_control.get_or_insert_with(|| {
+                                SmsDeleteControl::new(Duration::from_secs(3))
+                            })
+                        } else {
+                            control.transport_control()
+                        };
+                        execute_history_command(
+                            epoch,
+                            serial.as_mut(),
+                            &state,
+                            command,
+                            transaction_control,
+                            &control,
+                        )
+                    },
+                );
+                reply.send(Ok(result));
+                let _gate = state
+                    .submission_gate
+                    .lock()
+                    .expect("submission gate poisoned");
+                state.finish_closed_locked();
+            }
             Request::CheckedDelete {
                 expected,
                 control,
@@ -1114,6 +1229,62 @@ fn execute_delete_command(
         };
         check()?;
         for event in parser.push(&bytes).map_err(ActorError::Protocol)? {
+            if let AtEvent::Response(response) = event {
+                return if response.final_code == AtFinalCode::Ok {
+                    Ok(response)
+                } else {
+                    Err(ActorError::FinalCode(response.final_code))
+                };
+            }
+        }
+    }
+}
+
+fn execute_history_command(
+    epoch: DeviceEpoch,
+    serial: &mut dyn SerialIo,
+    state: &ActorState,
+    command: AtCommand,
+    control: &SmsDeleteControl,
+    read_control: &SmsReadControl,
+) -> Result<AtResponse, ActorError> {
+    let mut parser = StreamingParser::new(epoch, command.clone());
+    let check = || {
+        if !state.is_running() {
+            return Err(state.terminal_error());
+        }
+        if control.is_cancelled() {
+            return Err(ActorError::Io(io::ErrorKind::Interrupted));
+        }
+        if control.is_expired() {
+            return Err(ActorError::Io(io::ErrorKind::TimedOut));
+        }
+        Ok(())
+    };
+    {
+        // Synchronize invalidation with the attempt flag before entering potentially blocked I/O.
+        let _gate = state
+            .submission_gate
+            .lock()
+            .expect("submission gate poisoned");
+        check()?;
+    }
+    serial
+        .write_all(command.encode().as_bytes())
+        .map_err(|error| io_error(&mut parser, error))?;
+    loop {
+        check()?;
+        let bytes = match serial.read_chunk() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) => return Err(io_error(&mut parser, error)),
+        };
+        check()?;
+        let events = parser.push(&bytes).map_err(ActorError::Protocol)?;
+        if matches!(command, AtCommand::SmsList) {
+            read_control.set_progress(parser.sms_record_count());
+        }
+        for event in events {
             if let AtEvent::Response(response) = event {
                 return if response.final_code == AtFinalCode::Ok {
                     Ok(response)

@@ -276,8 +276,8 @@ fn temperature_still_rejects_foreign_wire_data() {
 }
 
 #[test]
-fn sms_list_accepts_sixty_six_records_and_rejects_above_two_hundred() {
-    // A full store commonly holds dozens of messages; 66 records must parse (the cap is 200).
+fn sms_list_accepts_sixty_six_records_and_rejects_above_one_thousand() {
+    // A full store commonly holds dozens of messages; 66 records must parse (the cap is 1000).
     let mut parser = StreamingParser::new(EPOCH, AtCommand::SmsList);
     let response = one_response(
         parser
@@ -288,7 +288,7 @@ fn sms_list_accepts_sixty_six_records_and_rejects_above_two_hundred() {
 
     // Above the cap the list fails closed instead of silently truncating.
     let mut over = String::new();
-    for index in 0..201 {
+    for index in 0..1001 {
         over.push_str(&format!(
             "+CMGL: {index},1,,,\r\n0011000B912120550521F30008024E2D\r\n"
         ));
@@ -298,7 +298,7 @@ fn sms_list_accepts_sixty_six_records_and_rejects_above_two_hundred() {
     assert_eq!(
         parser
             .push(over.as_bytes())
-            .expect_err("more than 200 records exceed the list cap")
+            .expect_err("more than 1000 records exceed the list cap")
             .kind,
         ProtocolErrorKind::WrongPortData
     );
@@ -506,5 +506,54 @@ fn a_prompt_line_without_prompt_mode_still_fails_closed() {
             .expect_err("prompt line is not a response shape")
             .kind,
         ProtocolErrorKind::WrongPortData
+    );
+}
+
+#[test]
+fn history_500_long_pdus_exceed_64k_but_fit_bounded_listing() {
+    let mut wire = String::new();
+    for index in 1..=500 {
+        wire.push_str(&format!(
+            "+CMGL: {index},1,,180\r\n{}\r\n",
+            "AB".repeat(180)
+        ));
+    }
+    wire.push_str("OK\r\n");
+    assert!(wire.len() > 65536);
+    let mut parser = StreamingParser::new(DeviceEpoch(1), AtCommand::SmsList);
+    let events = parser
+        .push(wire.as_bytes())
+        .expect("500 long records must fit");
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AtEvent::Response(response) if response.lines.len() == 1000)
+        )
+    );
+}
+
+#[test]
+fn history_payload_remains_bounded_at_one_mebibyte() {
+    let mut wire = String::new();
+    for index in 1..=1000 {
+        wire.push_str(&format!(
+            "+CMGL: {index},1,\"{}\",512\r\n{}\r\n",
+            "a".repeat(32),
+            "AB".repeat(512)
+        ));
+    }
+    wire.push_str("OK\r\n");
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::SmsList);
+    assert_eq!(
+        parser.push(wire.as_bytes()).unwrap_err().kind,
+        ProtocolErrorKind::ResponseTooLarge
+    );
+}
+#[test]
+fn history_limit_change_keeps_ordinary_at_64k_cap() {
+    let wire = format!("{}OK\r\n", format!("{}\r\n", "A".repeat(4096)).repeat(17));
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Identity);
+    assert_eq!(
+        parser.push(wire.as_bytes()).unwrap_err().kind,
+        ProtocolErrorKind::ResponseTooLarge
     );
 }

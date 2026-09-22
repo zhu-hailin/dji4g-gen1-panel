@@ -781,6 +781,9 @@ mod tests {
             serial_work_busy: false,
             sms_send: None,
             sms_refresh_pending: false,
+            sms_read_phase: None,
+            sms_read_progress: 0,
+            sms_read_report: None,
             sms_inbox_failure: None,
             device_tools: Default::default(),
         }

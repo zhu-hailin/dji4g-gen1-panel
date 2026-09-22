@@ -88,6 +88,7 @@ pub trait TrayEventSource: Send {
     /// only extends the native worker's hard-exit deadline; it never cancels it, because this
     /// call is never reached when the window is hidden and egui stops repainting.
     fn acknowledge_exit(&mut self) {}
+    fn defer_exit_for_local_io(&mut self) {}
 }
 
 impl<B> TrayEventSource for TrayController<B>
@@ -108,6 +109,9 @@ where
 
     fn acknowledge_exit(&mut self) {
         TrayController::acknowledge_exit(self);
+    }
+    fn defer_exit_for_local_io(&mut self) {
+        TrayController::defer_exit_for_local_io(self);
     }
 }
 
@@ -154,6 +158,12 @@ where
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .acknowledge_exit();
+    }
+    fn defer_exit_for_local_io(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .defer_exit_for_local_io();
     }
 }
 
@@ -344,6 +354,12 @@ fn panel_window_handle() -> Option<isize> {
 pub struct PanelApp {
     onboarding: crate::ui::onboarding::OnboardingState,
     loaded_config: ConfigV1,
+    driver_setup_outcome: Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome>,
+    archive: Option<crate::sms_archive::ArchiveService>,
+    archive_ui: crate::ui::sms_archive::ArchiveUi,
+    archive_view: bool,
+    exit_archive_snapshot: Option<Arc<ControllerSnapshot>>,
+    exit_archive_observed: bool,
     snapshot_rx: dji4g_application::sync::watch::Receiver<Arc<ControllerSnapshot>>,
     commands: Arc<dyn UiCommandSink>,
     snapshot: Arc<ControllerSnapshot>,
@@ -420,9 +436,135 @@ impl PanelApp {
         }
     }
 
+    pub fn configure_archive(&mut self, path: PathBuf, enabled: bool) {
+        let mut archive = crate::sms_archive::ArchiveService::new(path);
+        archive.set_enabled(enabled);
+        self.archive = Some(archive);
+    }
+
+    fn finish_archive_for_exit(&mut self) -> bool {
+        let final_snapshot = self
+            .exit_archive_snapshot
+            .get_or_insert_with(|| Arc::clone(&self.snapshot));
+        let Some(archive) = &mut self.archive else {
+            return false;
+        };
+        archive.poll();
+        if !archive.busy() && !self.exit_archive_observed {
+            archive.observe(final_snapshot);
+            self.exit_archive_observed = true;
+        }
+        archive.busy()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_review_archive(&mut self, loaded: bool) {
+        self.page = Page::Sms;
+        self.archive_view = true;
+        self.archive = Some(crate::sms_archive::ArchiveService::review_fixture(loaded));
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_review_sms_storage_confirmation(&mut self, storage: dji4g_domain::SmsStorageId) {
+        self.sms_compose.storage_confirmation = Some((
+            self.snapshot.app.device.as_ref().map(|d| d.epoch),
+            self.snapshot.sim_epoch,
+            storage,
+        ));
+    }
+
+    fn save_archive_preference(&mut self, enabled: bool) -> bool {
+        let mut config = ConfigV1::from_settings(&self.snapshot.settings)
+            .unwrap_or_else(|| self.loaded_config.clone());
+        config.onboarding_completed = self.onboarding.completed;
+        config.sms_archive_enabled = enabled;
+        let result = self
+            .settings_backend
+            .as_ref()
+            .ok_or_else(|| ConfigError::new("config:path_unavailable"))
+            .and_then(|backend| backend.save_config(&config));
+        match result {
+            Ok(()) => {
+                self.loaded_config = config;
+                self.archive_ui.error = None;
+                true
+            }
+            Err(_) => {
+                self.archive_ui.error =
+                    Some("保存历史开关失败，本次更改未保存。请检查用户目录权限后重试。".into());
+                false
+            }
+        }
+    }
+
+    fn render_sms_page(&mut self, ui: &mut egui::Ui, snapshot: &ControllerSnapshot) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.archive_view, false, "模块短信");
+            ui.selectable_value(&mut self.archive_view, true, "本地历史");
+        });
+        ui.add_space(6.0);
+        if !self.archive_view {
+            sms::render(
+                ui,
+                snapshot,
+                &snapshot.sms_messages,
+                self.language,
+                self.commands.as_ref(),
+                &mut self.sms_compose,
+            );
+            return;
+        }
+        use crate::ui::sms_archive::ArchiveAction;
+        let action =
+            crate::ui::sms_archive::render(ui, self.archive.as_ref(), &mut self.archive_ui);
+        match action {
+            Some(ArchiveAction::SetEnabled(enabled)) => {
+                if self.save_archive_preference(enabled) {
+                    if let Some(archive) = &mut self.archive {
+                        archive.set_enabled(enabled);
+                    }
+                }
+            }
+            Some(ArchiveAction::Clear) => {
+                // Persist disabled first, so a subsequent launch cannot immediately refill a cleared file.
+                if self.save_archive_preference(false) {
+                    if let Some(archive) = &mut self.archive {
+                        archive.clear();
+                    }
+                    self.archive_ui.export_path = None;
+                }
+            }
+            Some(ArchiveAction::Export) => {
+                if let (Some(archive), Some(directory)) = (&mut self.archive, &self.exports_dir) {
+                    let stamp = SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let path = directory.join(format!("短信历史-{stamp}.txt"));
+                    archive.export_text(path.clone());
+                    self.archive_ui.export_path = Some(path);
+                } else {
+                    self.archive_ui.error = Some("未导出：用户导出目录不可用。".into());
+                }
+            }
+            None => {}
+        }
+    }
+
     pub fn open_onboarding(&mut self) {
         self.onboarding.open = true;
         if !self.snapshot.serial_work_busy {
+            self.send(UiCommand::Refresh);
+        }
+    }
+
+    pub fn configure_driver_setup_result(
+        &mut self,
+        outcome: dji4g_windows_platform::driver_setup::DriverSetupOutcome,
+    ) {
+        self.driver_setup_outcome = Some(outcome);
+        self.onboarding.open = true;
+        if outcome.allows_recheck() && !self.snapshot.serial_work_busy {
             self.send(UiCommand::Refresh);
         }
     }
@@ -449,6 +591,7 @@ impl PanelApp {
         config.active_probe = self.snapshot.settings.active_probe;
         config.log_level = self.snapshot.settings.log_level;
         config.onboarding_completed = true;
+        config.sms_archive_enabled = self.loaded_config.sms_archive_enabled;
         self.loaded_config = config.clone();
         let result = self
             .settings_backend
@@ -491,6 +634,12 @@ impl PanelApp {
         Self {
             onboarding: Default::default(),
             loaded_config: ConfigV1::default(),
+            driver_setup_outcome: None,
+            archive: None,
+            archive_ui: Default::default(),
+            archive_view: false,
+            exit_archive_snapshot: None,
+            exit_archive_observed: false,
             snapshot_rx: inputs.snapshot_rx,
             commands: inputs.commands,
             snapshot,
@@ -542,6 +691,12 @@ impl PanelApp {
         Self {
             onboarding: Default::default(),
             loaded_config: ConfigV1::default(),
+            driver_setup_outcome: None,
+            archive: None,
+            archive_ui: Default::default(),
+            archive_view: false,
+            exit_archive_snapshot: None,
+            exit_archive_observed: false,
             snapshot_rx: inputs.snapshot_rx,
             commands: inputs.commands,
             snapshot,
@@ -909,6 +1064,11 @@ impl PanelApp {
             return;
         }
         if self.window.explicit_exit {
+            if self.finish_archive_for_exit() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.show_window(ctx);
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
             return;
         }
         if self.tray.is_none() {
@@ -1096,6 +1256,7 @@ impl PanelApp {
 
         if let Some(mut config) = config {
             config.onboarding_completed = self.onboarding.completed;
+            config.sms_archive_enabled = self.loaded_config.sms_archive_enabled;
             self.loaded_config = config.clone();
             self.persisted_revision = revision;
             let result = match self.settings_backend.as_ref() {
@@ -1171,17 +1332,51 @@ impl PanelApp {
 
     pub fn render(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.support_report.poll();
+        if let Some(archive) = &mut self.archive {
+            archive.poll();
+            if !self.window.explicit_exit {
+                archive.observe(&self.snapshot);
+            }
+            if archive.busy() {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+        if self.window.explicit_exit {
+            if self.finish_archive_for_exit() {
+                if let Some(tray) = &mut self.tray {
+                    tray.defer_exit_for_local_io();
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("正在完成本地短信历史操作");
+                    ui.spinner();
+                    ui.label("保存、清空或导出结束后将自动退出，请稍候。");
+                });
+                ctx.request_repaint_after(Duration::from_millis(50));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
         if self.onboarding.open {
             match crate::ui::onboarding::render(
                 ctx,
                 &self.snapshot,
                 SystemTime::now(),
                 self.onboarding.driver_fixture,
+                self.driver_setup_outcome,
             ) {
                 crate::ui::onboarding::OnboardingAction::Enter => self.finish_onboarding(),
                 crate::ui::onboarding::OnboardingAction::Refresh => self.send(UiCommand::Refresh),
                 crate::ui::onboarding::OnboardingAction::InstallBundledDriver => {
                     self.start_driver_install(ctx)
+                }
+                crate::ui::onboarding::OnboardingAction::OpenWindowsUpdate => {
+                    if dji4g_windows_platform::driver_setup::open_windows_update().is_err() {
+                        dji4g_windows_platform::show_message_box(
+                            "无法打开 Windows 更新",
+                            "请从 Windows 设置打开“Windows 更新”，检查可选驱动更新。当前尚未安装任何驱动。",
+                        );
+                    }
                 }
                 crate::ui::onboarding::OnboardingAction::None => {}
             }
@@ -1297,14 +1492,7 @@ impl PanelApp {
                 let sms_bounded = self.page == Page::Sms
                     && ui.available_height() >= crate::ui::sms_layout::MIN_BOUNDED_HEIGHT;
                 if sms_bounded {
-                    sms::render(
-                        ui,
-                        &snapshot,
-                        &snapshot.sms_messages,
-                        self.language,
-                        self.commands.as_ref(),
-                        &mut self.sms_compose,
-                    );
+                    self.render_sms_page(ui, &snapshot);
                 } else {
                     egui::ScrollArea::vertical()
                         .drag_to_scroll(false)
@@ -1359,14 +1547,7 @@ impl PanelApp {
                             // The stored messages ride along in the snapshot as a read-only copy
                             // (SmsMessage redacts sender/body in Debug/Serialize, so nothing leaks
                             // into logs or exports).
-                            Page::Sms => sms::render(
-                                ui,
-                                &snapshot,
-                                &snapshot.sms_messages,
-                                self.language,
-                                self.commands.as_ref(),
-                                &mut self.sms_compose,
-                            ),
+                            Page::Sms => self.render_sms_page(ui, &snapshot),
                             Page::DeviceTools => {
                                 // The page needs the panel's confirmation entry point and its own
                                 // mutable state at once; moving the state out keeps the two
@@ -1528,7 +1709,7 @@ impl PanelApp {
         if !dji4g_windows_platform::confirm_message_box(
             None,
             "安装模块驱动",
-            "面板将自动退出，随后显示 Windows 管理员授权。\n仅安装硬件匹配的缺失驱动，正常接口不会强制重装。\n\n完成后重新打开独立程序，点击“立即刷新”；如提示重启，先重启电脑。\n\n现在继续？",
+            "面板将自动退出，随后显示 Windows 管理员授权，请选择“是”。\n仅安装硬件匹配的缺失驱动，正常接口不会强制重装。\n\n完成或取消后会返回普通权限的面板，显示结果和下一步；如提示重启，请先重启电脑。\n\n现在继续？",
         ) {
             return;
         }
@@ -1705,8 +1886,8 @@ impl PanelCommandSink for PanelApp {
 impl eframe::App for PanelApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.poll_shell_events(ctx);
-        self.handle_close_request(ctx);
         self.receive_latest_nonblocking(ctx);
+        self.handle_close_request(ctx);
         // Drive native dialogs every frame (not only on snapshot change): a worker may have
         // just finished a box and cleared the busy flag without a state change yet.
         self.drive_native_dialogs();
@@ -2004,6 +2185,7 @@ mod tests {
         app.settings_backend = Some(backend.clone());
         let config = ConfigV1 {
             autostart: true,
+            sms_archive_enabled: true,
             ..ConfigV1::default()
         };
         app.configure_onboarding(&config);
@@ -2012,6 +2194,10 @@ mod tests {
         assert!(!app.onboarding.open);
         let saved = backend.0.lock().unwrap()[0].clone();
         assert!(saved.onboarding_completed);
+        assert!(
+            saved.sms_archive_enabled,
+            "finishing onboarding preserves archive opt-in"
+        );
         assert!(
             saved.autostart,
             "unknown registry state must preserve loaded intent"

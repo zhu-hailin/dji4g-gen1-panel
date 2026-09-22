@@ -223,6 +223,20 @@ pub fn sms_vm(snapshot: &ControllerSnapshot, messages: &[SmsMessage], language: 
             "sms:timeout" | "app:stage_timeout" => "短信查询超时",
             "sms:no_device" => "无已验证的设备，请先检查概览中的模块连接状态",
             "sms:device_removed" => "设备已断开",
+            "sms:sim_identity_required" => "尚未识别 SIM 卡，请先返回概览刷新连接状态",
+            "sms:sim_changed" => "SIM 卡已更换，本次短信未加入列表；请返回概览重新检测",
+            "sms:sim_identity_unverified" => {
+                "无法确认 SIM 卡身份，本次未读取短信；请检查 SIM 后重新检测"
+            }
+            "sms:read_cancelled" => "已停止读取，原有列表已保留",
+            "sms:context_changed" => "模块或 SIM 已变化，本次结果已丢弃，请重新检测",
+            "sms:storage_restore_unknown" => {
+                "无法确认已恢复原读取位置；请先重新检测模块，暂不要发送或删除短信"
+            }
+            "sms:storage_unsupported" | "sms:storage_selection_unavailable" => {
+                "模块不支持读取此位置，请使用当前存储位置"
+            }
+            "sms:list_too_large" => "短信数量或返回内容超过安全上限，本次列表未更新",
             _ => "短信查询失败",
         };
         status.text = format!("{reason}（{}）", error.code.stable().as_str());
@@ -287,7 +301,6 @@ pub(crate) fn render(
     ui.horizontal_wrapped(|ui| {
         ui.vertical(|ui| {
             ui.heading("短信中心");
-            ui.label(meta_text("管理模块短信，阅读消息与发送记录"));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add(super::theme::primary_button("新建短信")).clicked() {
@@ -304,7 +317,8 @@ pub(crate) fn render(
             }
         });
     });
-    ui.add_space(16.0);
+    render_history_controls(ui, snapshot, sink, state);
+    ui.add_space(8.0);
     compose::render(ui, state, snapshot, sink);
     if let Some(deletion) = &snapshot.sms_delete {
         render_delete_result(ui, deletion);
@@ -332,6 +346,100 @@ pub(crate) fn render(
 
 fn refresh(sink: &dyn UiCommandSink, state: &mut SmsComposeState) {
     state.request_refresh(Instant::now(), sink);
+}
+
+fn render_history_controls(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    use dji4g_domain::SmsReadPhase;
+    let context = (
+        snapshot.app.device.as_ref().map(|device| device.epoch),
+        snapshot.sim_epoch,
+    );
+    if state
+        .storage_confirmation
+        .as_ref()
+        .is_some_and(|(epoch, sim, _)| (*epoch, *sim) != context)
+    {
+        state.storage_confirmation = None;
+    }
+    if snapshot.sms_refresh_pending {
+        ui.horizontal_wrapped(|ui| {
+            ui.spinner();
+            let label = match snapshot.sms_read_phase {
+                None => "等候读取",
+                Some(SmsReadPhase::Verifying) => "正在确认模块与 SIM",
+                Some(SmsReadPhase::ReadingStorage) => "正在查询短信存储位置",
+                Some(SmsReadPhase::SwitchingStorage) => "正在选择读取位置",
+                Some(SmsReadPhase::Listing) => "正在读取历史短信",
+                Some(SmsReadPhase::Decoding) => "正在整理短信",
+                Some(SmsReadPhase::RestoringStorage) => "正在恢复原读取位置，请稍候",
+                Some(SmsReadPhase::Complete) => "正在释放连接，请稍候",
+            };
+            ui.label(format!(
+                "{label} · 已读取 {} 个存储记录",
+                snapshot.sms_read_progress
+            ));
+            if ui
+                .add_enabled(!state.read_cancel_requested, egui::Button::new("停止读取"))
+                .clicked()
+            {
+                match sink.try_send(UiCommand::SmsCancelRead) {
+                    Ok(()) => {
+                        state.auto_refresh_paused = true;
+                        state.read_cancel_requested = true;
+                        state.refresh_error = Some(
+                            "已请求停止，正在等待连接释放；自动刷新已暂停，可手动刷新继续。".into(),
+                        );
+                    }
+                    Err(error) => state.refresh_error = Some(compose::enqueue_error(error).into()),
+                }
+            }
+        });
+    }
+    if let Some(report) = &snapshot.sms_read_report {
+        let location = report
+            .storage
+            .as_ref()
+            .map_or("未确认", |s| match s.0.as_str() {
+                "SM" => "SIM 卡",
+                "ME" => "模块",
+                "MT" => "模块当前汇总区",
+                _ => "当前存储区",
+            });
+        egui::CollapsingHeader::new(format!("已读取 {} 个记录 · 存储位置与读取详情", report.raw_records)).id_salt("sms-history-help").show(ui, |ui| {
+            ui.label(format!("最近读取：{location} · {} 个短信分片，{} 个其他记录未展示", report.decoded_records, report.skipped_records));
+            ui.label("刷新会读取当前位置中仍保存的全部短信（最多 1000 个存储记录）。长短信可能占多个记录；已被模块删除的内容无法重新读回。可开启“本地历史”保存之后读到的短信。");
+            ui.label("其他位置可能还有短信。选择前会再次确认；读取期间暂时切换读取位置，完成后恢复，可能将未读短信标为已读。");
+            ui.horizontal_wrapped(|ui| {
+                for (token, label) in [("SM", "读取 SIM 卡短信"), ("ME", "读取模块短信")] {
+                    let supported = report.supported_storages.iter().any(|s| s.0 == token);
+                    let reason = if snapshot.serial_work_busy { "当前通信任务尚未结束" } else if !supported { "模块尚未确认支持此存储位置" } else { "读取前将再次确认" };
+                    if ui.add_enabled(supported && !snapshot.serial_work_busy, egui::Button::new(label)).on_hover_text(reason).clicked() {
+                        state.storage_confirmation = Some((context.0, context.1, dji4g_domain::SmsStorageId(token.into())));
+                    }
+                }
+            });
+        });
+    }
+    if let Some((_, _, storage)) = state.storage_confirmation.clone() {
+        egui::Window::new("读取其他位置的短信").collapsible(false).resizable(false).default_width(370.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ui.ctx(), |ui| {
+                ui.label(format!("将读取{}中保存的短信，期间暂停其他模块操作。读取可能改变短信已读状态；完成后会恢复原读取位置，不改变短信写入和接收位置。", if storage.0 == "SM" { "SIM 卡" } else { "模块" }));
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() { state.storage_confirmation = None; }
+                    if ui.add_enabled(!snapshot.serial_work_busy, egui::Button::new("确认读取")).clicked() {
+                        match sink.try_send(UiCommand::SmsReadStorage { storage: storage.clone() }) {
+                            Ok(()) => { state.auto_refresh_paused = true; state.read_cancel_requested = false; state.refresh_error = None; state.storage_confirmation = None; }
+                            Err(error) => state.refresh_error = Some(compose::enqueue_error(error).into()),
+                        }
+                    }
+                });
+            });
+    }
 }
 
 fn badge(ui: &mut Ui, text: impl Into<String>, color: egui::Color32) {
@@ -395,11 +503,9 @@ fn render_inbox(
             ui.label(meta_text(format!("存储 {used} / {total}")));
         }
     });
-    ui.label(meta_text(if snapshot.app.device.is_some() {
-        "每 15 秒自动同步 · 发送期间暂停"
-    } else {
-        "设备连接后自动同步短信"
-    }));
+    if state.auto_refresh_paused {
+        ui.label(meta_text("自动同步已暂停 · 点击刷新列表继续"));
+    }
     // A sync failure is real information, but it used to print a full paragraph above the list
     // and eat the space the messages needed. It stays one click away instead.
     if let Some(error) = &state.refresh_error {
@@ -979,6 +1085,9 @@ mod tests {
             sms_delete: None,
             serial_work_busy: false,
             sms_refresh_pending: false,
+            sms_read_phase: None,
+            sms_read_progress: 0,
+            sms_read_report: None,
             sms_inbox_failure: None,
             device_tools: Default::default(),
         }

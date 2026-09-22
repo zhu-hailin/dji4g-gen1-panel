@@ -139,7 +139,7 @@ pub trait TrayBackend {
     ///
     /// A window hidden to the tray produces no frames, so `PanelApp::update` never runs and the
     /// UI thread cannot re-show itself; the native worker uses this handle to restore, show, and
-    /// foreground the panel itself when 「打开面板」 (or a tray-icon double-click) is selected.
+    /// foreground the panel itself on Open, or Exit so pending local archive I/O can finish.
     /// Backends without a native window decline silently.
     fn register_panel_window(&mut self, _hwnd: isize) {}
 
@@ -158,6 +158,9 @@ pub trait TrayBackend {
     /// repainted, so this acknowledgement may never be sent at all, and termination must not
     /// depend on it.
     fn acknowledge_exit(&mut self) {}
+
+    /// Best-effort non-blocking heartbeat, only while local archive I/O is pending at exit.
+    fn defer_exit_for_local_io(&mut self) {}
 
     fn take_error(&mut self) -> Option<TrayError> {
         None
@@ -224,6 +227,11 @@ impl<B: TrayBackend> TrayController<B> {
 
     pub fn acknowledge_exit(&mut self) {
         self.backend.acknowledge_exit();
+    }
+
+    /// Keep graceful shutdown alive only while local archive I/O is still pending.
+    pub fn defer_exit_for_local_io(&mut self) {
+        self.backend.defer_exit_for_local_io();
     }
 
     pub fn take_error(&mut self) -> Option<TrayError> {
@@ -471,6 +479,12 @@ impl TrayBackend for NativeTrayBackend {
         }
     }
 
+    fn defer_exit_for_local_io(&mut self) {
+        if let Some(native) = self.native.as_ref() {
+            native.defer_exit_for_local_io();
+        }
+    }
+
     fn take_error(&mut self) -> Option<TrayError> {
         self.last_error.take().or_else(|| {
             self.native.as_ref().and_then(|native| {
@@ -504,5 +518,41 @@ mod tests {
         assert_eq!(tray.try_recv(), None);
         tray.recreate().unwrap();
         assert_eq!(tray.state(), TrayState::Ready);
+    }
+
+    #[test]
+    fn local_io_heartbeat_forwards_separately_from_exit_acknowledgement() {
+        #[derive(Default)]
+        struct Recording {
+            heartbeats: usize,
+            acks: usize,
+        }
+        impl TrayBackend for Recording {
+            fn create(&mut self, _: &TrayLabels) -> Result<(), TrayError> {
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<TrayCommand> {
+                None
+            }
+            fn recreate(&mut self) -> Result<(), TrayError> {
+                Ok(())
+            }
+            fn set_tooltip(&mut self, _: &str) -> Result<(), TrayError> {
+                Ok(())
+            }
+            fn acknowledge_exit(&mut self) {
+                self.acks += 1;
+            }
+            fn defer_exit_for_local_io(&mut self) {
+                self.heartbeats += 1;
+            }
+        }
+        let mut tray =
+            TrayController::initialize(Recording::default(), TrayLabels::zh_cn()).unwrap();
+        tray.acknowledge_exit();
+        tray.defer_exit_for_local_io();
+        tray.defer_exit_for_local_io();
+        assert_eq!(tray.backend.heartbeats, 2);
+        assert_eq!(tray.backend.acks, 1);
     }
 }

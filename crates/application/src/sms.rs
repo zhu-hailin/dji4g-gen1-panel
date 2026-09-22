@@ -49,9 +49,9 @@ enum PresentationSlot {
     LongMessage(Vec<SmsMessage>),
 }
 
-/// Upper bound on the stored inbox. The module stores far fewer messages than this; the cap only
-/// exists so a pathological list loop cannot grow the application's memory without bound.
-pub const MAX_STORED: usize = 200;
+/// Bounded raw-record budget, including every multipart fragment. This is a software safety
+/// ceiling, not a claim about any particular module's physical storage capacity.
+pub const MAX_STORED: usize = 1000;
 
 /// In-memory inbox for one device/SIM epoch, deduplicated by content digest.
 ///

@@ -1285,3 +1285,302 @@ fn checked_delete_close_timeout_holds_lease_and_clears_cleanup_only_after_drop()
     assert!(dropped.load(Ordering::Acquire));
     let _lease = super::SerialLease::acquire(path, Duration::ZERO).unwrap();
 }
+#[test]
+fn history_actor_lists_500_records_with_live_raw_progress() {
+    let mut listing = String::new();
+    for index in 1..=500 {
+        listing.push_str(&format!(
+            "+CMGL: {index},1,,180\r\n{}\r\n",
+            "AB".repeat(180)
+        ));
+    }
+    listing.push_str("OK\r\n");
+    let reads = [
+        "OK\r\n",
+        "Quectel EC25\r\nOK\r\n",
+        "+QCCID: 89860123456789012345\r\nOK\r\n",
+        "+CMGF: 0\r\nOK\r\n",
+        "+CPMS: \"SM\",500,500,\"ME\",0,50,\"SM\",500,500\r\nOK\r\n",
+        "+CPMS: (\"SM\",\"ME\"),(\"ME\"),(\"SM\")\r\nOK\r\n",
+        &listing,
+        "+QCCID: 89860123456789012345\r\nOK\r\n",
+    ];
+    let (actor, state) = actor_with_reads(reads.map(|s| Ok(s.as_bytes().to_vec())));
+    let control = dji4g_domain::SmsReadControl::new(Duration::from_secs(2));
+    let result = actor
+        .execute_sms_history(Some(history_sim_fingerprint()), None, control.clone())
+        .unwrap();
+    assert_eq!(result.report.raw_records, 500);
+    assert_eq!(control.progress(), 500);
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .filter(|v| v.as_slice() == b"AT+CMGL=4\r")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn history_actor_selected_mem1_restored_after_module_rejects_list() {
+    let original = "+CPMS: \"MT\",5,100,\"ME\",3,50,\"SM\",2,50\r\nOK\r\n";
+    let selected = "+CPMS: \"SM\",2,50,\"ME\",3,50,\"SM\",2,50\r\nOK\r\n";
+    let reads = [
+        "OK\r\n",
+        "Quectel EC25\r\nOK\r\n",
+        "+QCCID: 89860123456789012345\r\nOK\r\n",
+        "+CMGF: 0\r\nOK\r\n",
+        original,
+        "+CPMS: (\"SM\",\"ME\",\"MT\"),(\"ME\"),(\"SM\")\r\nOK\r\n",
+        "+CPMS: 2,50,3,50,2,50\r\nOK\r\n",
+        selected,
+        "ERROR\r\n",
+        "OK\r\n",
+        original,
+    ];
+    let (actor, state) = actor_with_reads(reads.map(|s| Ok(s.as_bytes().to_vec())));
+    let control = dji4g_domain::SmsReadControl::new(Duration::from_secs(2));
+    assert!(
+        actor
+            .execute_sms_history(
+                Some(history_sim_fingerprint()),
+                Some(dji4g_domain::SmsStorageId("SM".into())),
+                control.clone()
+            )
+            .is_err()
+    );
+    assert_eq!(
+        control.restoration(),
+        dji4g_domain::SmsStorageRestoration::Restored
+    );
+    let writes = &state.lock().unwrap().writes;
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|v| v.starts_with(b"AT+CPMS=") && v.as_slice() != b"AT+CPMS=?\r")
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![b"AT+CPMS=\"SM\"\r".to_vec(), b"AT+CPMS=\"MT\"\r".to_vec()]
+    );
+    assert_eq!(writes.last().unwrap(), b"AT+CPMS?\r");
+}
+
+#[test]
+fn history_deadline_actively_interrupts_blocked_io() {
+    let (actor, state) = blocking_actor(&[]);
+    let control = dji4g_domain::SmsReadControl::new(Duration::from_millis(30));
+    let start = std::time::Instant::now();
+    assert_eq!(
+        actor
+            .execute_sms_history(Some(history_sim_fingerprint()), None, control)
+            .unwrap_err()
+            .code,
+        "sms:timeout"
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(state.0.lock().unwrap().released);
+}
+
+#[test]
+fn history_cleanup_stays_pending_until_real_port_drop_and_lease_release() {
+    let path = "sms-history-slow-cleanup";
+    let dropped = Arc::new(AtomicBool::new(false));
+    let lease = super::SerialLease::acquire(path, Duration::ZERO).unwrap();
+    let mut actor = AtSessionActor::spawn_with_lease(
+        DeviceEpoch(7),
+        Box::new(SlowDropSerial(dropped.clone())),
+        None,
+        Some(lease),
+    )
+    .unwrap();
+    let control = dji4g_domain::SmsReadControl::new(Duration::from_secs(1));
+    assert_eq!(
+        actor.close_delete_and_wait(control.transport_control(), Duration::from_millis(1)),
+        Err(ActorError::CloseTimeout)
+    );
+    assert!(control.cleanup_pending());
+    assert!(matches!(
+        super::SerialLease::acquire(path, Duration::ZERO),
+        Err(ActorError::LeaseBusy)
+    ));
+    drop(actor);
+    let start = std::time::Instant::now();
+    while control.cleanup_pending() && start.elapsed() < Duration::from_secs(1) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!control.cleanup_pending());
+    assert!(dropped.load(Ordering::Acquire));
+    let _lease = super::SerialLease::acquire(path, Duration::ZERO).unwrap();
+}
+struct HistoryBlockingSerial {
+    state: Arc<(Mutex<BlockingState>, Condvar)>,
+    block_write: bool,
+}
+impl SerialIo for HistoryBlockingSerial {
+    fn cancellation_handle(&self) -> io::Result<Arc<dyn SerialIoCancellation>> {
+        Ok(Arc::new(BlockingCancellation(self.state.clone())))
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        state.writes.push(bytes.to_vec());
+        changed.notify_all();
+        if state.writes.len() == 9 && self.block_write {
+            let _guard = changed.wait_while(state, |s| !s.released).unwrap();
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(())
+    }
+    fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        if state.writes.len() == 9 {
+            let _guard = changed.wait_while(state, |s| !s.released).unwrap();
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(state
+            .reads
+            .pop_front()
+            .expect("history preflight or restore response"))
+    }
+}
+#[test]
+fn history_cancel_actual_listing_read_or_write_preserves_restore_budget() {
+    for block_write in [false, true] {
+        let original = "+CPMS: \"MT\",5,100,\"ME\",3,50,\"SM\",2,50\r\nOK\r\n";
+        let selected = "+CPMS: \"SM\",2,50,\"ME\",3,50,\"SM\",2,50\r\nOK\r\n";
+        let reads = [
+            "OK\r\n",
+            "Quectel EC25\r\nOK\r\n",
+            "+QCCID: 89860123456789012345\r\nOK\r\n",
+            "+CMGF: 0\r\nOK\r\n",
+            original,
+            "+CPMS: (\"SM\",\"ME\",\"MT\"),(\"ME\"),(\"SM\")\r\nOK\r\n",
+            "OK\r\n",
+            selected,
+            "OK\r\n",
+            original,
+        ];
+        let state = Arc::new((
+            Mutex::new(BlockingState {
+                reads: reads.iter().map(|s| s.as_bytes().to_vec()).collect(),
+                ..Default::default()
+            }),
+            Condvar::new(),
+        ));
+        let actor = AtSessionActor::spawn(
+            DeviceEpoch(7),
+            Box::new(HistoryBlockingSerial {
+                state: state.clone(),
+                block_write,
+            }),
+        );
+        let control = dji4g_domain::SmsReadControl::new(Duration::from_secs(2));
+        let cancel = control.clone();
+        let cancel_state = state.clone();
+        let canceller = thread::spawn(move || {
+            wait_for_writes(&cancel_state, 9);
+            cancel.cancel();
+        });
+        let result = actor.execute_sms_history(
+            Some(history_sim_fingerprint()),
+            Some(dji4g_domain::SmsStorageId("SM".into())),
+            control.clone(),
+        );
+        canceller.join().unwrap();
+        assert_eq!(result.unwrap_err().code, "sms:cancelled");
+        assert_eq!(
+            control.restoration(),
+            dji4g_domain::SmsStorageRestoration::Restored
+        );
+        let state = state.0.lock().unwrap();
+        assert_eq!(state.writes.len(), 11);
+        assert_eq!(state.writes[9], b"AT+CPMS=\"MT\"\r");
+        assert_eq!(state.writes[10], b"AT+CPMS?\r");
+    }
+}
+
+fn history_sim_fingerprint() -> [u8; 8] {
+    dji4g_domain::sha256(b"89860123456789012345")[..8]
+        .try_into()
+        .unwrap()
+}
+
+#[test]
+fn history_actor_changed_sim_before_read_sends_no_sms_commands() {
+    let reads = [
+        "OK\r\n",
+        "Quectel EC25\r\nOK\r\n",
+        "+QCCID: 89860123456789012346\r\nOK\r\n",
+    ];
+    let (actor, state) = actor_with_reads(reads.map(|s| Ok(s.as_bytes().to_vec())));
+    let control = dji4g_domain::SmsReadControl::new(Duration::from_secs(1));
+    let result = actor.execute_sms_history(Some(history_sim_fingerprint()), None, control);
+    assert_eq!(result.unwrap_err().code, "sms:sim_changed");
+    assert_eq!(
+        state.lock().unwrap().writes,
+        vec![b"AT\r".to_vec(), b"ATI\r".to_vec(), b"AT+QCCID\r".to_vec()]
+    );
+}
+
+#[test]
+fn history_actor_changed_or_missing_sim_after_listing_discards_and_restores_storage() {
+    for after in ["+QCCID: 89860123456789012346\r\nOK\r\n", "ERROR\r\n"] {
+        let original = "+CPMS: \"MT\",5,100,\"ME\",3,50,\"SM\",2,50\r\nOK\r\n";
+        let selected = "+CPMS: \"SM\",2,50,\"ME\",3,50,\"SM\",2,50\r\nOK\r\n";
+        let listing = format!("+CMGL: 1,1,,24\r\n{DELETE_PDU}\r\nOK\r\n");
+        let reads = [
+            "OK\r\n",
+            "Quectel EC25\r\nOK\r\n",
+            "+QCCID: 89860123456789012345\r\nOK\r\n",
+            "+CMGF: 0\r\nOK\r\n",
+            original,
+            "+CPMS: (\"SM\",\"ME\",\"MT\"),(\"ME\"),(\"SM\")\r\nOK\r\n",
+            "OK\r\n",
+            selected,
+            &listing,
+            after,
+            "OK\r\n",
+            original,
+        ];
+        let (actor, state) = actor_with_reads(reads.map(|s| Ok(s.as_bytes().to_vec())));
+        let control = dji4g_domain::SmsReadControl::new(Duration::from_secs(1));
+        let result = actor.execute_sms_history(
+            Some(history_sim_fingerprint()),
+            Some(dji4g_domain::SmsStorageId("SM".into())),
+            control.clone(),
+        );
+        assert_eq!(
+            result.unwrap_err().code,
+            if after.starts_with("+QCCID") {
+                "sms:sim_changed"
+            } else {
+                "sms:sim_identity_unverified"
+            }
+        );
+        assert_eq!(
+            control.restoration(),
+            dji4g_domain::SmsStorageRestoration::Restored
+        );
+        let writes = &state.lock().unwrap().writes;
+        assert_eq!(writes[writes.len() - 2], b"AT+CPMS=\"MT\"\r");
+        assert_eq!(writes.last().unwrap(), b"AT+CPMS?\r");
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|v| v.as_slice() == b"AT+CMGL=4\r")
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|v| v.as_slice() == b"AT+QCCID\r")
+                .count(),
+            2
+        );
+    }
+}

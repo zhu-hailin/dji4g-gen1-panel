@@ -32,6 +32,12 @@ pub enum AtCommand {
     SmsSetPduMode,
     /// SMS storage/capacity query (AT+CPMS?). 实机未验证.
     SmsStorageQuery,
+    /// Supported SMS storage names (AT+CPMS=?).
+    SmsStorageCapabilities,
+    /// Select mem1 only using closed wire tokens. mem2/mem3 are omitted.
+    SmsSelectStorage {
+        storage: dji4g_domain::SmsReadStorage,
+    },
     /// List stored messages in PDU mode (AT+CMGL=4). Reading may mark messages as read
     /// (research §6.2), so it is never retried.
     SmsList,
@@ -82,6 +88,11 @@ impl fmt::Debug for AtCommand {
             Self::SmsMessageFormat => formatter.write_str("SmsMessageFormat"),
             Self::SmsSetPduMode => formatter.write_str("SmsSetPduMode"),
             Self::SmsStorageQuery => formatter.write_str("SmsStorageQuery"),
+            Self::SmsStorageCapabilities => formatter.write_str("SmsStorageCapabilities"),
+            Self::SmsSelectStorage { storage } => formatter
+                .debug_struct("SmsSelectStorage")
+                .field("storage", storage)
+                .finish(),
             Self::SmsList => formatter.write_str("SmsList"),
             Self::SmsRead { index } => formatter
                 .debug_struct("SmsRead")
@@ -127,6 +138,7 @@ impl AtCommand {
                 | Self::SetApn { .. }
                 | Self::SetUsbNetProfile(_)
                 | Self::SmsSetPduMode
+                | Self::SmsSelectStorage { .. }
                 | Self::SmsDelete { .. }
                 | Self::SmsSend { .. }
         )
@@ -157,12 +169,14 @@ impl AtCommand {
             | Self::Iccid
             | Self::SmsMessageFormat
             | Self::SmsStorageQuery
+            | Self::SmsStorageCapabilities
             | Self::SmsList
             | Self::Temperature => Effect::PureRead,
             Self::RestartModule | Self::SetUsbNetProfile(_) => Effect::ConnectivityChange,
-            Self::SetApn { .. } | Self::SmsSetPduMode | Self::SmsDelete { .. } => {
-                Effect::SessionSetting
-            }
+            Self::SetApn { .. }
+            | Self::SmsSetPduMode
+            | Self::SmsSelectStorage { .. }
+            | Self::SmsDelete { .. } => Effect::SessionSetting,
             Self::SmsRead { .. } => Effect::ReadMayMarkRead,
             Self::SmsSend { .. } => Effect::NetworkTransaction,
         }
@@ -228,6 +242,8 @@ impl AtCommand {
             Self::SmsMessageFormat => "AT+CMGF?".to_owned(),
             Self::SmsSetPduMode => "AT+CMGF=0".to_owned(),
             Self::SmsStorageQuery => "AT+CPMS?".to_owned(),
+            Self::SmsStorageCapabilities => "AT+CPMS=?".to_owned(),
+            Self::SmsSelectStorage { storage } => format!("AT+CPMS=\"{}\"", storage.as_str()),
             Self::SmsList => "AT+CMGL=4".to_owned(),
             Self::SmsRead { index } => format!("AT+CMGR={index}"),
             Self::SmsDelete { index } => format!("AT+CMGD={index}"),

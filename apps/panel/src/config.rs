@@ -27,6 +27,7 @@ static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigV1 {
     pub onboarding_completed: bool,
+    pub sms_archive_enabled: bool,
     pub language: LanguageCode,
     pub autostart: bool,
     pub start_minimized: bool,
@@ -38,6 +39,7 @@ impl Default for ConfigV1 {
     fn default() -> Self {
         Self {
             onboarding_completed: false,
+            sms_archive_enabled: false,
             language: LanguageCode::ZhCn,
             autostart: false,
             start_minimized: false,
@@ -68,6 +70,7 @@ impl ConfigV1 {
         }?;
         Some(Self {
             onboarding_completed: false,
+            sms_archive_enabled: false,
             language: settings.language,
             autostart,
             start_minimized: settings.start_minimized,
@@ -496,6 +499,8 @@ fn io_error(code: &'static str, error: IoFailure) -> ConfigError {
 struct ConfigDocument {
     #[serde(default)]
     onboarding_completed: bool,
+    #[serde(default)]
+    sms_archive_enabled: bool,
     schema_version: u32,
     language: String,
     autostart: bool,
@@ -507,6 +512,7 @@ struct ConfigDocument {
 fn encode_config(config: &ConfigV1) -> Result<String, ConfigError> {
     let document = ConfigDocument {
         onboarding_completed: config.onboarding_completed,
+        sms_archive_enabled: config.sms_archive_enabled,
         schema_version: 1,
         language: match config.language {
             LanguageCode::ZhCn => "zh-CN".to_owned(),
@@ -552,6 +558,7 @@ fn decode_config(bytes: &[u8]) -> Result<ConfigV1, &'static str> {
     };
     Ok(ConfigV1 {
         onboarding_completed: document.onboarding_completed,
+        sms_archive_enabled: document.sms_archive_enabled,
         language,
         autostart: document.autostart,
         start_minimized: document.start_minimized,
@@ -563,6 +570,7 @@ fn decode_config(bytes: &[u8]) -> Result<ConfigV1, &'static str> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StartupOptions {
     pub autostart: bool,
+    pub driver_setup_result: Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome>,
     pub demo: Option<String>,
     /// Set by the in-app restart button: the panel this process replaces. The new process waits
     /// for it to release the single-instance mutex before taking over, so a restart never ends up
@@ -582,6 +590,16 @@ impl StartupOptions {
         while index < values.len() {
             match values[index].as_str() {
                 "--autostart" => result.autostart = true,
+                value if value.starts_with("--driver-setup-result=") => {
+                    result.driver_setup_result = Some(
+                        dji4g_windows_platform::driver_setup::DriverSetupOutcome::parse_argument(
+                            value,
+                        )
+                        .ok_or_else(|| {
+                            StartupParseError::new("config:startup_invalid_driver_result")
+                        })?,
+                    );
+                }
                 value if value.starts_with("--restart-after=") => {
                     let raw = &value["--restart-after=".len()..];
                     // A pid that is not a plain positive integer would make the handoff wait on
@@ -612,7 +630,7 @@ impl StartupOptions {
 
     #[must_use]
     pub const fn start_to_tray(&self, configured_start_minimized: bool) -> bool {
-        self.autostart || configured_start_minimized
+        self.driver_setup_result.is_none() && (self.autostart || configured_start_minimized)
     }
 }
 
@@ -646,11 +664,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_opt_in_is_explicitly_saved_and_defaults_off() {
+        let encoded = encode_config(&ConfigV1::default()).unwrap();
+        assert!(encoded.contains("sms_archive_enabled = false"));
+    }
+
+    #[test]
+    fn driver_return_is_recognized_and_never_hidden_to_tray() {
+        for result in [
+            "ready",
+            "restart-required",
+            "restart-required-after-failure",
+            "cancelled",
+            "unsupported-interface",
+            "not-ready",
+            "disconnected",
+            "validation-failed",
+            "failed",
+        ] {
+            let argument = format!("--driver-setup-result={result}");
+            let startup = StartupOptions::parse([argument.as_str(), "--autostart"]).unwrap();
+            assert!(!startup.start_to_tray(true));
+        }
+        assert!(StartupOptions::parse(["--driver-setup-result=arbitrary"]).is_err());
+    }
+
+    #[test]
     fn legacy_config_opens_onboarding_and_completed_roundtrips() {
         let old = b"schema_version = 1\nlanguage = \"zh-CN\"\nautostart = false\nstart_minimized = false\nactive_probe = true\nlog_level = \"info\"\n";
         let mut config = decode_config(old).unwrap();
         assert!(!config.onboarding_completed);
+        assert!(!config.sms_archive_enabled);
         config.onboarding_completed = true;
+        config.sms_archive_enabled = true;
         assert_eq!(
             decode_config(encode_config(&config).unwrap().as_bytes()).unwrap(),
             config

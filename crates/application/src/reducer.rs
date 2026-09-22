@@ -258,6 +258,9 @@ pub struct ControllerSnapshot {
     pub serial_work_busy: bool,
     pub sms_send: Option<dji4g_domain::SmsSendSnapshot>,
     pub sms_refresh_pending: bool,
+    pub sms_read_phase: Option<dji4g_domain::SmsReadPhase>,
+    pub sms_read_progress: usize,
+    pub sms_read_report: Option<dji4g_domain::SmsReadReport>,
     pub sms_inbox_failure: Option<crate::PortError>,
     /// Device-tool task, capability evidence, module profile and bounded transcript history
     /// (§7). The type redacts request and response text from `Debug` and never implements
@@ -737,7 +740,7 @@ impl ReducerState {
 
     pub(crate) fn target_context(&self) -> Option<TargetContext> {
         let identity = self.target_identity()?;
-        TargetContext::new(
+        let mut target = TargetContext::new(
             self.epoch,
             identity,
             self.inventory_at_port.clone(),
@@ -745,7 +748,13 @@ impl ReducerState {
                 .clone()
                 .or_else(|| self.adapter_id()),
         )
-        .ok()
+        .ok()?;
+        target.sim_fingerprint = self
+            .cellular
+            .as_ref()
+            .and_then(|evidence| evidence.value.sim_identity.as_ref())
+            .map(|identity| identity.fingerprint);
+        Some(target)
     }
 
     pub(crate) fn action_prerequisite(
@@ -868,6 +877,9 @@ impl ReducerState {
             serial_work_busy: false,
             sms_send: None,
             sms_refresh_pending: false,
+            sms_read_phase: None,
+            sms_read_progress: 0,
+            sms_read_report: None,
             sms_inbox_failure: None,
             device_tools: crate::DeviceToolsSnapshot::default(),
         }

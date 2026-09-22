@@ -35,6 +35,13 @@ pub(crate) struct SmsComposeState {
     pub outgoing: bool,
     pub search: String,
     pub refresh_error: Option<String>,
+    pub storage_confirmation: Option<(
+        Option<dji4g_domain::DeviceEpoch>,
+        u64,
+        dji4g_domain::SmsStorageId,
+    )>,
+    pub auto_refresh_paused: bool,
+    pub read_cancel_requested: bool,
     last_refresh_attempt: Option<std::time::Instant>,
     last_visible: Option<std::time::Instant>,
     pub selected: Option<[u8; 32]>,
@@ -106,6 +113,8 @@ impl SmsComposeState {
     }
 
     pub(super) fn request_refresh(&mut self, now: std::time::Instant, sink: &dyn UiCommandSink) {
+        self.auto_refresh_paused = false;
+        self.read_cancel_requested = false;
         self.last_refresh_attempt = Some(now);
         self.refresh_error = sink
             .try_send(UiCommand::SmsRefresh)
@@ -128,7 +137,8 @@ impl SmsComposeState {
             self.last_refresh_attempt = None;
         }
         self.last_visible = Some(now);
-        if !available || busy || query_pending || self.pending.is_some() {
+        if self.auto_refresh_paused || !available || busy || query_pending || self.pending.is_some()
+        {
             return;
         }
         if self.last_refresh_attempt.is_none_or(|at| {
@@ -307,7 +317,7 @@ pub(super) fn render(
                     });
                 }
             });
-    } else if busy {
+    } else if state.pending.is_some() {
         ui.label("短信已排队，请勿重复发送");
     }
     if let Some(error) = &state.error {

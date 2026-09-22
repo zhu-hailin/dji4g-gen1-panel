@@ -143,7 +143,8 @@ pub struct ControllerRunner {
     pending_sms: Option<PendingSms>,
     /// A timed-out ordinary read/list may still be inside synchronous serial I/O.
     /// Retain its completion channel so timeout cannot release serial ownership early.
-    pending_sms_read_cleanup: Option<mpsc::Receiver<Result<SmsStageOutcome, crate::PortError>>>,
+    pending_sms_read: Option<PendingSmsRead>,
+    sms_read_timeout: Duration,
     pending_sms_delete: Option<PendingSmsDelete>,
     sms_delete_timeout: Duration,
     sms_timeout: Duration,
@@ -164,6 +165,24 @@ struct PendingSms {
     control: SmsTransactionControl,
     epoch: dji4g_domain::DeviceEpoch,
     sim_epoch: u64,
+}
+
+struct PendingSmsRead {
+    request: SmsRequest,
+    receiver: mpsc::Receiver<Result<(SmsStageOutcome, Instant), crate::PortError>>,
+    control: dji4g_domain::SmsReadControl,
+    epoch: dji4g_domain::DeviceEpoch,
+    sim_epoch: u64,
+    outcome: Option<(SmsStageOutcome, Instant)>,
+    abandoned: Option<SmsReadAbandonment>,
+    last_progress: (dji4g_domain::SmsReadPhase, usize),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SmsReadAbandonment {
+    Timeout,
+    Cancelled,
+    ContextChanged,
 }
 
 struct PendingSmsDelete {
@@ -217,6 +236,9 @@ const TOOL_BUSY_WINDOW: Duration = Duration::from_secs(5);
 
 impl Drop for ControllerRunner {
     fn drop(&mut self) {
+        if let Some(read) = &self.pending_sms_read {
+            read.control.cancel();
+        }
         if let Some(item) = self
             .pending_sms_delete
             .as_ref()
@@ -254,7 +276,8 @@ impl ControllerRunner {
             stage_timeout: STAGE_TIMEOUT,
             next_sms_transaction_id: 1,
             pending_sms: None,
-            pending_sms_read_cleanup: None,
+            pending_sms_read: None,
+            sms_read_timeout: Duration::from_secs(60),
             pending_sms_delete: None,
             sms_delete_timeout: dji4g_domain::SMS_DELETE_TIMEOUT,
             sms_timeout: SMS_SEND_TIMEOUT,
@@ -282,6 +305,7 @@ impl ControllerRunner {
     #[must_use]
     pub fn with_stage_timeout(mut self, stage_timeout: Duration) -> Self {
         self.stage_timeout = stage_timeout;
+        self.sms_read_timeout = stage_timeout;
         self
     }
 
@@ -296,7 +320,7 @@ impl ControllerRunner {
     }
     pub fn sms_pending(&self) -> bool {
         self.pending_sms.is_some()
-            || self.pending_sms_read_cleanup.is_some()
+            || self.pending_sms_read.is_some()
             || self.pending_sms_delete.is_some()
             || self.controller.sms_delete_active()
     }
@@ -435,17 +459,8 @@ impl ControllerRunner {
     /// by an explicit user request, never on a timer. With no port wired the requests stay queued
     /// (the controller records intent; a later composition may attach the port and drain them).
     pub fn poll_sms_requests(&mut self) -> bool {
-        if let Some(receiver) = &self.pending_sms_read_cleanup {
-            match receiver.try_recv() {
-                Err(mpsc::TryRecvError::Empty) => return false,
-                // Late results remain discarded after timeout, including after a context change.
-                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
-                    self.pending_sms_read_cleanup = None;
-                    self.controller.set_sms_read_in_flight(false);
-                    self.publish();
-                    return true;
-                }
-            }
+        if self.pending_sms_read.is_some() {
+            return self.poll_sms_read();
         }
         if self.pending_sms_delete.is_some() {
             return self.poll_sms_delete();
@@ -493,7 +508,7 @@ impl ControllerRunner {
         } else {
             self.controller.set_sms_read_in_flight(true);
             self.run_sms_request(request, &sms_port);
-            if self.pending_sms_read_cleanup.is_none() {
+            if self.pending_sms_read.is_none() {
                 self.controller.set_sms_read_in_flight(false);
             }
         }
@@ -818,37 +833,124 @@ impl ControllerRunner {
             );
             return;
         };
-        let timeout = self.stage_timeout;
+        let timeout = self.sms_read_timeout;
+        let control = dji4g_domain::SmsReadControl::new(timeout);
+        self.controller.set_sms_read_control(Some(control.clone()));
         let port = Arc::clone(sms_port);
         // The request is owned (a send carries its recipient and body) and the runner still needs
         // it to apply the outcome, so the worker gets a clone.
         let worker_request = request.clone();
-        let is_send = matches!(request, SmsRequest::Send { .. });
+        let worker_control = control.clone();
         let receiver = spawn_stage(move || {
-            Ok(poll_ready(
-                run_sms_port_call(&port, &target, worker_request),
+            let outcome = poll_ready(
+                run_sms_port_call(&port, &target, worker_request, worker_control),
                 timeout,
-                || SmsStageOutcome::timed_out(is_send),
-            ))
+                || SmsStageOutcome::timed_out(false),
+            );
+            // Stamp the actual worker completion, not the later runner/UI poll. A ready result
+            // can wait in the channel while adapter work delays the controller's next iteration.
+            Ok((outcome, Instant::now()))
         });
-        let outcome = match receiver.recv_timeout(self.stage_timeout) {
-            Ok(Ok(outcome)) => outcome,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending_sms_read_cleanup = Some(receiver);
-                SmsStageOutcome::timed_out(is_send)
-            }
-            // The watchdog expired or the worker died: the transaction outcome is unknown, so the
-            // inbox status records a transport failure. A send additionally records the honest
-            // `OutcomeUnknown` store state below; nothing else is mutated.
-            _ => SmsStageOutcome::timed_out(is_send),
+        self.pending_sms_read = Some(PendingSmsRead {
+            request,
+            receiver,
+            epoch: self.controller.state().epoch(),
+            sim_epoch: self.controller.state().sim_epoch(),
+            last_progress: (control.phase(), control.progress()),
+            control,
+            outcome: None,
+            abandoned: None,
+        });
+    }
+
+    fn poll_sms_read(&mut self) -> bool {
+        let Some(mut pending) = self.pending_sms_read.take() else {
+            return false;
         };
-        self.apply_sms_outcome(request, outcome);
+        if pending.outcome.is_none() {
+            match pending.receiver.try_recv() {
+                Ok(Ok(outcome)) => pending.outcome = Some(outcome),
+                Ok(Err(error)) => {
+                    pending.outcome = Some((SmsStageOutcome::Failed(error), Instant::now()))
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    pending.outcome = Some((SmsStageOutcome::timed_out(false), Instant::now()))
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let completed_in_time = pending
+            .outcome
+            .as_ref()
+            .is_some_and(|(_, completed_at)| *completed_at <= pending.control.deadline());
+        let context_changed = pending.epoch != self.controller.state().epoch()
+            || pending.sim_epoch != self.controller.state().sim_epoch();
+        let previous_abandonment = pending.abandoned;
+        if context_changed {
+            pending.abandoned = Some(SmsReadAbandonment::ContextChanged);
+        } else if pending.abandoned.is_none() {
+            if pending.control.is_cancelled() {
+                pending.abandoned = Some(SmsReadAbandonment::Cancelled);
+            } else if !completed_in_time && pending.control.is_expired() {
+                pending.abandoned = Some(SmsReadAbandonment::Timeout);
+            }
+        }
+        let mut changed = false;
+        if pending.abandoned != previous_abandonment {
+            pending.control.cancel();
+            self.controller
+                .set_sms_inbox_failure(Some(crate::PortError::new(
+                    dji4g_domain::ErrorCode::Timeout,
+                    match pending.abandoned.expect("new abandonment") {
+                        SmsReadAbandonment::ContextChanged => "sms:context_changed",
+                        SmsReadAbandonment::Timeout => "sms:timeout",
+                        SmsReadAbandonment::Cancelled => "sms:read_cancelled",
+                    },
+                )));
+            changed = true;
+        }
+        let progress = (pending.control.phase(), pending.control.progress());
+        changed |= progress != pending.last_progress;
+        pending.last_progress = progress;
+        if pending.outcome.is_some() && !pending.control.cleanup_pending() {
+            if pending.control.restoration() == dji4g_domain::SmsStorageRestoration::Unknown {
+                self.controller
+                    .set_sms_inbox_failure(Some(crate::PortError::new(
+                        dji4g_domain::ErrorCode::Internal,
+                        "sms:storage_restore_unknown",
+                    )));
+            } else if pending.abandoned.is_none()
+                || (pending.abandoned == Some(SmsReadAbandonment::Timeout) && completed_in_time)
+            {
+                // The worker may have been descheduled between stamping completion and sending
+                // the receipt. Only a watchdog abandonment can be corrected by timely proof;
+                // explicit cancellation and context changes still discard all returned data.
+                self.apply_sms_outcome(
+                    pending.request,
+                    pending.outcome.take().expect("completed read").0,
+                );
+            }
+            self.controller.set_sms_refresh_pending(false);
+            self.controller.set_sms_read_control(None);
+            self.controller.set_sms_read_in_flight(false);
+            self.publish();
+            true
+        } else {
+            self.pending_sms_read = Some(pending);
+            if changed {
+                self.publish();
+            }
+            changed
+        }
     }
 
     /// Apply one worker outcome to the controller. Runs on the runner thread only; every mutation
     /// here is a deliberate consequence of a completed module transaction.
     fn apply_sms_outcome(&mut self, request: SmsRequest, outcome: SmsStageOutcome) {
-        if matches!(request, SmsRequest::Refresh) {
+        if matches!(
+            request,
+            SmsRequest::Refresh | SmsRequest::ReadStorage { .. }
+        ) {
             self.controller.set_sms_refresh_pending(false);
         }
         self.controller.set_sms_inbox_failure(None);
@@ -857,7 +959,9 @@ impl ControllerRunner {
                 messages,
                 capacity,
                 status,
+                report,
             } => {
+                self.controller.set_sms_read_report(report);
                 self.controller.reconcile_sms_listed_slots(&messages);
                 for message in messages {
                     self.controller.ingest_sms(message);
@@ -1435,7 +1539,7 @@ impl ControllerRunner {
     fn run_refresh(&mut self) {
         if self.controller.sms_active()
             || self.controller.sms_delete_active()
-            || self.pending_sms_read_cleanup.is_some()
+            || self.pending_sms_read.is_some()
         {
             self.refresh_deferred = true;
             return;
@@ -1679,6 +1783,7 @@ enum SmsStageOutcome {
         messages: Vec<SmsMessage>,
         capacity: Option<(u32, u32)>,
         status: FeatureStatus,
+        report: dji4g_domain::SmsReadReport,
     },
     /// One successfully read message.
     Read { message: SmsMessage },
@@ -1786,27 +1891,29 @@ fn run_sms_port_call<'a>(
     port: &'a Arc<dyn SmsPort>,
     target: &'a TargetContext,
     request: SmsRequest,
+    control: dji4g_domain::SmsReadControl,
 ) -> crate::PortFuture<'a, SmsStageOutcome> {
     Box::pin(async move {
         match request {
-            SmsRequest::Refresh => {
+            SmsRequest::Refresh | SmsRequest::ReadStorage { .. } => {
                 // The UI owns the user-consent flow and only dispatches a refresh after the user
                 // has accepted the session-setting change; while no consent state travels in the
                 // command, this path attempts `enable_pdu_mode` once whenever the observed mode is
                 // not confirmed PDU. An already-PDU module is left untouched.
-                let result = async {
-                    let mode = port.query_pdu_mode(target).await?;
-                    if matches!(mode, Some(false) | None) {
-                        port.enable_pdu_mode(target).await?;
-                    }
-                    port.list(target).await
-                }
-                .await;
+                let storage = match request {
+                    SmsRequest::ReadStorage { storage } => Some(storage),
+                    _ => None,
+                };
+                let result = port.list_controlled(target, storage, control).await;
                 match result {
-                    Ok(SmsListing { messages, capacity }) => SmsStageOutcome::Refreshed {
+                    Ok(crate::SmsReadResult {
+                        listing: SmsListing { messages, capacity },
+                        report,
+                    }) => SmsStageOutcome::Refreshed {
                         messages,
                         capacity,
                         status: FeatureStatus::Supported,
+                        report,
                     },
                     Err(error) => SmsStageOutcome::Failed(error),
                 }

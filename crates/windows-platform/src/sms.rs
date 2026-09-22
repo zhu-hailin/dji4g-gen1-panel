@@ -12,7 +12,7 @@
 //!
 //! Storage holder resolution: the standard PDU-mode `+CMGL`/`+CMGR` headers carry no storage
 //! holder. `sms_list` therefore reports the preferred holder from the `+CPMS?` first group,
-//! and `sms_read` resolves it best-effort with the same read-only query so its record can be
+//! and `sms_read_verified` resolves it best-effort with the same read-only query so its record can be
 //! paired with a listing. A failed holder query never fails the read itself.
 
 use std::{sync::mpsc::RecvTimeoutError, time::Duration};
@@ -41,6 +41,7 @@ pub struct SmsRecord {
 /// One inbox listing: decoded records plus the `+CPMS?` first-group capacity.
 #[derive(Clone, Debug, Default)]
 pub struct SmsListing {
+    pub report: dji4g_domain::SmsReadReport,
     pub records: Vec<SmsRecord>,
     /// `(used, total)` slots reported by `+CPMS?`; `None` when that line is absent/malformed.
     pub capacity: Option<(u32, u32)>,
@@ -78,20 +79,39 @@ pub fn sms_set_pdu_mode(device: &DjiDevice, epoch: DeviceEpoch) -> Result<(), Pl
 
 /// List stored messages in PDU mode (`AT+CMGL=4`).
 ///
-/// Requires the module to already be in PDU mode; otherwise the call fails closed with
-/// `sms:pdu_mode_required`. Records whose PDU fails to decode are skipped individually without
-/// failing the whole listing.
+/// Legacy compatibility entry point. It lacks a caller-verified SIM fingerprint and therefore
+/// refuses with `sms:sim_identity_required`; production callers must use `sms_list_controlled`.
 pub fn sms_list(device: &DjiDevice, epoch: DeviceEpoch) -> Result<SmsListing, PlatformError> {
-    with_session(device, epoch, list)
+    crate::sms_history::sms_list_controlled(
+        device,
+        epoch,
+        None,
+        None,
+        dji4g_domain::SmsReadControl::new(Duration::from_secs(60)),
+    )
 }
 
-/// Read one stored message (`AT+CMGR=<index>`). Reading may mark it as read (research §6.2).
+/// Legacy entry point without a frozen SIM identity. Refuses before opening the serial port;
+/// callers must use [`sms_read_verified`] so a single read cannot bypass history SIM isolation.
 pub fn sms_read(
+    _device: &DjiDevice,
+    _epoch: DeviceEpoch,
+    _index: u32,
+) -> Result<SmsRecord, PlatformError> {
+    Err(platform_error("sms:sim_identity_required"))
+}
+
+/// Read one stored message after matching the caller's SIM fingerprint, and verify it again
+/// before releasing the decoded body. Both identity reads and CMGR use one exclusive session.
+/// Reading may mark the message as read even if the final identity check fails.
+pub fn sms_read_verified(
     device: &DjiDevice,
     epoch: DeviceEpoch,
+    expected_sim: Option<[u8; 8]>,
     index: u32,
 ) -> Result<SmsRecord, PlatformError> {
-    with_session(device, epoch, |actor| read(actor, index))
+    let expected_sim = expected_sim.ok_or(platform_error("sms:sim_identity_required"))?;
+    with_session(device, epoch, |actor| read(actor, index, expected_sim))
 }
 
 /// Delete one stored message (`AT+CMGD=<index>`). The final `OK` is required for success; a
@@ -179,6 +199,7 @@ fn set_pdu_mode(actor: &AtSessionActor) -> Result<(), PlatformError> {
     ensure_final_ok(&response)
 }
 
+#[cfg(test)]
 fn list(actor: &AtSessionActor) -> Result<SmsListing, PlatformError> {
     if query_pdu_mode(actor)? != Some(true) {
         return Err(platform_error("sms:pdu_mode_required"));
@@ -187,15 +208,43 @@ fn list(actor: &AtSessionActor) -> Result<SmsListing, PlatformError> {
     let (storage, capacity) = parse_cpms(&cpms.lines);
     let response = execute_timed(actor, AtCommand::SmsList)?;
     Ok(SmsListing {
+        report: Default::default(),
         records: pair_cmgl_records(&response.lines, &storage),
         capacity,
     })
 }
 
-fn read(actor: &AtSessionActor, index: u32) -> Result<SmsRecord, PlatformError> {
+fn read(
+    actor: &AtSessionActor,
+    index: u32,
+    expected_sim: [u8; 8],
+) -> Result<SmsRecord, PlatformError> {
+    verify_read_sim(actor, expected_sim)?;
     let storage = storage_holder(actor).unwrap_or_default();
     let response = execute_timed(actor, AtCommand::SmsRead { index })?;
-    parse_cmgr_record(&response.lines, index, &storage)
+    let record = parse_cmgr_record(&response.lines, index, &storage)?;
+    verify_read_sim(actor, expected_sim)?;
+    Ok(record)
+}
+
+fn verify_read_sim(actor: &AtSessionActor, expected: [u8; 8]) -> Result<(), PlatformError> {
+    let response = execute_timed(actor, AtCommand::Iccid).map_err(|error| {
+        if matches!(error.code, "sms:timeout" | "sms:device_removed") {
+            error
+        } else {
+            platform_error("sms:sim_identity_unverified")
+        }
+    })?;
+    if response.final_code != AtFinalCode::Ok || response.lines.len() != 1 {
+        return Err(platform_error("sms:sim_identity_unverified"));
+    }
+    let iccid = dji4g_at_protocol::parse_iccid_line(&response.lines[0])
+        .ok_or(platform_error("sms:sim_identity_unverified"))?;
+    // Same irreversible SHA-256 prefix used by SimIdentity; never log the card number.
+    if dji4g_domain::sha256(iccid.as_bytes())[..8] != expected {
+        return Err(platform_error("sms:sim_changed"));
+    }
+    Ok(())
 }
 
 fn delete(actor: &AtSessionActor, index: u32) -> Result<(), PlatformError> {
@@ -348,7 +397,7 @@ fn parse_cmgr_header(line: &str) -> Option<u8> {
     (stat <= 4).then_some(stat)
 }
 
-fn pair_cmgl_records(lines: &[String], storage: &str) -> Vec<SmsRecord> {
+pub(crate) fn pair_cmgl_records(lines: &[String], storage: &str) -> Vec<SmsRecord> {
     let mut records = Vec::new();
     let mut lines = lines.iter();
     while let Some(line) = lines.next() {
@@ -361,6 +410,9 @@ fn pair_cmgl_records(lines: &[String], storage: &str) -> Vec<SmsRecord> {
         let Ok(decoded) = decode_deliver_pdu(pdu.trim()) else {
             continue;
         };
+        if decoded.encoding == dji4g_domain::SmsEncoding::Other {
+            continue;
+        }
         records.push(SmsRecord {
             index,
             storage: storage.to_owned(),
@@ -417,7 +469,7 @@ const fn platform_error(code: &'static str) -> PlatformError {
     }
 }
 
-fn map_actor_error(error: &ActorError) -> PlatformError {
+pub(crate) fn map_actor_error(error: &ActorError) -> PlatformError {
     let code = match error.protocol_kind() {
         Some(ProtocolErrorKind::Timeout) => "sms:timeout",
         Some(ProtocolErrorKind::DeviceRemoved) => "sms:device_removed",
@@ -467,6 +519,13 @@ mod tests {
     // SMSC 00, sender +8613800138000, DCS 08 (UCS-2), UDL 02, body U+4E2D.
     const UCS2_ZHONG: &str = "00040D91683108108300F0000842102030405023024E2D";
     const CPMS: &str = "+CPMS: \"SM\",3,20,\"SM\",3,20,\"SM\",3,20\r\nOK\r\n";
+    const ICCID: &str = "+QCCID: 89860123456789012345\r\nOK\r\n";
+
+    fn expected_sim() -> [u8; 8] {
+        dji4g_domain::sha256(b"89860123456789012345")[..8]
+            .try_into()
+            .unwrap()
+    }
 
     struct PassiveCancellation;
 
@@ -627,9 +686,9 @@ mod tests {
     #[test]
     fn read_resolves_storage_and_decodes_the_single_record() {
         let cmgr = format!("+CMGR: 1,,24\r\n{GSM7_HELLO}\r\nOK\r\n");
-        let (actor, state) = actor_with_reads([CPMS, cmgr.as_str()]);
+        let (actor, state) = actor_with_reads([ICCID, CPMS, cmgr.as_str(), ICCID]);
 
-        let record = read(&actor, 1).unwrap();
+        let record = read(&actor, 1, expected_sim()).unwrap();
 
         assert_eq!(record.index, 1);
         assert_eq!(record.stat, 1);
@@ -637,8 +696,63 @@ mod tests {
         assert_eq!(record.decoded.body, "hello");
         assert_eq!(
             state.lock().unwrap().writes,
-            vec![b"AT+CPMS?\r".to_vec(), b"AT+CMGR=1\r".to_vec()]
+            vec![
+                b"AT+QCCID\r".to_vec(),
+                b"AT+CPMS?\r".to_vec(),
+                b"AT+CMGR=1\r".to_vec(),
+                b"AT+QCCID\r".to_vec()
+            ]
         );
+    }
+
+    #[test]
+    fn single_read_must_not_release_body_after_sim_changes() {
+        let cmgr = format!("+CMGR: 1,,24\r\n{GSM7_HELLO}\r\nOK\r\n");
+        let (actor, state) = actor_with_reads([
+            ICCID,
+            CPMS,
+            cmgr.as_str(),
+            "+QCCID: 89860999999999999999\r\nOK\r\n",
+        ]);
+        assert_eq!(
+            read(&actor, 1, expected_sim()).unwrap_err().code,
+            "sms:sim_changed"
+        );
+        assert_eq!(
+            state.lock().unwrap().write_attempts,
+            4,
+            "one read, no retry"
+        );
+    }
+
+    #[test]
+    fn single_read_rejects_wrong_or_unverifiable_sim_before_reading_body() {
+        for (reply, error) in [
+            ("+QCCID: 89860999999999999999\r\nOK\r\n", "sms:sim_changed"),
+            ("+QCCID: malformed\r\nOK\r\n", "sms:sim_identity_unverified"),
+            ("ERROR\r\n", "sms:sim_identity_unverified"),
+            (
+                "+QCCID: 89860123456789012345\r\n+QCCID: 89860123456789012345\r\nOK\r\n",
+                "sms:sim_identity_unverified",
+            ),
+        ] {
+            let (actor, state) = actor_with_reads([reply]);
+            assert_eq!(read(&actor, 1, expected_sim()).unwrap_err().code, error);
+            assert_eq!(state.lock().unwrap().writes, vec![b"AT+QCCID\r".to_vec()]);
+        }
+    }
+
+    #[test]
+    fn single_read_discards_body_when_post_read_sim_is_unverifiable() {
+        let cmgr = format!("+CMGR: 1,,24\r\n{GSM7_HELLO}\r\nOK\r\n");
+        for reply in ["ERROR\r\n", "+QCCID: malformed\r\nOK\r\n"] {
+            let (actor, state) = actor_with_reads([ICCID, CPMS, cmgr.as_str(), reply]);
+            assert_eq!(
+                read(&actor, 1, expected_sim()).unwrap_err().code,
+                "sms:sim_identity_unverified"
+            );
+            assert_eq!(state.lock().unwrap().write_attempts, 4);
+        }
     }
 
     #[test]

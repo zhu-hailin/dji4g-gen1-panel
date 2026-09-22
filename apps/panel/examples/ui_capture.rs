@@ -172,7 +172,16 @@ mod capture {
             "onboarding-absent"
             | "onboarding-healthy"
             | "onboarding-missing-port"
-            | "onboarding-driver" => vec![Screen::Overview],
+            | "onboarding-driver"
+            | "driver-ready"
+            | "driver-cancelled"
+            | "driver-restart-required"
+            | "driver-unsupported" => vec![Screen::Overview],
+            "history-reading"
+            | "history-counts"
+            | "history-storage-confirm"
+            | "archive-disabled"
+            | "archive-loaded" => vec![Screen::SmsList],
             "sms" | "mail" => vec![
                 Screen::SmsList,
                 Screen::SmsDetail,
@@ -277,6 +286,7 @@ mod capture {
         fn publish_overview_fixture(&mut self) {
             if !matches!(self.screens[self.page], Screen::Overview)
                 || self.mode.starts_with("onboarding-")
+                || self.mode.starts_with("driver-")
             {
                 return;
             }
@@ -485,6 +495,27 @@ mod capture {
             self.screens[self.page].apply(&mut self.app);
             if self.mode == "draft-replace" {
                 self.app.set_review_reply_replace();
+            }
+            // Only initialize services once: archive fixtures must never read real user data
+            // or create a fresh worker on every render frame.
+            if self.ticks == 0 {
+                match self.mode.as_str() {
+                    "archive-disabled" => self.app.set_review_archive(false),
+                    "archive-loaded" => self.app.set_review_archive(true),
+                    "history-storage-confirm" => {
+                        self.app
+                            .set_review_sms_storage_confirmation(dji4g_domain::SmsStorageId(
+                                "ME".into(),
+                            ))
+                    }
+                    _ => {}
+                }
+                if let Some(outcome) = driver_outcome(&self.mode) {
+                    self.app.configure_driver_setup_result(outcome);
+                }
+            }
+            if self.mode.starts_with("driver-") {
+                self.app.review_onboarding_with_driver(true);
             }
             if self.mode == "onboarding-driver" {
                 self.app.review_onboarding_with_driver(true);
@@ -805,6 +836,15 @@ mod capture {
         use dji4g_application::*;
         use dji4g_domain::*;
         let now = SystemTime::now();
+        if mode.starts_with("history-") {
+            apply_history_fixture(snapshot, mode);
+            return;
+        }
+        if driver_outcome(mode).is_some() {
+            // An installer result is advisory, not a fresh USB/AT/network measurement.
+            *snapshot = ReducerState::new(now).snapshot();
+            return;
+        }
         if mode == "onboarding-absent" {
             *snapshot = demo_snapshot(DemoScenario::Absent, now);
             return;
@@ -1019,6 +1059,104 @@ mod capture {
             task.phase = ToolPhase::Running;
             snapshot.device_tools.task = Some(task);
             snapshot.serial_work_busy = true;
+        }
+    }
+
+    fn driver_outcome(
+        mode: &str,
+    ) -> Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome> {
+        use dji4g_windows_platform::driver_setup::DriverSetupOutcome as Outcome;
+        match mode {
+            "driver-ready" => Some(Outcome::Ready),
+            "driver-cancelled" => Some(Outcome::Cancelled),
+            "driver-restart-required" => Some(Outcome::RestartRequired),
+            "driver-unsupported" => Some(Outcome::UnsupportedInterface),
+            _ => None,
+        }
+    }
+
+    fn apply_history_fixture(snapshot: &mut dji4g_application::ControllerSnapshot, mode: &str) {
+        use dji4g_domain::*;
+        let count = if mode == "history-counts" { 500 } else { 12 };
+        let epoch = snapshot
+            .app
+            .device
+            .as_ref()
+            .map_or(1, |device| device.epoch.0);
+        snapshot.sms_messages = (1..=count)
+            .map(|index| {
+                let mut message = SmsMessage::new(
+                    index,
+                    SmsStorageId("SM".into()),
+                    epoch,
+                    snapshot.sim_epoch,
+                    "+100000-test",
+                    format!("【合成历史 {index}】用于界面验收，从未真实收发。"),
+                    SmsEncoding::Ucs2,
+                    SmsStatus::Received,
+                );
+                message.read = Some(index % 4 != 0);
+                message.service_centre_timestamp =
+                    Some(format!("26/09/22,12:{:02}:00+32", index % 60));
+                SmsDisplayMessage {
+                    fragments: vec![message.fragment_key()],
+                    delete_allowed: true,
+                    message,
+                }
+            })
+            .collect();
+        snapshot.sms_send = None;
+        snapshot.sms_delete = None;
+        snapshot.sms_inbox = SmsInboxSummary {
+            message_count: count as usize,
+            unread_count: (count / 4) as usize,
+            capacity: Some((count, if count == 500 { 512 } else { 128 })),
+            status: FeatureStatus::Supported,
+            has_incomplete: false,
+            evicted: 0,
+        };
+        snapshot.sms_read_report = Some(SmsReadReport {
+            storage: Some(SmsStorageId("SM".into())),
+            capacity: snapshot.sms_inbox.capacity,
+            raw_records: count as usize,
+            decoded_records: count as usize,
+            skipped_records: 0,
+            supported_storages: vec![SmsStorageId("SM".into()), SmsStorageId("ME".into())],
+            restoration: SmsStorageRestoration::NotNeeded,
+        });
+        let reading = mode == "history-reading";
+        snapshot.sms_refresh_pending = reading;
+        snapshot.serial_work_busy = reading;
+        snapshot.sms_read_phase = Some(if reading {
+            SmsReadPhase::Listing
+        } else {
+            SmsReadPhase::Complete
+        });
+        snapshot.sms_read_progress = if reading { 278 } else { count as usize };
+        if reading {
+            snapshot.sms_read_report = None;
+        }
+    }
+
+    #[cfg(test)]
+    mod history_tests {
+        use super::*;
+        #[test]
+        fn five_hundred_fixture_contains_real_synthetic_rows_and_matching_counts() {
+            let mut snapshot = demo_snapshot(DemoScenario::Available, SystemTime::now());
+            apply_history_fixture(&mut snapshot, "history-counts");
+            assert_eq!(snapshot.sms_messages.len(), 500);
+            assert_eq!(snapshot.sms_inbox.message_count, 500);
+            assert_eq!(snapshot.sms_read_report.unwrap().decoded_records, 500);
+            assert!(!snapshot.serial_work_busy);
+        }
+        #[test]
+        fn reading_fixture_does_not_claim_a_completed_report() {
+            let mut snapshot = demo_snapshot(DemoScenario::Available, SystemTime::now());
+            apply_history_fixture(&mut snapshot, "history-reading");
+            assert!(snapshot.sms_refresh_pending && snapshot.serial_work_busy);
+            assert_eq!(snapshot.sms_read_progress, 278);
+            assert!(snapshot.sms_read_report.is_none());
         }
     }
 

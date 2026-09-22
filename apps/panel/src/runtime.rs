@@ -11,7 +11,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use dji4g_application::{
@@ -46,8 +46,8 @@ use dji4g_windows_platform::{
     RepairAction, RepairError, SmsRecord, TlsEvidence, ToolExchangeOutcome, TrustedHelper,
     UnansweredReason, WindowsAdapterResolver, WindowsDeviceInventory, WindowsHotspotControl,
     WindowsNativeRepairBackend, WindowsNetworkProbe, WindowsRepairExecutor, launch_elevated_helper,
-    probe_at_port, read_interface_metrics, select_at_port_verified, sms_delete, sms_list,
-    sms_query_pdu_mode, sms_read, sms_set_pdu_mode, tool_exchange,
+    probe_at_port, read_interface_metrics, select_at_port_verified, sms_delete, sms_query_pdu_mode,
+    sms_read_verified, sms_set_pdu_mode, tool_exchange,
 };
 
 /// Maximum helper request lifetime, bounded by `dji4g_ipc::MAX_OPERATION_LIFETIME`.  The window
@@ -411,6 +411,36 @@ impl ProductionSms {
 }
 
 impl SmsPort for ProductionSms {
+    fn list_controlled(
+        &self,
+        target: &TargetContext,
+        storage: Option<SmsStorageId>,
+        control: dji4g_domain::SmsReadControl,
+    ) -> PortFuture<'_, Result<dji4g_application::SmsReadResult, PortError>> {
+        let target = target.clone();
+        Box::pin(async move {
+            let (device, epoch) = self.target_device(&target)?;
+            let listing = dji4g_windows_platform::sms_list_controlled(
+                &device,
+                epoch,
+                target.sim_fingerprint(),
+                storage,
+                control,
+            )
+            .map_err(map_platform_error)?;
+            Ok(dji4g_application::SmsReadResult {
+                report: listing.report,
+                listing: SmsListing {
+                    messages: listing
+                        .records
+                        .into_iter()
+                        .map(|record| sms_message(record, epoch))
+                        .collect(),
+                    capacity: listing.capacity,
+                },
+            })
+        })
+    }
     fn query_pdu_mode(
         &self,
         target: &TargetContext,
@@ -434,7 +464,14 @@ impl SmsPort for ProductionSms {
         let target = target.clone();
         Box::pin(async move {
             let (device, epoch) = self.target_device(&target)?;
-            let listing = sms_list(&device, epoch).map_err(map_platform_error)?;
+            let listing = dji4g_windows_platform::sms_list_controlled(
+                &device,
+                epoch,
+                target.sim_fingerprint(),
+                None,
+                dji4g_domain::SmsReadControl::new(Duration::from_secs(60)),
+            )
+            .map_err(map_platform_error)?;
             Ok(SmsListing {
                 messages: listing
                     .records
@@ -454,7 +491,8 @@ impl SmsPort for ProductionSms {
         let target = target.clone();
         Box::pin(async move {
             let (device, epoch) = self.target_device(&target)?;
-            let record = sms_read(&device, epoch, index).map_err(map_platform_error)?;
+            let record = sms_read_verified(&device, epoch, target.sim_fingerprint(), index)
+                .map_err(map_platform_error)?;
             Ok(sms_message(record, epoch))
         })
     }

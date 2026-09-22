@@ -237,21 +237,17 @@ pub(crate) fn render(
             }
         }
         eframe::egui::CollapsingHeader::new("驱动安装").default_open(driver_installation_expanded(snapshot, now)).show(ui, |ui| {
-            let installer = std::env::current_exe().ok().and_then(|exe| {
-                exe.parent().map(|dir| dir.join("dji4g-driver-setup.exe"))
-            });
-            let bundled = installer.as_ref().is_some_and(|path| {
-                path.is_file() && path.parent().is_some_and(|dir| dir.join("drivers/qcser.inf").is_file())
-            });
+            let bundled = super::onboarding::bundled_driver_available();
             if bundled {
-                wrapped_label(ui, "此离线版附带本机导出的原始签名驱动。安装器会校验文件，为缺驱动接口选择匹配包；Windows 可能同时更新其他匹配该包的设备，不强制覆盖更优驱动。");
-                wrapped_label(ui, meta_text("确认后面板会自动退出，再显示 Windows 管理员授权。安装结束后重新打开独立程序，点击“立即刷新”验证；如提示重启，请先重启电脑。"));
+                wrapped_label(ui, "此离线版附带原始驱动资源，安装前会校验文件和签名。当前包不能覆盖所有接口（包括未匹配的 MI_04）；任何缺驱动接口无法匹配时，将在安装前停止。Windows 可能同时更新其他匹配该包的设备，不强制覆盖更优驱动。");
+                wrapped_label(ui, meta_text("确认后面板会自动退出，再显示 Windows 管理员授权。安装结束或取消授权后会自动返回面板并显示结果；如提示重启，请先重启电脑。"));
                 install_requested = ui.button("退出面板并安装驱动").clicked();
             } else {
-                wrapped_label(ui, "安装资源不完整，请重新运行“大疆4G面板独立版.exe”。若仍失败，导出详细日志。");
+                wrapped_label(ui, "此版本没有完整的离线驱动资源。请打开 Windows 设置 → Windows 更新 → 可选更新检查驱动，或联系 DJI 官方支持取得此模块的适配驱动；安装后点击“立即刷新”。");
             }
             ui.hyperlink_to("大疆官方兼容说明（第 21 项）", "https://repair.dji.com/help/content?customId=01700008285&lang=en&paperDocType=ARTICLE&re=US&spaceId=17");
-            wrapped_label(ui, meta_text("网卡与 AT 串口可能需要不同驱动。安装后使用窗口顶部“刷新”重新检查；仅安装程序完成不代表模块已经可用。已有功能正常时无需重复安装。"));
+            wrapped_label(ui, meta_text("网卡与 AT 串口可能需要不同驱动。安装结果返回后仍需验证 AT 与网络；已有功能正常时无需重复安装。Windows 更新不保证提供该模块的全部驱动。"));
+            ui.hyperlink_to("联系 DJI 官方支持", super::onboarding::OFFICIAL_SUPPORT_URL);
             ui.hyperlink_to("移远官方驱动获取说明", "https://forums.quectel.com/t/how-to-get-driver-tools/38963");
             wrapped_label(ui, meta_text("该链接提供厂商获取渠道，不代表其中所有驱动都兼容大疆定制模块。"));
         });

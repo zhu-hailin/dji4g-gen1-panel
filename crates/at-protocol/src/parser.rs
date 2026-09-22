@@ -15,7 +15,7 @@ const MAX_UNRECOGNIZED_LINES: usize = 32;
 /// rather than formatted into a transaction.
 const SMS_MAX_INDEX: u32 = 9999;
 /// Upper bound for one `AT+CMGL=4` listing; an empty listing is a valid result.
-const MAX_SMS_LIST_RECORDS: usize = 200;
+const MAX_SMS_LIST_RECORDS: usize = 1000;
 /// Upper bound for one PDU hex line inside a transaction (140-octet user data plus headers).
 const MAX_PDU_HEX_CHARS: usize = 1024;
 /// Upper bound for the channels of one `+QTEMP:` positional list.  A longer run of bare numbers
@@ -119,6 +119,11 @@ impl StreamingParser {
         Ok(events)
     }
 
+    /// Number of raw SMS records received so far; multipart merging is unrelated.
+    pub fn sms_record_count(&self) -> usize {
+        self.sms_records
+    }
+
     pub fn finish_timeout(&mut self) -> ProtocolError {
         self.terminate(ProtocolError::timeout())
     }
@@ -180,6 +185,9 @@ impl StreamingParser {
                 self.expecting_pdu = line_starts_sms_record(&self.command, &line);
                 if self.expecting_pdu {
                     self.sms_records += 1;
+                    if self.sms_records > MAX_SMS_LIST_RECORDS {
+                        return self.fail(ProtocolErrorKind::WrongPortData);
+                    }
                 }
             }
             LineClassification::Urc => {
@@ -200,8 +208,18 @@ impl StreamingParser {
             }
         }
 
-        if self.response_lines.len() == MAX_RESPONSE_LINES
-            || self.response_bytes.saturating_add(line.len()) > MAX_RESPONSE_BYTES
+        if self.response_lines.len()
+            == (if matches!(self.command, AtCommand::SmsList) {
+                2 * MAX_SMS_LIST_RECORDS
+            } else {
+                MAX_RESPONSE_LINES
+            })
+            || self.response_bytes.saturating_add(line.len())
+                > (if matches!(self.command, AtCommand::SmsList) {
+                    1024 * 1024
+                } else {
+                    MAX_RESPONSE_BYTES
+                })
         {
             return self.fail(ProtocolErrorKind::ResponseTooLarge);
         }
@@ -327,7 +345,13 @@ fn classify_line(command: &AtCommand, line: &str, expecting_pdu: bool) -> LineCl
         // malformed identity line can never complete a transaction.
         AtCommand::Iccid if parse_iccid_line(line).is_some() => LineClassification::Response,
         AtCommand::SmsMessageFormat if is_cmgf_response(line) => LineClassification::Response,
-        AtCommand::SmsStorageQuery if is_cpms_response(line) => LineClassification::Response,
+        AtCommand::SmsStorageQuery
+        | AtCommand::SmsStorageCapabilities
+        | AtCommand::SmsSelectStorage { .. }
+            if is_cpms_response(line) =>
+        {
+            LineClassification::Response
+        }
         AtCommand::SmsList if is_cmgl_response(line) => LineClassification::Response,
         AtCommand::SmsRead { .. } if is_cmgr_response(line) => LineClassification::Response,
         // The message reference line of a submission; the PDU body itself already went out on
@@ -364,7 +388,10 @@ fn response_is_complete(command: &AtCommand, line_count: usize, sms_records: usi
         // CNUM reports zero to sixteen lines; the final OK gate still applies (an empty OK is
         // a valid Empty result, never a protocol failure).
         AtCommand::SubscriberNumber => line_count <= 16,
-        AtCommand::SmsMessageFormat | AtCommand::SmsStorageQuery => line_count == 1,
+        AtCommand::SmsMessageFormat
+        | AtCommand::SmsStorageQuery
+        | AtCommand::SmsStorageCapabilities => line_count == 1,
+        AtCommand::SmsSelectStorage { .. } => line_count <= 1,
         // One CMGR record: the header, optionally followed by its PDU continuation line.
         AtCommand::SmsRead { .. } => sms_records == 1,
         // An empty list is a valid OK; PDU continuation lines are not records.

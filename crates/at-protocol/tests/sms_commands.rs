@@ -108,3 +108,34 @@ fn sms_read_debug_exposes_only_the_storage_index() {
     assert!(delete.contains("SmsDelete"));
     assert!(delete.contains("7"));
 }
+
+#[test]
+fn history_storage_commands_only_select_mem1() {
+    assert_eq!(
+        AtCommand::SmsStorageCapabilities.encode().as_bytes(),
+        b"AT+CPMS=?\r"
+    );
+    assert_eq!(
+        AtCommand::SmsSelectStorage {
+            storage: dji4g_domain::SmsReadStorage::Sim
+        }
+        .encode()
+        .as_bytes(),
+        b"AT+CPMS=\"SM\"\r"
+    );
+    assert_eq!(
+        AtCommand::SmsSelectStorage {
+            storage: dji4g_domain::SmsReadStorage::Device
+        }
+        .encode()
+        .as_bytes(),
+        b"AT+CPMS=\"ME\"\r"
+    );
+    assert_eq!(
+        AtCommand::SmsSelectStorage {
+            storage: dji4g_domain::SmsReadStorage::Device
+        }
+        .retry_policy(),
+        dji4g_at_protocol::RetryPolicy::Never
+    );
+}

@@ -46,8 +46,8 @@ pub use ports::{
     InventoryObservation, InventoryPort, LanguageCode, LogLevel, MonoTime, NetworkProbePort,
     NormalizedNetworkEvidence, PortError, PortFuture, PrivilegedExecutor, ProbeObservationDto,
     ProbeStageDto, SettingsPersistenceState, SettingsSaveOutcome, SettingsSnapshot, SmsListing,
-    SmsPort, SmsSendReceipt, SmsSendResult, StableCode, StableCodeError, SystemRouteDto,
-    TargetContext, mask_recipient,
+    SmsPort, SmsReadResult, SmsSendReceipt, SmsSendResult, StableCode, StableCodeError,
+    SystemRouteDto, TargetContext, mask_recipient,
 };
 pub use reducer::{
     ActionReadiness, ActionReadinessKey, BackendEvent, CheckMask, CheckResult, ControllerSnapshot,

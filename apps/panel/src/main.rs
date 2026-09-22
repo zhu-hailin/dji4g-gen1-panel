@@ -132,6 +132,11 @@ fn main() {
     let instance = match SingleInstance::acquire() {
         Ok(AcquireResult::Primary(instance)) => Some(instance),
         Ok(AcquireResult::Existing) => {
+            // A concurrent manual launch can win the instance mutex while the installer is
+            // finishing. Do not silently lose its closed result when activating that window.
+            if let Some(outcome) = startup.driver_setup_result {
+                dji4g_windows_platform::show_message_box("模块驱动安装结果", outcome.message());
+            }
             let request = if startup.autostart {
                 ActivationRequest::OpenAndRefresh
             } else {
@@ -295,6 +300,15 @@ fn main() {
             let mut app = PanelApp::new(inputs, cc);
             if configure_first_run {
                 app.configure_onboarding(&config);
+                if let Some(paths) = &paths {
+                    app.configure_archive(
+                        paths.log_dir.with_file_name("sms-history.dat"),
+                        config.sms_archive_enabled,
+                    );
+                }
+                if let Some(outcome) = startup.driver_setup_result {
+                    app.configure_driver_setup_result(outcome);
+                }
             }
             if let Some(tray) = tray {
                 app.attach_tray(tray);

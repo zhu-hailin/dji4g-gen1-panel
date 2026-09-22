@@ -51,6 +51,9 @@ fn initial_snapshot() -> Arc<ControllerSnapshot> {
         sms_delete: None,
         serial_work_busy: false,
         sms_refresh_pending: false,
+        sms_read_phase: None,
+        sms_read_progress: 0,
+        sms_read_report: None,
         sms_inbox_failure: None,
         device_tools: Default::default(),
     })
@@ -199,6 +202,7 @@ fn a_pending_toggle_drives_one_save_and_one_registration_per_revision() {
             .as_slice(),
         &[ConfigV1 {
             onboarding_completed: false,
+            sms_archive_enabled: false,
             language: LanguageCode::ZhCn,
             autostart: true,
             start_minimized: true,

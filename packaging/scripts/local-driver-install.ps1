@@ -3,15 +3,14 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 function Assert-DriverCompletion {
  param([object[]]$Devices, [bool]$NeedsRestart)
- if (!$Devices.Count) { throw 'Device disconnected; installation result requires a fresh check.' }
+ if ($NeedsRestart) { Write-Output 'DRIVER_SETUP_RESULT=restart-required'; return }
+ if (!$Devices.Count) { throw 'disconnected' }
  $remaining=@($Devices | Where-Object { $_.ConfigManagerErrorCode -ne 0 })
  Write-Output ("Driver staging finished. Interfaces not yet OK: {0}" -f $remaining.Count)
- if ($NeedsRestart) {
-  Write-Output '需要重启：Windows 已暂存驱动，当前不能确认接口安装成功。请重启后重新检查。'
- } elseif ($remaining.Count) {
-  throw 'DRIVER_NOT_READY: 接口仍异常，不能判定安装成功。请保留日志并检查设备管理器；未强制绑定驱动。'
+ if ($remaining.Count) {
+  throw 'not-ready'
  } else {
-  Write-Output '驱动接口状态正常；仍需单独验证 AT 通信和网络。'
+  Write-Output 'DRIVER_SETUP_RESULT=ready'
  }
 }
 $root = $env:DJI4G_DRIVER_ROOT
@@ -28,6 +27,8 @@ $expected = @{
  'serial/amd64/qcusbser.sys'='FE77A74CBB798E0B6E49437CC20D0C6A6EDF1D164CE1CFB5E3157DB75943B87D'
 }
 $locks = [Collections.Generic.List[IO.FileStream]]::new()
+$failureResult = 'validation-failed'
+$needsRestart=$false
 try {
  if (![Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'This package requires Windows x64.' }
  foreach ($name in $expected.Keys) {
@@ -41,6 +42,7 @@ try {
  }
  Write-Output 'Package hashes and catalog signatures verified.'
  if (!$install -and !$planOnly) { exit 0 }
+ $failureResult = 'failed'
  if ($install) {
  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
  if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator permission is required.' }
@@ -51,7 +53,7 @@ try {
  $deviceFilter = "PNPDeviceID LIKE 'USB\\VID_2CA3&PID_4006%' AND Present = TRUE"
  $devices = @(Get-CimInstance Win32_PnPEntity -Filter $deviceFilter -OperationTimeoutSec 20)
  Write-Output ('Before install: ' + ($devices | Select-Object PNPDeviceID,Name,ConfigManagerErrorCode,HardwareID,Service | ConvertTo-Json -Depth 4 -Compress))
- if (!$devices.Count) { throw 'No supported DJI Gen1 USB device connected.' }
+ if (!$devices.Count) { throw 'disconnected' }
  $missing = @($devices | Where-Object { $_.ConfigManagerErrorCode -eq 28 })
  if (!$missing.Count) {
   Write-Output 'No missing-driver interfaces (Code 28). Nothing installed.'
@@ -72,7 +74,10 @@ try {
     if (@($ids | Where-Object { $hardwareIds -contains $_ }).Count) { $matchesForDevice += $inf; break }
    }
   }
-  if ($matchesForDevice.Count -ne 1) { throw 'A missing interface has no unique matching driver. Nothing installed; no forced binding.' }
+  if ($matchesForDevice.Count -ne 1) {
+   Write-Output ('Unmatched interface: ' + ($device | Select-Object PNPDeviceID,HardwareID,CompatibleID | ConvertTo-Json -Depth 4 -Compress))
+   throw 'unsupported-interface'
+  }
   $plans += [pscustomobject]@{inf=$matchesForDevice[0]; instance=$device.PNPDeviceID}
  }
  if ($planOnly) {
@@ -94,11 +99,22 @@ try {
   if ($LASTEXITCODE -eq 3010) { $needsRestart=$true }
   elseif ($LASTEXITCODE -ne 0) { throw "DEVICE_SCAN_FAILED: $LASTEXITCODE" }
  }
- if ($needsRestart) { Write-Output 'Windows requested a restart. Restart before verifying device operation.' }
+ if ($needsRestart) {
+  # Preserve the reboot requirement even when USB re-enumeration or CIM is not ready yet.
+  Assert-DriverCompletion -Devices @() -NeedsRestart $true
+  exit 0
+ }
  $after=@(Get-CimInstance Win32_PnPEntity -Filter $deviceFilter -OperationTimeoutSec 20)
  Write-Output ('After install: ' + ($after | Select-Object PNPDeviceID,Name,ConfigManagerErrorCode,HardwareID,Service | ConvertTo-Json -Depth 4 -Compress))
  Assert-DriverCompletion -Devices $after -NeedsRestart $needsRestart
- Write-Output 'Reopen DJI 4G Panel > Repair > First connection checks. Verify AT and network separately.'
- Write-Output 'PnP status alone does not prove SMS or Internet operation. New child interfaces may require running setup again.'
-} catch { Write-Output ("ERROR: " + $_.Exception.Message); exit 1 }
+} catch {
+ Write-Output ("ERROR: " + $_.Exception.Message)
+ if ($needsRestart) {
+  # A later package/scan failure cannot erase Windows' already-reported reboot requirement.
+  $failureResult='restart-required-after-failure'
+  Write-Output '部分操作失败，且 Windows 已要求重启。请保存工作并先重启，再检查实际接口状态；不要重复安装。'
+ } elseif ($_.Exception.Message -in @('unsupported-interface','not-ready','disconnected')) { $failureResult=$_.Exception.Message }
+ Write-Output ("DRIVER_SETUP_RESULT=" + $failureResult)
+ exit 1
+}
 finally { foreach ($handle in $locks) { $handle.Dispose() } }

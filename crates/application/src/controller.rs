@@ -112,6 +112,11 @@ pub enum UiCommand {
     /// itself only records the request. The user consent for the session-setting change is owned
     /// by the UI and must be confirmed before this command is dispatched.
     SmsRefresh,
+    /// Explicitly confirmed read of another supported holder; platform restores the old holder.
+    SmsReadStorage {
+        storage: dji4g_domain::SmsStorageId,
+    },
+    SmsCancelRead,
     /// Read one stored message. Queued for the runner's `SmsPort`; the success path marks the
     /// stored copy read through [`Controller::mark_sms_read`].
     SmsRead {
@@ -172,6 +177,9 @@ pub enum UiCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SmsRequest {
     Refresh,
+    ReadStorage {
+        storage: dji4g_domain::SmsStorageId,
+    },
     Read {
         index: u32,
     },
@@ -281,6 +289,8 @@ pub struct Controller {
     sms_refresh_pending: bool,
     sms_delete: Option<crate::SmsDeleteSnapshot>,
     sms_read_in_flight: bool,
+    sms_read_control: Option<dji4g_domain::SmsReadControl>,
+    sms_read_report: Option<(DeviceEpoch, u64, dji4g_domain::SmsReadReport)>,
     sms_inbox_failure: Option<(DeviceEpoch, u64, crate::PortError)>,
     next_sms_request_id: u64,
     sms_send_context: Option<(DeviceEpoch, u64)>,
@@ -316,6 +326,8 @@ impl Controller {
             sms_refresh_pending: false,
             sms_delete: None,
             sms_read_in_flight: false,
+            sms_read_control: None,
+            sms_read_report: None,
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
@@ -350,6 +362,8 @@ impl Controller {
             sms_refresh_pending: false,
             sms_delete: None,
             sms_read_in_flight: false,
+            sms_read_control: None,
+            sms_read_report: None,
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
@@ -370,6 +384,21 @@ impl Controller {
         snapshot.feedback = self.feedback.clone();
         snapshot.sms_send = self.sms_send.clone();
         snapshot.sms_refresh_pending = self.sms_refresh_pending;
+        snapshot.sms_read_phase = self
+            .sms_read_control
+            .as_ref()
+            .map(|control| control.phase());
+        snapshot.sms_read_progress = self
+            .sms_read_control
+            .as_ref()
+            .map_or(0, |control| control.progress());
+        snapshot.sms_read_report = self
+            .sms_read_report
+            .as_ref()
+            .filter(|(epoch, sim, _)| {
+                *epoch == self.state.epoch() && *sim == self.state.sim_epoch()
+            })
+            .map(|(_, _, report)| report.clone());
         snapshot.sms_delete = self.sms_delete.clone();
         snapshot.serial_work_busy = self.serial_work_busy();
         snapshot.sms_inbox_failure = self
@@ -759,6 +788,37 @@ impl Controller {
                 }
                 self.sms_refresh_pending = true;
                 self.sms_requests.push_back(SmsRequest::Refresh);
+                Ok(CommandReceipt::Accepted)
+            }
+            UiCommand::SmsReadStorage { storage } => {
+                if self.serial_work_busy() || self.operation_pending.is_some() {
+                    return self.reject_sms_busy();
+                }
+                if !matches!(storage.0.as_str(), "SM" | "ME") {
+                    self.report_feedback(failure(
+                        ErrorCode::Unsupported,
+                        "sms:storage_selection_unavailable",
+                    ));
+                    return Err(UiSendError::Closed);
+                }
+                self.sms_refresh_pending = true;
+                self.sms_requests
+                    .push_back(SmsRequest::ReadStorage { storage });
+                Ok(CommandReceipt::Accepted)
+            }
+            UiCommand::SmsCancelRead => {
+                if let Some(control) = &self.sms_read_control {
+                    control.cancel();
+                } else {
+                    self.sms_requests.retain(|request| {
+                        !matches!(
+                            request,
+                            SmsRequest::Refresh | SmsRequest::ReadStorage { .. }
+                        )
+                    });
+                    self.sms_refresh_pending = false;
+                }
+                self.state.publish_only_change();
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsRead { index } => {
@@ -1390,6 +1450,14 @@ impl Controller {
     }
     pub fn set_sms_refresh_pending(&mut self, pending: bool) {
         self.sms_refresh_pending = pending;
+        self.state.publish_only_change();
+    }
+    pub fn set_sms_read_control(&mut self, control: Option<dji4g_domain::SmsReadControl>) {
+        self.sms_read_control = control;
+        self.state.publish_only_change();
+    }
+    pub fn set_sms_read_report(&mut self, report: dji4g_domain::SmsReadReport) {
+        self.sms_read_report = Some((self.state.epoch(), self.state.sim_epoch(), report));
         self.state.publish_only_change();
     }
     pub fn update_sms_send(

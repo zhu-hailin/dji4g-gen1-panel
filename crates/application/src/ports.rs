@@ -203,6 +203,7 @@ pub struct TargetContext {
     pub(crate) identity: StableDeviceIdentity,
     pub(crate) at_port: Option<String>,
     pub(crate) adapter_id: Option<String>,
+    pub(crate) sim_fingerprint: Option<[u8; 8]>,
 }
 
 impl TargetContext {
@@ -223,6 +224,7 @@ impl TargetContext {
             identity,
             at_port,
             adapter_id,
+            sim_fingerprint: None,
         })
     }
 
@@ -234,6 +236,11 @@ impl TargetContext {
     #[must_use]
     pub fn identity(&self) -> &StableDeviceIdentity {
         &self.identity
+    }
+
+    #[must_use]
+    pub const fn sim_fingerprint(&self) -> Option<[u8; 8]> {
+        self.sim_fingerprint
     }
 
     #[must_use]
@@ -390,6 +397,12 @@ pub struct SmsListing {
     pub capacity: Option<(u32, u32)>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SmsReadResult {
+    pub listing: SmsListing,
+    pub report: dji4g_domain::SmsReadReport,
+}
+
 /// Terminal result of one module-side send attempt (research document §6.3).
 ///
 /// `Submitted` is submission only — the module accepted the PDU — and never means the peer
@@ -442,6 +455,42 @@ pub fn mask_recipient(recipient: &str) -> String {
 /// `sms:pdu_mode_required` otherwise: [`Self::query_pdu_mode`] observes the current mode and
 /// [`Self::enable_pdu_mode`] performs the session-setting change after the user has consented.
 pub trait SmsPort: Send + Sync {
+    /// Production overrides this to propagate cancellation through the actual serial I/O.
+    /// The compatibility path never changes storage on behalf of an old port implementation.
+    fn list_controlled(
+        &self,
+        target: &TargetContext,
+        storage: Option<dji4g_domain::SmsStorageId>,
+        control: dji4g_domain::SmsReadControl,
+    ) -> PortFuture<'_, Result<SmsReadResult, PortError>> {
+        let target = target.clone();
+        Box::pin(async move {
+            if storage.is_some() {
+                return Err(PortError::new(
+                    ErrorCode::Unsupported,
+                    "sms:storage_selection_unavailable",
+                ));
+            }
+            if control.is_cancelled() || control.is_expired() {
+                return Err(PortError::new(ErrorCode::Timeout, "sms:read_cancelled"));
+            }
+            if self.query_pdu_mode(&target).await? != Some(true) {
+                self.enable_pdu_mode(&target).await?;
+            }
+            let listing = self.list(&target).await?;
+            let report = dji4g_domain::SmsReadReport {
+                storage: listing
+                    .messages
+                    .first()
+                    .map(|message| message.storage.clone()),
+                capacity: listing.capacity,
+                raw_records: listing.messages.len(),
+                decoded_records: listing.messages.len(),
+                ..Default::default()
+            };
+            Ok(SmsReadResult { listing, report })
+        })
+    }
     /// One confirmed transaction owns preflight, mode switch and submission. Production ports
     /// must honour this shared deadline/cancellation through the actual serial I/O.
     fn send_controlled(

@@ -107,15 +107,51 @@ pub(crate) enum OnboardingAction {
     Enter,
     Refresh,
     InstallBundledDriver,
+    OpenWindowsUpdate,
 }
 
-fn bundled_driver_available() -> bool {
+pub(crate) fn bundled_driver_available() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
         .is_some_and(|dir| {
-            dir.join("dji4g-driver-setup.exe").is_file() && dir.join("drivers/qcser.inf").is_file()
+            [
+                "dji4g-driver-setup.exe",
+                "drivers/qcser.inf",
+                "drivers/qcser.cat",
+                "drivers/qcmdm.inf",
+                "drivers/qcmdm.cat",
+                "drivers/qcfilter.inf",
+                "drivers/qcfilter.cat",
+                "drivers/filter/amd64/qcusbfilter.sys",
+                "drivers/serial/amd64/qcusbser.sys",
+            ]
+            .iter()
+            .all(|file| dir.join(file).is_file())
         })
+}
+
+fn completion_copy(
+    ready: bool,
+    result: Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome>,
+) -> (&'static str, &'static str, &'static str) {
+    use dji4g_windows_platform::driver_setup::DriverSetupOutcome as O;
+    if let Some(outcome @ (O::RestartRequired | O::RestartRequiredAfterFailure)) = result {
+        return ("2. 请先重启电脑", "查看面板（需先重启）", outcome.message());
+    }
+    (
+        "2. 自动检查模块",
+        if ready {
+            "检查完成，开始使用"
+        } else {
+            "进入面板查看详情"
+        },
+        if ready {
+            "模块绑定的公网与 DNS 检查通过；电脑实际出口仍可能由 Wi-Fi 或 VPN 决定。"
+        } else {
+            "等待检查、未连接、证据过期或关闭主动联网检查，不等于驱动损坏。具体原因可进入面板查看。"
+        },
+    )
 }
 
 pub(crate) fn render(
@@ -123,9 +159,11 @@ pub(crate) fn render(
     snapshot: &ControllerSnapshot,
     now: SystemTime,
     driver_fixture: Option<bool>,
+    setup_result: Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome>,
 ) -> OnboardingAction {
     let rows = checks(snapshot, now);
     let ready = rows.iter().all(|(_, state)| *state == CheckState::Passed);
+    let (check_heading, enter_label, completion_detail) = completion_copy(ready, setup_result);
     let mut action = OnboardingAction::None;
     egui::TopBottomPanel::bottom("onboarding-actions")
         .frame(
@@ -142,14 +180,7 @@ pub(crate) fn render(
                 if ui.button("跳过，直接进入面板").clicked() {
                     action = OnboardingAction::Enter;
                 }
-                if ui
-                    .add(super::theme::primary_button(if ready {
-                        "检查完成，开始使用"
-                    } else {
-                        "进入面板查看详情"
-                    }))
-                    .clicked()
-                {
+                if ui.add(super::theme::primary_button(enter_label)).clicked() {
                     action = OnboardingAction::Enter;
                 }
             });
@@ -161,6 +192,13 @@ pub(crate) fn render(
         egui::ScrollArea::vertical().id_salt("onboarding-scroll").auto_shrink([false,false]).show(ui, |ui| {
             ui.label(RichText::new("欢迎使用 DJI 一代 4G 面板").size(24.0).strong());
             super::wrapped_label(ui,"连接模块后，面板会在后台检查连接情况。可以随时跳过，进入后继续查看检查结果。");
+            if let Some(result) = setup_result {
+                ui.add_space(12.0);
+                super::section_frame(ui, |ui| {
+                    ui.label(super::section_heading("本次驱动安装结果"));
+                    super::wrapped_label(ui, result.message());
+                });
+            }
             ui.add_space(16.0);
             super::section_frame(ui, |ui| {
                 ui.label(super::section_heading("1. 连接模块"));
@@ -169,7 +207,7 @@ pub(crate) fn render(
             ui.add_space(12.0);
             super::section_frame(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(super::section_heading("2. 自动检查模块"));
+                    ui.label(super::section_heading(check_heading));
                     if ui.add_enabled(!snapshot.serial_work_busy,egui::Button::new("重新检查")).clicked() { action = OnboardingAction::Refresh; }
                 });
                 for (label,state) in &rows {
@@ -180,23 +218,24 @@ pub(crate) fn render(
                     });
                 }
                 ui.add_space(6.0);
-                super::wrapped_label(ui,super::meta_text(if ready { "模块绑定的公网与 DNS 检查通过；电脑实际出口仍可能由 Wi-Fi 或 VPN 决定。" } else { "等待检查、未连接、证据过期或关闭主动联网检查，不等于驱动损坏。具体原因可进入面板查看。" }));
+                super::wrapped_label(ui,super::meta_text(completion_detail));
             });
             ui.add_space(12.0);
             super::section_frame(ui, |ui| {
                 ui.label(super::section_heading("3. 需要驱动时再安装"));
                 if driver_fixture.unwrap_or_else(bundled_driver_available) {
-                    super::wrapped_label(ui,"此版本包含已校验的本地驱动包。已有接口正常时无需重复安装。");
+                    super::wrapped_label(ui,"已找到本地驱动资源，安装前还会校验签名和文件。此包不能覆盖所有接口（包括未匹配的 MI_04）；如有缺驱动接口无法匹配，将在安装前停止。已有接口正常时无需重复安装。");
                     if ui.add_enabled(!super::driver_setup::installation_busy(snapshot),egui::Button::new("使用内置驱动")).clicked() { action = OnboardingAction::InstallBundledDriver; }
-                    super::wrapped_label(ui,super::meta_text("点击后先确认，再退出面板并显示 Windows 授权；安装后重新打开面板验证。"));
+                    super::wrapped_label(ui,super::meta_text("点击后先确认，再退出面板并显示 Windows 授权；安装结束或取消授权后会自动返回面板。需要重启时，请先重启电脑。"));
                 } else {
-                    super::wrapped_label(ui,"当前目录未检测到完整内置驱动包。可从官方渠道确认适配驱动，下载后按厂商说明安装。");
+                    super::wrapped_label(ui,"此版本未附带完整驱动资源，不能在这里离线安装。请先打开 Windows 设置 → Windows 更新 → 可选更新，查看驱动更新；也可联系 DJI 官方支持取得适配此模块的驱动，按厂商说明安装后点击“重新检查”。");
                 }
                 ui.horizontal_wrapped(|ui| {
+                    if ui.button("打开 Windows 更新").clicked() { action = OnboardingAction::OpenWindowsUpdate; }
                     ui.hyperlink_to("DJI 官方兼容与驱动说明",OFFICIAL_DRIVER_GUIDANCE_URL);
                     ui.hyperlink_to("联系 DJI 官方支持",OFFICIAL_SUPPORT_URL);
                 });
-                super::wrapped_label(ui,super::meta_text("官方网页仅在浏览器中打开，不会自动下载或安装。"));
+                super::wrapped_label(ui,super::meta_text("官方网页提供兼容说明与支持入口，不是驱动直达下载。网页不会自动安装；Windows 更新也不保证提供该模块的全部驱动。"));
             });
         });
     });
@@ -236,4 +275,18 @@ mod tests {
                 .all(|(_, state)| *state == CheckState::Expired)
         );
     }
+}
+
+#[test]
+fn restart_result_overrides_healthy_checks_and_start_using_copy() {
+    use dji4g_windows_platform::driver_setup::DriverSetupOutcome as O;
+    for outcome in [O::RestartRequired, O::RestartRequiredAfterFailure] {
+        let (heading, button, detail) = completion_copy(true, Some(outcome));
+        assert!(heading.contains("重启"));
+        assert!(button.contains("重启"));
+        assert!(detail.contains("重启"));
+        assert!(!button.contains("开始使用"));
+        assert!(!detail.contains("检查通过"));
+    }
+    assert!(completion_copy(true, Some(O::Ready)).1.contains("开始使用"));
 }

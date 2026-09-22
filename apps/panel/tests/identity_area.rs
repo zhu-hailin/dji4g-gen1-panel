@@ -80,6 +80,9 @@ fn snapshot(
         sms_delete: None,
         serial_work_busy: false,
         sms_refresh_pending: false,
+        sms_read_phase: None,
+        sms_read_progress: 0,
+        sms_read_report: None,
         sms_inbox_failure: None,
         device_tools: Default::default(),
     }

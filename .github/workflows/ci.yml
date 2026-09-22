@@ -47,6 +47,7 @@ jobs:
         run: |
           ./packaging/scripts/test-driver-completion.ps1
           ./packaging/scripts/test-driver-install-command.ps1
+          ./packaging/scripts/test-driver-plan.ps1
 
       - name: release build
         run: cargo build --workspace --release --locked --target ${{ env.TARGET }}

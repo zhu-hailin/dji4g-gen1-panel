@@ -8,7 +8,7 @@
 //! Because a window hidden to the tray produces no frames — `PanelApp::update` (the only place
 //! tray events are drained) simply stops running — the worker also fulfils two duties that must
 //! not depend on a UI frame: it natively restores/shows/foregrounds the registered panel window
-//! when 「打开面板」 is selected, and it invokes a panel-provided action hook with every queued
+//! when 「打开面板」 or 「退出」 is selected (Exit resumes frames to finish pending local I/O), and it invokes a panel-provided action hook with every queued
 //! event so 「立即刷新」/「热点状态」 can be served off-UI. Neither duty may block the worker:
 //! it owns the message pump and the hard-exit watchdog.
 
@@ -168,14 +168,13 @@ mod native {
     /// Whether a queued tray event must make the worker natively restore/show/foreground the
     /// registered panel window.
     ///
-    /// Only the Open selection may do this. A window hidden via `ViewportCommand::Visible(false)`
-    /// produces no frames, so `PanelApp::update` never runs and the UI thread can never re-show
-    /// itself — the worker that received the click is the only place left that can. The other
-    /// commands must not touch the window: 「立即刷新」 refreshes in the background, 「热点状态」
-    /// answers on its own thread, and 「退出」 must never resurrect the window it is closing.
+    /// Open and Exit restore the window. A hidden window produces no UI frames; Exit must resume
+    /// them to drain pending local archive writes/clears before normal shutdown and show progress.
+    /// The existing watchdog still terminates a stalled UI. Refresh and hotspot status remain
+    /// background actions and never show the window.
     /// An unrecognized menu id must not show the window either.
     const fn shows_panel_window(event: TrayEvent) -> bool {
-        matches!(event, TrayEvent::Menu(MENU_OPEN))
+        matches!(event, TrayEvent::Menu(MENU_OPEN | MENU_EXIT))
     }
 
     /// Hard-exit watchdog state, owned by the tray worker.
@@ -220,6 +219,17 @@ mod native {
             }
         }
 
+        /// Refresh only an existing watchdog while UI frames report pending local archive I/O.
+        /// Sender timestamps keep delayed queued heartbeats from reviving a stalled UI.
+        fn defer_for_local_io(&mut self, sent_at: Instant) {
+            match self {
+                Self::Armed { deadline } | Self::Acknowledged { deadline } => {
+                    *deadline = (*deadline).max(sent_at + EXIT_BACKSTOP_GRACE);
+                }
+                Self::Idle => {}
+            }
+        }
+
         #[must_use]
         fn is_due(&self, now: Instant) -> bool {
             match *self {
@@ -247,7 +257,7 @@ mod native {
         action: Option<Arc<dyn Fn(TrayEvent) + Send + Sync>>,
         /// The panel's real viewport window (raw `HWND` value), registered once by the UI thread
         /// at startup. Carried as an opaque integer — never dereferenced off this worker thread —
-        /// and used to natively restore/show/foreground the panel on 「打开面板」, the only show
+        /// and used to natively restore/show/foreground the panel on Open/Exit, the only show
         /// path that works while the window is hidden and `PanelApp::update` never runs.
         panel_window: Option<isize>,
         /// Hard-exit watchdog, armed only by an Exit menu selection.
@@ -281,6 +291,8 @@ mod native {
         /// Deliberately carries no response channel: it must never block the UI thread, and a lost
         /// acknowledgement is safe because the already-armed deadline still ends the process.
         AcknowledgeExit,
+        /// Only UI progress on pending local I/O may renew an armed watchdog.
+        DeferExitForLocalIo(Instant),
         Shutdown,
     }
 
@@ -465,6 +477,14 @@ mod native {
             let _ = self.commands.try_send(WorkerCommand::AcknowledgeExit);
         }
 
+        /// Non-blocking heartbeat, sent only while local archive I/O is pending at exit.
+        /// Losing heartbeats leaves the original 1.5-second watchdog bound in force.
+        pub fn defer_exit_for_local_io(&self) {
+            let _ = self
+                .commands
+                .try_send(WorkerCommand::DeferExitForLocalIo(Instant::now()));
+        }
+
         pub fn take_error(&self) -> Option<TrayError> {
             self.error.lock().ok().and_then(|mut value| value.take())
         }
@@ -633,6 +653,9 @@ mod native {
                     }
                     WorkerCommand::AcknowledgeExit => {
                         callback.exit_backstop.acknowledge(Instant::now());
+                    }
+                    WorkerCommand::DeferExitForLocalIo(sent_at) => {
+                        callback.exit_backstop.defer_for_local_io(sent_at);
                     }
                     WorkerCommand::Shutdown => shutdown = true,
                 }
@@ -1091,14 +1114,13 @@ mod native {
         }
 
         #[test]
-        fn only_the_open_selection_shows_the_panel_window() {
-            // Re-showing the window is the point of 「打开面板」; no other selection may resurrect
-            // a window the user hid (or is about to close via 「退出」).
+        fn open_and_exit_show_the_panel_window_for_graceful_local_io_drain() {
+            // Exit must resume UI frames long enough to finish pending local archive I/O.
             assert!(shows_panel_window(TrayEvent::Menu(MENU_OPEN)));
+            assert!(shows_panel_window(TrayEvent::Menu(MENU_EXIT)));
             for event in [
                 TrayEvent::Menu(MENU_REFRESH_NOW),
                 TrayEvent::Menu(MENU_HOTSPOT_STATUS),
-                TrayEvent::Menu(MENU_EXIT),
                 TrayEvent::TaskbarCreated,
                 TrayEvent::Menu(MENU_EXIT + 1),
                 TrayEvent::Menu(0),
@@ -1182,6 +1204,34 @@ mod native {
                 *seen.lock().expect("the recorder lock is healthy"),
                 [TrayEvent::Menu(MENU_EXIT)]
             );
+        }
+
+        #[test]
+        fn local_io_heartbeats_preserve_watchdog_but_only_while_ui_is_alive() {
+            let start = Instant::now();
+            for acknowledged in [false, true] {
+                let mut backstop = ExitBackstop::Idle;
+                backstop.arm(start);
+                if acknowledged {
+                    backstop.acknowledge(start);
+                }
+                // Continued 50ms UI heartbeats allow a 3-second save, beyond the original limit.
+                for tick in 1..=60 {
+                    let now = start + Duration::from_millis(tick * 50);
+                    backstop.defer_for_local_io(now);
+                    assert!(!backstop.is_due(now));
+                }
+                let last = start + Duration::from_secs(3);
+                assert!(!backstop.is_due(last + EXIT_BACKSTOP_GRACE - Duration::from_millis(1)));
+                assert!(backstop.is_due(last + EXIT_BACKSTOP_GRACE));
+                assert!(backstop.is_due(last + Duration::from_secs(20)));
+                // A delayed old heartbeat cannot restart the grace clock when dequeued later.
+                backstop.defer_for_local_io(start);
+                assert!(backstop.is_due(last + Duration::from_secs(20)));
+            }
+            let mut idle = ExitBackstop::Idle;
+            idle.defer_for_local_io(start);
+            assert_eq!(idle, ExitBackstop::Idle);
         }
 
         #[test]
@@ -1314,6 +1364,8 @@ mod native {
 
         /// No worker thread exists on this platform, so there is no watchdog to extend.
         pub fn acknowledge_exit(&self) {}
+
+        pub fn defer_exit_for_local_io(&self) {}
 
         pub fn take_error(&self) -> Option<TrayError> {
             None

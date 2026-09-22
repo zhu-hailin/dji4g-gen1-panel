@@ -38,6 +38,7 @@ fn config_roundtrip_preserves_all_user_fields() {
     let store = ConfigStore::new(paths.clone());
     let expected = ConfigV1 {
         onboarding_completed: true,
+        sms_archive_enabled: true,
         language: dji4g_application::LanguageCode::ZhCn,
         autostart: true,
         start_minimized: true,

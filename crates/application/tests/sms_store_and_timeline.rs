@@ -280,6 +280,21 @@ fn clear_drops_every_message_and_digest() {
 }
 
 #[test]
+fn history_keeps_five_hundred_module_records() {
+    let mut store = SmsStore::new();
+    for index in 1..=500 {
+        store.ingest(message(index, &format!("history {index}")));
+    }
+    assert_eq!(store.messages().len(), 500);
+    assert_eq!(
+        store
+            .summary(FeatureStatus::Supported, Some((500, 1000)))
+            .evicted,
+        0
+    );
+}
+
+#[test]
 fn the_store_is_capped_and_evicts_the_oldest_first() {
     let mut store = SmsStore::new();
     for index in 0..(MAX_STORED as u32 + 5) {
@@ -634,6 +649,7 @@ fn sms_commands_queue_module_requests_and_delete_waits_for_confirmation() {
         runner.handle().try_send(command).unwrap();
         assert!(runner.poll_commands());
         assert!(runner.poll_sms_requests());
+        finish_read(&mut runner);
     }
     let fragments = runner.controller().snapshot().sms_messages[0]
         .fragments
@@ -1213,6 +1229,7 @@ fn runner_refresh_lists_messages_and_records_the_supported_probe() {
         runner.poll_sms_requests(),
         "a queued request must be drained when a port is wired"
     );
+    finish_read(&mut runner);
     assert!(
         !runner.poll_sms_requests(),
         "the queue is empty after the drain"
@@ -1245,6 +1262,7 @@ fn runner_refresh_enables_pdu_mode_once_when_the_module_is_not_confirmed_pdu() {
         .expect("queue refresh");
     assert!(runner.poll_commands(), "the queued command must be handled");
     assert!(runner.poll_sms_requests());
+    finish_read(&mut runner);
 
     assert_eq!(
         sms.enable_calls.load(Ordering::SeqCst),
@@ -1280,6 +1298,7 @@ fn runner_read_marks_the_stored_message_read() {
         .expect("queue read");
     assert!(runner.poll_commands(), "the queued command must be handled");
     assert!(runner.poll_sms_requests());
+    finish_read(&mut runner);
 
     assert_eq!(sms.read_calls.load(Ordering::SeqCst), 1);
     let snapshot = runner.controller().snapshot();
@@ -1375,6 +1394,7 @@ fn runner_refresh_transport_failure_maps_to_transport_failure_without_panicking(
         .expect("queue refresh");
     assert!(runner.poll_commands(), "the queued command must be handled");
     assert!(runner.poll_sms_requests());
+    finish_read(&mut runner);
 
     let snapshot = runner.controller().snapshot();
     assert_eq!(snapshot.sms_inbox.status, FeatureStatus::TransportFailure);
@@ -2100,6 +2120,7 @@ fn inbox_failure_retains_code_and_success_clears_it() {
         runner.handle().try_send(UiCommand::SmsRefresh).unwrap();
         runner.poll_commands();
         runner.poll_sms_requests();
+        finish_read(&mut runner);
         let snapshot = runner.controller().snapshot();
         assert_eq!(
             snapshot
@@ -2126,5 +2147,19 @@ fn finish_delete(runner: &mut ControllerRunner) {
         }
         assert!(Instant::now() < deadline, "delete worker did not finish");
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn finish_read(runner: &mut ControllerRunner) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runner.sms_pending() {
+        runner.poll_sms_requests();
+        assert!(
+            Instant::now() < deadline,
+            "read worker did not finish its cleanup"
+        );
+        if runner.sms_pending() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
