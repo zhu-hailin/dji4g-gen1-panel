@@ -253,7 +253,9 @@ pub struct ControllerSnapshot {
     /// with long-message fragments already merged into single entries (§6.2). `SmsMessage`
     /// redacts sender/body in `Debug` and `Serialize`, so this list can travel in the snapshot
     /// without entering logs or diagnostics exports.
-    pub sms_messages: Vec<dji4g_domain::SmsMessage>,
+    pub sms_messages: Vec<dji4g_domain::SmsDisplayMessage>,
+    pub sms_delete: Option<crate::SmsDeleteSnapshot>,
+    pub serial_work_busy: bool,
     pub sms_send: Option<dji4g_domain::SmsSendSnapshot>,
     pub sms_refresh_pending: bool,
     pub sms_inbox_failure: Option<crate::PortError>,
@@ -557,9 +559,37 @@ impl ReducerState {
         if self.settings.active_probe != enabled {
             self.active_probe = enabled;
             self.settings.active_probe = enabled;
+            self.reset_active_probe_evidence(self.last_observed_at);
             self.settings.revision = self.settings.revision.saturating_add(1);
             self.publication_revision = self.publication_revision.saturating_add(1);
         }
+    }
+
+    /// A disabled probe is not a continuing positive observation. Re-enabling starts without
+    /// reviving the previous proof, and in-flight results are ignored by `apply_probe` while off.
+    fn reset_active_probe_evidence(&mut self, now: SystemTime) {
+        self.bound_public = None;
+        self.bound_dns = None;
+        self.protocol_coverage = None;
+        self.consecutive_public_failures = 0;
+        if let Some(network) = self.network.as_mut() {
+            network.bound_public = BoundPublicStatus::Incomplete;
+            network.bound_dns = BoundDnsStatus::Incomplete;
+            network.protocol_coverage = ProtocolCoverage::SingleFamilyOnly;
+        }
+        let reason = if self.active_probe {
+            UnexecutedReason::NotScheduled
+        } else {
+            UnexecutedReason::DisabledBySetting
+        };
+        for id in [
+            DiagnosticCheckId::BoundGateway,
+            DiagnosticCheckId::BoundPublic,
+            DiagnosticCheckId::BoundDns,
+        ] {
+            self.set_check_terminal(id, DiagnosticCheckState::Unexecuted { reason }, now);
+        }
+        self.evidence_revision = self.evidence_revision.saturating_add(1);
     }
 
     pub fn set_language(&mut self, language: LanguageCode) {
@@ -834,6 +864,8 @@ impl ReducerState {
             timeline: self.timeline.clone(),
             sms_inbox: self.sms_store.summary(self.sms_status, self.sms_capacity),
             sms_messages: self.sms_store.display_messages(),
+            sms_delete: None,
+            serial_work_busy: false,
             sms_send: None,
             sms_refresh_pending: false,
             sms_inbox_failure: None,
@@ -1400,8 +1432,12 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
             }
         }
         BackendEvent::SettingsChanged { settings } => {
+            let probe_changed = next.active_probe != settings.active_probe;
             next.settings = settings;
             next.active_probe = next.settings.active_probe;
+            if probe_changed {
+                next.reset_active_probe_evidence(now);
+            }
             next.publication_revision = next.publication_revision.saturating_add(1);
         }
         BackendEvent::ExpirationTick => {
@@ -1689,16 +1725,16 @@ impl ReducerState {
                 self.cellular = value
                     .cellular
                     .map(|value| evidence(epoch, EvidenceSource::AtControl, value, observed_at));
+                let (cellular_check, block) =
+                    cellular_verdict(self.cellular.as_ref().map(|entry| &entry.value));
+                self.cellular_block = block
+                    .map(|value| evidence(epoch, EvidenceSource::AtControl, value, observed_at));
                 self.set_check_terminal(
                     DiagnosticCheckId::AtControl,
                     DiagnosticCheckState::Passed,
                     observed_at,
                 );
-                self.set_check_terminal(
-                    DiagnosticCheckId::Cellular,
-                    DiagnosticCheckState::Passed,
-                    observed_at,
-                );
+                self.set_check_terminal(DiagnosticCheckId::Cellular, cellular_check, observed_at);
                 self.mark_evidence_changed(observed_at);
             }
             CheckResult::Failed { code, observed_at } if self.accept_observed(observed_at, now) => {
@@ -1863,6 +1899,12 @@ impl ReducerState {
     }
 
     /// Store one listed SMS message; returns whether it was new. A new message republishes.
+    pub fn reconcile_sms_listed_slots(&mut self, listed: &[SmsMessage]) {
+        if self.sms_store.reconcile_listed_slots(listed) {
+            self.publish_only_change();
+        }
+    }
+
     pub fn ingest_sms(&mut self, message: SmsMessage) -> bool {
         if self.sms_store.ingest(message) {
             self.publish_only_change();
@@ -1885,6 +1927,15 @@ impl ReducerState {
     /// Remove every stored message carrying this index (panel-side delete bookkeeping).
     pub fn remove_sms_by_index(&mut self, index: u32) -> bool {
         if self.sms_store.remove_by_index(index) {
+            self.publish_only_change();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_sms_fragment(&mut self, fragment: &dji4g_domain::SmsFragmentKey) -> bool {
+        if self.sms_store.remove_fragment(fragment) {
             self.publish_only_change();
             true
         } else {
@@ -2648,6 +2699,55 @@ fn readiness_key(action: &dji4g_domain::ActionKind) -> Option<ActionReadinessKey
         dji4g_domain::ActionKind::ToggleHotspot { .. } => ActionReadinessKey::ToggleHotspot,
         dji4g_domain::ActionKind::Refresh => return None,
     })
+}
+
+fn cellular_verdict(
+    cellular: Option<&CellularSnapshot>,
+) -> (DiagnosticCheckState, Option<CellularBlock>) {
+    use dji4g_domain::{AttachState, SimState};
+    let unavailable = |code| {
+        (
+            DiagnosticCheckState::Unavailable {
+                code: failure(ErrorCodeForStage::Missing, code),
+            },
+            None,
+        )
+    };
+    let Some(cellular) = cellular else {
+        return unavailable("app:cellular_unobserved");
+    };
+    let sim_block = match cellular.sim {
+        SimState::Missing => Some("app:sim_missing"),
+        SimState::PinRequired => Some("app:sim_pin_required"),
+        SimState::PukRequired => Some("app:sim_puk_required"),
+        SimState::Rejected => Some("app:sim_rejected"),
+        SimState::Unknown => return unavailable("app:sim_unobserved"),
+        SimState::Ready => None,
+    };
+    if let Some(code) = sim_block {
+        return (
+            DiagnosticCheckState::Failed {
+                code: failure(ErrorCodeForStage::Missing, code),
+            },
+            Some(CellularBlock::SimRejected),
+        );
+    }
+    match cellular.registration {
+        RegistrationState::Denied => {
+            return (
+                DiagnosticCheckState::Failed {
+                    code: failure(ErrorCodeForStage::Missing, "app:registration_rejected"),
+                },
+                Some(CellularBlock::RegistrationRejected),
+            );
+        }
+        RegistrationState::RegisteredHome | RegistrationState::RegisteredRoaming => {}
+        _ => return unavailable("app:registration_not_ready"),
+    }
+    if cellular.attached != AttachState::Attached {
+        return unavailable("app:packet_not_attached");
+    }
+    (DiagnosticCheckState::Passed, None)
 }
 
 fn failure(kind: ErrorCodeForStage, stable: &'static str) -> FailureCode {

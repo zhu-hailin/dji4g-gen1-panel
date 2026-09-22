@@ -141,6 +141,11 @@ pub struct ControllerRunner {
     /// send records distinct in the store's digest set; never a module storage index.
     next_sms_transaction_id: u32,
     pending_sms: Option<PendingSms>,
+    /// A timed-out ordinary read/list may still be inside synchronous serial I/O.
+    /// Retain its completion channel so timeout cannot release serial ownership early.
+    pending_sms_read_cleanup: Option<mpsc::Receiver<Result<SmsStageOutcome, crate::PortError>>>,
+    pending_sms_delete: Option<PendingSmsDelete>,
+    sms_delete_timeout: Duration,
     sms_timeout: Duration,
     refresh_deferred: bool,
     pending_tool: Option<PendingTool>,
@@ -159,6 +164,19 @@ struct PendingSms {
     control: SmsTransactionControl,
     epoch: dji4g_domain::DeviceEpoch,
     sim_epoch: u64,
+}
+
+struct PendingSmsDelete {
+    request_id: u64,
+    next: usize,
+    in_flight: Option<InFlightSmsDelete>,
+}
+
+struct InFlightSmsDelete {
+    fragment: crate::SmsFragmentKey,
+    receiver: mpsc::Receiver<crate::SmsDeleteReceipt>,
+    control: crate::SmsDeleteControl,
+    receipt: Option<crate::SmsDeleteReceipt>,
 }
 
 /// One tool task in flight on its own worker.
@@ -199,6 +217,13 @@ const TOOL_BUSY_WINDOW: Duration = Duration::from_secs(5);
 
 impl Drop for ControllerRunner {
     fn drop(&mut self) {
+        if let Some(item) = self
+            .pending_sms_delete
+            .as_ref()
+            .and_then(|p| p.in_flight.as_ref())
+        {
+            item.control.cancel();
+        }
         if let Some(pending) = &self.pending_sms {
             pending.control.cancel();
         }
@@ -229,6 +254,9 @@ impl ControllerRunner {
             stage_timeout: STAGE_TIMEOUT,
             next_sms_transaction_id: 1,
             pending_sms: None,
+            pending_sms_read_cleanup: None,
+            pending_sms_delete: None,
+            sms_delete_timeout: dji4g_domain::SMS_DELETE_TIMEOUT,
             sms_timeout: SMS_SEND_TIMEOUT,
             refresh_deferred: false,
             pending_tool: None,
@@ -261,8 +289,16 @@ impl ControllerRunner {
         self.sms_timeout = timeout;
         self
     }
+    /// Test seam; production retains the shared 30-second per-fragment deadline.
+    pub fn with_sms_delete_timeout(mut self, timeout: Duration) -> Self {
+        self.sms_delete_timeout = timeout;
+        self
+    }
     pub fn sms_pending(&self) -> bool {
         self.pending_sms.is_some()
+            || self.pending_sms_read_cleanup.is_some()
+            || self.pending_sms_delete.is_some()
+            || self.controller.sms_delete_active()
     }
 
     /// Whether a device-tool task is currently in flight.
@@ -399,6 +435,21 @@ impl ControllerRunner {
     /// by an explicit user request, never on a timer. With no port wired the requests stay queued
     /// (the controller records intent; a later composition may attach the port and drain them).
     pub fn poll_sms_requests(&mut self) -> bool {
+        if let Some(receiver) = &self.pending_sms_read_cleanup {
+            match receiver.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return false,
+                // Late results remain discarded after timeout, including after a context change.
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_sms_read_cleanup = None;
+                    self.controller.set_sms_read_in_flight(false);
+                    self.publish();
+                    return true;
+                }
+            }
+        }
+        if self.pending_sms_delete.is_some() {
+            return self.poll_sms_delete();
+        }
         if self.pending_sms.is_some() {
             return self.poll_sms_completion();
         }
@@ -408,6 +459,23 @@ impl ControllerRunner {
             .and_then(|ports| ports.sms.as_ref())
             .map(Arc::clone)
         else {
+            if self.controller.sms_delete_active() {
+                if let Some(SmsRequest::Delete { request_id }) =
+                    self.controller.take_next_sms_request()
+                {
+                    self.controller.record_sms_delete_item(
+                        request_id,
+                        0,
+                        crate::SmsDeleteReceipt {
+                            result: crate::SmsDeleteItemResult::NotAttempted,
+                            code: Some("sms:checked_delete_unavailable".into()),
+                        },
+                    );
+                    self.controller.finish_sms_delete(request_id);
+                    self.publish();
+                    return true;
+                }
+            }
             return false;
         };
         let Some(request) = self.controller.take_next_sms_request() else {
@@ -415,9 +483,150 @@ impl ControllerRunner {
         };
         if matches!(request, SmsRequest::Send { .. }) {
             self.start_sms_send(request, sms_port);
+        } else if let SmsRequest::Delete { request_id } = request {
+            self.pending_sms_delete = Some(PendingSmsDelete {
+                request_id,
+                next: 0,
+                in_flight: None,
+            });
+            self.poll_sms_delete();
         } else {
+            self.controller.set_sms_read_in_flight(true);
             self.run_sms_request(request, &sms_port);
+            if self.pending_sms_read_cleanup.is_none() {
+                self.controller.set_sms_read_in_flight(false);
+            }
         }
+        true
+    }
+
+    fn poll_sms_delete(&mut self) -> bool {
+        use crate::SmsDeleteItemResult as Result;
+        let Some(mut pending) = self.pending_sms_delete.take() else {
+            return false;
+        };
+        if let Some(mut item) = pending.in_flight.take() {
+            let changed = (
+                self.controller.state().epoch().0,
+                self.controller.state().sim_epoch(),
+            ) != (item.fragment.device_epoch, item.fragment.sim_epoch);
+            if changed || item.control.is_expired() {
+                item.control.cancel();
+            }
+            if item.receipt.is_none() {
+                match item.receiver.try_recv() {
+                    Ok(receipt) => item.receipt = Some(receipt),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        item.receipt = Some(crate::SmsDeleteReceipt {
+                            result: if item.control.delete_attempted() {
+                                Result::OutcomeUnknown
+                            } else {
+                                Result::Failed
+                            },
+                            code: Some("sms:delete_worker_closed".into()),
+                        })
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            // A timeout requests cancellation; it is never permission to reuse a live worker's port.
+            if item.receipt.is_none() || item.control.cleanup_pending() {
+                pending.in_flight = Some(item);
+                self.pending_sms_delete = Some(pending);
+                return false;
+            }
+            let receipt = item.receipt.take().expect("checked receipt");
+            let stop = changed || receipt.result != Result::Deleted;
+            self.controller
+                .record_sms_delete_item(pending.request_id, pending.next, receipt);
+            pending.next += 1;
+            if stop {
+                self.controller.finish_sms_delete(pending.request_id);
+                self.publish();
+                return true;
+            }
+        }
+        let fragment = self
+            .controller
+            .sms_delete_snapshot()
+            .filter(|batch| batch.request_id == pending.request_id)
+            .and_then(|batch| batch.items.get(pending.next))
+            .map(|item| item.fragment.clone());
+        let Some(fragment) = fragment else {
+            self.controller.finish_sms_delete(pending.request_id);
+            self.publish();
+            return true;
+        };
+        let valid = (
+            self.controller.state().epoch().0,
+            self.controller.state().sim_epoch(),
+        ) == (fragment.device_epoch, fragment.sim_epoch)
+            && self
+                .controller
+                .state()
+                .sms_store()
+                .contains_fragment(&fragment);
+        let target = self.controller.state().target_context();
+        let port = self.ports.as_ref().and_then(|p| p.sms.as_ref()).cloned();
+        if !valid || target.is_none() || port.is_none() {
+            self.controller.record_sms_delete_item(
+                pending.request_id,
+                pending.next,
+                crate::SmsDeleteReceipt {
+                    result: Result::NotAttempted,
+                    code: Some("sms:delete_target_changed".into()),
+                },
+            );
+            self.controller.finish_sms_delete(pending.request_id);
+            self.publish();
+            return true;
+        }
+        let target = target.expect("checked target");
+        let port = port.expect("checked port");
+        let control = crate::SmsDeleteControl::new(self.sms_delete_timeout);
+        let worker_control = control.clone();
+        let worker_fragment = fragment.clone();
+        let (sender, receiver) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("dji4g-sms-delete".into())
+            .spawn(move || {
+                let receipt = poll_ready(
+                    port.delete_checked(&target, &worker_fragment, worker_control.clone()),
+                    worker_control.remaining(),
+                    || {
+                        worker_control.cancel();
+                        crate::SmsDeleteReceipt {
+                            result: if worker_control.delete_attempted() {
+                                Result::OutcomeUnknown
+                            } else {
+                                Result::Failed
+                            },
+                            code: Some("sms:delete_timeout".into()),
+                        }
+                    },
+                );
+                let _ = sender.send(receipt);
+            });
+        if spawned.is_err() {
+            self.controller.record_sms_delete_item(
+                pending.request_id,
+                pending.next,
+                crate::SmsDeleteReceipt {
+                    result: Result::Failed,
+                    code: Some("sms:delete_worker_failed".into()),
+                },
+            );
+            self.controller.finish_sms_delete(pending.request_id);
+        } else {
+            pending.in_flight = Some(InFlightSmsDelete {
+                fragment,
+                receiver,
+                control,
+                receipt: None,
+            });
+            self.pending_sms_delete = Some(pending);
+        }
+        self.publish();
         true
     }
 
@@ -622,8 +831,12 @@ impl ControllerRunner {
                 || SmsStageOutcome::timed_out(is_send),
             ))
         });
-        let outcome = match join_stage(receiver, Instant::now() + self.stage_timeout) {
-            Some(Ok(outcome)) => outcome,
+        let outcome = match receiver.recv_timeout(self.stage_timeout) {
+            Ok(Ok(outcome)) => outcome,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.pending_sms_read_cleanup = Some(receiver);
+                SmsStageOutcome::timed_out(is_send)
+            }
             // The watchdog expired or the worker died: the transaction outcome is unknown, so the
             // inbox status records a transport failure. A send additionally records the honest
             // `OutcomeUnknown` store state below; nothing else is mutated.
@@ -645,6 +858,7 @@ impl ControllerRunner {
                 capacity,
                 status,
             } => {
+                self.controller.reconcile_sms_listed_slots(&messages);
                 for message in messages {
                     self.controller.ingest_sms(message);
                 }
@@ -653,13 +867,6 @@ impl ControllerRunner {
             SmsStageOutcome::Read { message } => {
                 self.controller.ingest_sms(message.clone());
                 self.controller.mark_sms_read(&message);
-                self.controller
-                    .record_sms_probe(FeatureStatus::Supported, self.current_sms_capacity());
-            }
-            SmsStageOutcome::Deleted => {
-                if let SmsRequest::Delete { index } = request {
-                    self.controller.confirm_sms_delete(index);
-                }
                 self.controller
                     .record_sms_probe(FeatureStatus::Supported, self.current_sms_capacity());
             }
@@ -1226,7 +1433,10 @@ impl ControllerRunner {
     }
 
     fn run_refresh(&mut self) {
-        if self.controller.sms_active() {
+        if self.controller.sms_active()
+            || self.controller.sms_delete_active()
+            || self.pending_sms_read_cleanup.is_some()
+        {
             self.refresh_deferred = true;
             return;
         }
@@ -1473,7 +1683,6 @@ enum SmsStageOutcome {
     /// One successfully read message.
     Read { message: SmsMessage },
     /// One successfully deleted message (the module returned the final `OK`).
-    Deleted,
     /// One send attempt whose store status and feature verdict were already derived on the
     /// worker. The runner only records the outgoing entry and the probe.
     SendOutcome {
@@ -1606,10 +1815,9 @@ fn run_sms_port_call<'a>(
                 Ok(message) => SmsStageOutcome::Read { message },
                 Err(error) => SmsStageOutcome::Failed(error),
             },
-            SmsRequest::Delete { index } => match port.delete(target, index).await {
-                Ok(()) => SmsStageOutcome::Deleted,
-                Err(error) => SmsStageOutcome::Failed(error),
-            },
+            SmsRequest::Delete { .. } => {
+                unreachable!("checked deletion owns its controlled worker")
+            }
             SmsRequest::Send { .. } => unreachable!("send owns its dedicated controlled worker"),
         }
     })

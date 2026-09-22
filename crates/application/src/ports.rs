@@ -482,6 +482,22 @@ pub trait SmsPort: Send + Sync {
     /// Delete one stored message (`AT+CMGD=<index>`); the final `OK` is the success proof.
     fn delete(&self, target: &TargetContext, index: u32) -> PortFuture<'_, Result<(), PortError>>;
 
+    /// Checked deletion never falls back to the legacy index-only boundary.
+    fn delete_checked(
+        &self,
+        target: &TargetContext,
+        fragment: &dji4g_domain::SmsFragmentKey,
+        control: dji4g_domain::SmsDeleteControl,
+    ) -> PortFuture<'_, dji4g_domain::SmsDeleteReceipt> {
+        let _ = (target, fragment, control);
+        Box::pin(async {
+            dji4g_domain::SmsDeleteReceipt {
+                result: dji4g_domain::SmsDeleteItemResult::Failed,
+                code: Some("sms:checked_delete_unavailable".into()),
+            }
+        })
+    }
+
     /// Submit one user-confirmed message; the port owns PDU preflight and one CMGS transaction.
     ///
     /// The UI owns the single per-send consent: the application only reaches this call after the

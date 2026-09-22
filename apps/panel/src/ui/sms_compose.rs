@@ -17,6 +17,15 @@ struct Pending {
     context_changed: bool,
 }
 
+/// Content-free result of starting a reply; existing drafts require an explicit decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReplyStartResult {
+    Opened,
+    ReplacementConfirmation,
+    InvalidRecipient,
+    Busy,
+}
+
 #[derive(Default)]
 pub(crate) struct SmsComposeState {
     pub open: bool,
@@ -28,13 +37,57 @@ pub(crate) struct SmsComposeState {
     pub refresh_error: Option<String>,
     last_refresh_attempt: Option<std::time::Instant>,
     last_visible: Option<std::time::Instant>,
-    pub selected: Option<(bool, u32)>,
+    pub selected: Option<[u8; 32]>,
+    pub serial_busy: bool,
+    reply_recipient: Option<String>,
     pub error: Option<String>,
     last_feedback: u64,
     context: Option<(Option<dji4g_domain::DeviceEpoch>, u64)>,
 }
 
 impl SmsComposeState {
+    pub(super) fn begin_reply(&mut self, recipient: &str) -> ReplyStartResult {
+        if self.serial_busy || self.pending.is_some() || self.confirmation.is_some() {
+            self.error = Some("当前任务或发送确认尚未结束，草稿已保留。".into());
+            return ReplyStartResult::Busy;
+        }
+        if dji4g_at_protocol::validate_sms_recipient(recipient).is_err() {
+            self.error =
+                Some("此发件人不是受支持的短信号码，无法直接回复。原号码未被修改。".into());
+            return ReplyStartResult::InvalidRecipient;
+        }
+        self.error = None;
+        if !self.draft.recipient.is_empty() || !self.draft.body.is_empty() {
+            self.reply_recipient = Some(recipient.to_owned());
+            ReplyStartResult::ReplacementConfirmation
+        } else {
+            self.draft = Draft {
+                recipient: recipient.to_owned(),
+                body: String::new(),
+            };
+            self.open = true;
+            ReplyStartResult::Opened
+        }
+    }
+
+    fn resolve_reply(&mut self, replace: bool) {
+        let Some(recipient) = self.reply_recipient.take() else {
+            return;
+        };
+        if replace && !self.serial_busy && self.pending.is_none() && self.confirmation.is_none() {
+            self.draft = Draft {
+                recipient,
+                body: String::new(),
+            };
+            self.open = true;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn review_reply_replace(&mut self) {
+        self.review_editor();
+        self.begin_reply("+8613900000000");
+    }
     /// Debug-only visual fixture. This only opens a confirmation; it never dispatches a command.
     #[cfg(debug_assertions)]
     pub(crate) fn review_confirmation(&mut self) {
@@ -148,6 +201,7 @@ impl SmsComposeState {
     fn observe_context(&mut self, context: (Option<dji4g_domain::DeviceEpoch>, u64)) {
         if self.context.is_some_and(|old| old != context) {
             self.confirmation = None;
+            self.reply_recipient = None;
             self.selected = None;
             self.last_refresh_attempt = None;
             if let Some(pending) = &mut self.pending {
@@ -194,8 +248,10 @@ pub(super) fn render(
     if let Some(feedback) = &controller.feedback {
         state.observe_rejection(feedback.seq, feedback.code.stable.as_str());
     }
-    let busy =
-        state.pending.is_some() || snapshot.is_some_and(|s| s.phase != SmsSendPhase::Finished);
+    state.serial_busy = controller.serial_work_busy;
+    let busy = state.serial_busy
+        || state.pending.is_some()
+        || snapshot.is_some_and(|s| s.phase != SmsSendPhase::Finished);
     if let Some(snapshot) = snapshot {
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(0xf3, 0xf5, 0xfc))
@@ -215,12 +271,12 @@ pub(super) fn render(
                     },
                 };
                 ui.horizontal_wrapped(|ui| {
-                    let tone = if snapshot.result == Some(SmsSendResult::Failed) {
-                        super::StatusTone::Negative
-                    } else {
-                        super::StatusTone::Progress
-                    };
-                    ui.label(egui::RichText::new(text).color(tone.color()).strong());
+                    let tone = send_result_tone(snapshot);
+                    ui.label(
+                        egui::RichText::new(format!("{} {text}", tone.marker()))
+                            .color(tone.color())
+                            .strong(),
+                    );
                     if let Some(failure) = &snapshot.failure {
                         if let Some(code) = failure.cms_code {
                             ui.label(crate::ui::meta_text(format!("CMS {code}")));
@@ -296,7 +352,8 @@ pub(super) fn render(
                         });
                         ui.add_space(18.0);
                         ui.label(egui::RichText::new("收件人").strong());
-                        let recipient = ui.add(
+                        let recipient = ui.add_enabled(
+                            !busy,
                             egui::TextEdit::singleline(&mut state.draft.recipient)
                                 .hint_text("+86 手机号码")
                                 .desired_width(f32::INFINITY)
@@ -318,7 +375,8 @@ pub(super) fn render(
                                 },
                             );
                         });
-                        let body = ui.add(
+                        let body = ui.add_enabled(
+                            !busy,
                             egui::TextEdit::multiline(&mut state.draft.body)
                                 .hint_text("在这里输入短信内容…")
                                 .desired_width(f32::INFINITY)
@@ -405,6 +463,42 @@ pub(super) fn render(
             state.confirmation = None;
         }
     }
+    if state.reply_recipient.is_some() {
+        let mut open = true;
+        egui::Window::new("保留当前草稿？")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label("已有未发送草稿。默认保留；替换后将只填写回复号码，正文为空。");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("保留草稿").clicked() {
+                        state.resolve_reply(false);
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("替换为回复草稿"))
+                        .clicked()
+                    {
+                        state.resolve_reply(true);
+                    }
+                });
+            });
+        if !open {
+            state.resolve_reply(false);
+        }
+    }
+}
+
+fn send_result_tone(snapshot: &SmsSendSnapshot) -> super::StatusTone {
+    if snapshot.phase != SmsSendPhase::Finished {
+        return super::StatusTone::Progress;
+    }
+    match snapshot.result {
+        Some(SmsSendResult::Submitted) => super::StatusTone::Positive,
+        Some(SmsSendResult::Failed) => super::StatusTone::Negative,
+        Some(SmsSendResult::OutcomeUnknown) | None => super::StatusTone::Caution,
+    }
 }
 
 fn submission_notice(
@@ -472,6 +566,158 @@ fn failure_advice(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replying_only_prefills_the_original_recipient() {
+        let mut state = SmsComposeState::default();
+        assert_eq!(
+            state.begin_reply("+8613800138000"),
+            ReplyStartResult::Opened
+        );
+        assert_eq!(state.draft.recipient, "+8613800138000");
+        assert!(state.draft.body.is_empty());
+        assert!(state.open);
+        assert!(state.confirmation.is_none());
+        assert!(state.pending.is_none());
+    }
+    #[test]
+    fn existing_draft_is_kept_until_explicit_replacement() {
+        let mut state = ready();
+        state.confirmation = None;
+        let original = state.draft.clone();
+        assert_eq!(
+            state.begin_reply("+8613900000000"),
+            ReplyStartResult::ReplacementConfirmation
+        );
+        assert!(state.draft == original);
+        state.resolve_reply(false);
+        assert!(state.draft == original);
+        state.begin_reply("+8613900000000");
+        state.resolve_reply(true);
+        assert_eq!(state.draft.recipient, "+8613900000000");
+        assert!(state.draft.body.is_empty());
+    }
+    #[test]
+    fn invalid_sender_and_busy_or_frozen_send_cannot_replace_draft() {
+        let mut state = ready();
+        let original = state.draft.clone();
+        assert_eq!(state.begin_reply("+8613900000000"), ReplyStartResult::Busy);
+        assert!(state.draft == original);
+        assert!(state.confirmation.is_some());
+        state.confirmation = None;
+        assert_eq!(
+            state.begin_reply("BANK"),
+            ReplyStartResult::InvalidRecipient
+        );
+        assert!(state.reply_recipient.is_none());
+        state.serial_busy = true;
+        assert_eq!(state.begin_reply("+8613900000000"), ReplyStartResult::Busy);
+        assert!(state.reply_recipient.is_none());
+        assert!(state.draft == original);
+    }
+
+    #[test]
+    fn service_and_national_numbers_are_not_normalized_into_reply_recipients() {
+        for recipient in [
+            "10086",
+            "10690000",
+            "13800138000",
+            "BANK",
+            " +8613800138000",
+        ] {
+            let mut state = SmsComposeState::default();
+            assert_eq!(
+                state.begin_reply(recipient),
+                ReplyStartResult::InvalidRecipient
+            );
+            assert!(state.draft.recipient.is_empty());
+            assert!(state.reply_recipient.is_none());
+            assert!(!state.open);
+        }
+    }
+
+    #[test]
+    fn device_or_sim_change_clears_waiting_reply_replacement_and_preserves_draft() {
+        for next in [
+            (Some(dji4g_domain::DeviceEpoch(2)), 0),
+            (Some(dji4g_domain::DeviceEpoch(1)), 1),
+        ] {
+            let mut state = ready();
+            state.confirmation = None;
+            state.observe_context((Some(dji4g_domain::DeviceEpoch(1)), 0));
+            let original = state.draft.clone();
+            assert_eq!(
+                state.begin_reply("+8613900000000"),
+                ReplyStartResult::ReplacementConfirmation
+            );
+            state.observe_context(next);
+            assert!(state.reply_recipient.is_none());
+            state.resolve_reply(true);
+            assert!(state.draft == original);
+            assert!(state.confirmation.is_none());
+        }
+    }
+
+    #[test]
+    fn replaced_reply_sends_only_the_exact_frozen_recipient_and_body() {
+        struct Capture(std::sync::Mutex<Vec<(String, String)>>);
+        impl UiCommandSink for Capture {
+            fn try_send(&self, command: UiCommand) -> Result<(), UiSendError> {
+                if let UiCommand::SmsSend { recipient, body } = command {
+                    self.0.lock().unwrap().push((recipient, body));
+                }
+                Ok(())
+            }
+        }
+        let sink = Capture(std::sync::Mutex::new(Vec::new()));
+        for changed_field in [None, Some("recipient"), Some("body")] {
+            let mut state = ready();
+            state.confirmation = None;
+            assert_eq!(
+                state.begin_reply("+8613900000000"),
+                ReplyStartResult::ReplacementConfirmation
+            );
+            state.resolve_reply(true);
+            state.draft.body = "明确确认的回复".into();
+            state.confirmation = Some(state.draft.clone());
+            match changed_field {
+                Some("recipient") => state.draft.recipient = "+8613700000000".into(),
+                Some("body") => state.draft.body.push('新'),
+                _ => {}
+            }
+            state.confirm(&sink, None);
+            if changed_field.is_none() {
+                assert_eq!(state.begin_reply("+8613600000000"), ReplyStartResult::Busy);
+            } else {
+                assert!(state.pending.is_none());
+            }
+        }
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![("+8613900000000".to_owned(), "明确确认的回复".to_owned())]
+        );
+    }
+    #[test]
+    fn sending_and_three_results_have_distinct_tones() {
+        assert_eq!(
+            send_result_tone(&done(1, SmsSendResult::Submitted)),
+            super::super::StatusTone::Positive
+        );
+        assert_eq!(
+            send_result_tone(&done(1, SmsSendResult::Failed)),
+            super::super::StatusTone::Negative
+        );
+        assert_eq!(
+            send_result_tone(&done(1, SmsSendResult::OutcomeUnknown)),
+            super::super::StatusTone::Caution
+        );
+        let mut sending = done(1, SmsSendResult::Submitted);
+        sending.phase = SmsSendPhase::WaitingForResult;
+        sending.result = None;
+        assert_eq!(
+            send_result_tone(&sending),
+            super::super::StatusTone::Progress
+        );
+    }
     #[test]
     fn explicit_module_rejection_overrides_body_write_uncertainty_in_notice() {
         let failure = dji4g_application::SmsFailureDetail::new(
@@ -669,7 +915,7 @@ mod tests {
         let sink = RefreshSink(std::sync::atomic::AtomicUsize::new(0));
         let now = std::time::Instant::now();
         let mut state = ready();
-        state.selected = Some((false, 7));
+        state.selected = Some([7; 32]);
         let draft = state.draft.clone();
         state.auto_refresh(now, false, false, false, &sink);
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -683,6 +929,6 @@ mod tests {
         state.auto_refresh(later, true, false, false, &sink);
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(state.draft == draft);
-        assert_eq!(state.selected, Some((false, 7)));
+        assert_eq!(state.selected, Some([7; 32]));
     }
 }

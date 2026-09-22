@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use dji4g_domain::{SmsEncoding, SmsMultipartInfo};
+use dji4g_domain::{SmsConcatReference, SmsEncoding, SmsMultipartInfo};
 
 /// Maximum accepted hex input length for one PDU.
 const MAX_PDU_HEX_CHARS: usize = 4096;
@@ -135,6 +135,13 @@ pub fn decode_deliver_pdu(hex: &str) -> Result<DecodedSms, SmsPduError> {
 /// report). Recipients are explicit international numbers only; the body is BMP only and must
 /// fit 140 user-data octets.
 pub fn build_ucs2_submit(recipient: &str, text: &str) -> Result<EncodedSubmit, SmsPduError> {
+    validate_sms_recipient(recipient)?;
+    let digits = &recipient[1..];
+    build_ucs2_submit_validated(digits, text)
+}
+
+/// Validate an explicit international recipient without guessing or normalizing its prefix.
+pub fn validate_sms_recipient(recipient: &str) -> Result<(), SmsPduError> {
     let digits = recipient.strip_prefix('+').ok_or(SmsPduError::Number)?;
     if digits.is_empty()
         || digits.len() > MAX_RECIPIENT_DIGITS
@@ -143,6 +150,10 @@ pub fn build_ucs2_submit(recipient: &str, text: &str) -> Result<EncodedSubmit, S
     {
         return Err(SmsPduError::Number);
     }
+    Ok(())
+}
+
+fn build_ucs2_submit_validated(digits: &str, text: &str) -> Result<EncodedSubmit, SmsPduError> {
     if text.is_empty() {
         return Err(SmsPduError::Range);
     }
@@ -322,15 +333,21 @@ fn parse_user_data_header(ud: &[u8]) -> Result<(Option<SmsMultipartInfo>, usize)
                 if data.len() != 3 {
                     return Err(SmsPduError::Multipart);
                 }
-                multipart = Some(validate_multipart(data[0], data[1], data[2])?);
+                multipart = Some(validate_multipart(
+                    SmsConcatReference::EightBit(data[0]),
+                    data[1],
+                    data[2],
+                )?);
             }
             0x08 => {
                 if data.len() != 4 {
                     return Err(SmsPduError::Multipart);
                 }
-                // The domain reference is one byte (research §6.2); the low byte of the 16-bit
-                // concatenated reference is the only stable part representable there.
-                multipart = Some(validate_multipart(data[1], data[2], data[3])?);
+                multipart = Some(validate_multipart(
+                    SmsConcatReference::SixteenBit(u16::from_be_bytes([data[0], data[1]])),
+                    data[2],
+                    data[3],
+                )?);
             }
             _ => {}
         }
@@ -340,7 +357,7 @@ fn parse_user_data_header(ud: &[u8]) -> Result<(Option<SmsMultipartInfo>, usize)
 }
 
 fn validate_multipart(
-    reference: u8,
+    reference: SmsConcatReference,
     total: u8,
     sequence: u8,
 ) -> Result<SmsMultipartInfo, SmsPduError> {
@@ -474,6 +491,41 @@ fn gsm7_escape(septet: u8) -> char {
 mod tests {
     use super::*;
 
+    #[test]
+    fn distinct_sixteen_bit_references_with_equal_low_bytes_stay_distinct() {
+        let first =
+            decode_deliver_pdu("00440B912120550521F30000421020304050230A06080412340202EF35")
+                .unwrap();
+        let second =
+            decode_deliver_pdu("00440B912120550521F30000421020304050230A06080456340202EF35")
+                .unwrap();
+        assert_ne!(first.multipart, second.multipart);
+    }
+
+    #[test]
+    fn standalone_recipient_validation_matches_submit_and_never_normalizes() {
+        for recipient in [
+            "+12025550123",
+            "+8613800138000",
+            "+1",
+            "+123456789012345",
+            "10690000",
+            "13800138000",
+            "+0123",
+            "+1234567890123456",
+            " +123",
+            "+123\rAT",
+            "+１２３",
+            "SERVICE",
+            "",
+        ] {
+            assert_eq!(
+                validate_sms_recipient(recipient).is_ok(),
+                build_ucs2_submit(recipient, "test").is_ok()
+            );
+        }
+    }
+
     // SMSC 00, DELIVER|MMS, sender +12025550123 (TOA 0x91), PID 00, DCS 00,
     // SCTS 24-01-02 03:04:05 +32, UDL 05, "hello" packed as septets.
     const GSM7_HELLO: &str = "00040B912120550521F300004210203040502305E8329BFD06";
@@ -579,7 +631,7 @@ mod tests {
         assert_eq!(
             decoded.multipart,
             Some(SmsMultipartInfo {
-                reference: 5,
+                reference: SmsConcatReference::EightBit(5),
                 total: 2,
                 sequence: 1,
             })
@@ -587,13 +639,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_deliver_gsm7_multipart_uses_16bit_reference_low_byte() {
+    fn decode_deliver_gsm7_multipart_preserves_full_16bit_reference() {
         let decoded = decode_deliver_pdu(GSM7_MULTIPART_16BIT_REF).expect("16-bit ref decodes");
         assert_eq!(decoded.body, "ok");
         assert_eq!(
             decoded.multipart,
             Some(SmsMultipartInfo {
-                reference: 0x34,
+                reference: SmsConcatReference::SixteenBit(0x1234),
                 total: 2,
                 sequence: 2,
             })
@@ -608,7 +660,7 @@ mod tests {
         assert_eq!(
             decoded.multipart,
             Some(SmsMultipartInfo {
-                reference: 7,
+                reference: SmsConcatReference::EightBit(7),
                 total: 2,
                 sequence: 1,
             })

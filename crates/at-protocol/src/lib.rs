@@ -23,7 +23,10 @@ pub use parser::{
 };
 pub use pdp::{PdpParseError, parse_pdp_contexts, parse_pdp_contexts_with_activity};
 pub use redact::{redact_at_text, redact_at_transaction_line};
-pub use sms_pdu::{DecodedSms, EncodedSubmit, SmsPduError, build_ucs2_submit, decode_deliver_pdu};
+pub use sms_pdu::{
+    DecodedSms, EncodedSubmit, SmsPduError, build_ucs2_submit, decode_deliver_pdu,
+    validate_sms_recipient,
+};
 pub use tool_command::{
     MAX_TOOL_LINE_BYTES, ToolInputError, ToolReadId, ToolWriteId, ValidatedToolLine,
     classify_known_write, classify_read, typed_read,

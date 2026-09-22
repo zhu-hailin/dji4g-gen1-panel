@@ -82,6 +82,8 @@ fn controller_snapshot(app: AppSnapshot) -> ControllerSnapshot {
         sms_inbox: Default::default(),
         sms_messages: Vec::new(),
         sms_send: None,
+        sms_delete: None,
+        serial_work_busy: false,
         sms_refresh_pending: false,
         sms_inbox_failure: None,
         device_tools: Default::default(),
@@ -564,6 +566,7 @@ fn running_operation_disables_repair_actions_until_finished() {
         "the ready fixture has a device"
     );
 
+    snapshot.serial_work_busy = true;
     snapshot.operation = Some(OperationUiSnapshot {
         operation_id: 1,
         action: ActionKindTag::ToggleHotspot { enabled: true },
@@ -591,6 +594,7 @@ fn running_operation_disables_repair_actions_until_finished() {
     });
     // A finished operation restores exactly the baseline enablement (some actions carry extra
     // per-action gates, so the baseline comparison is the honest invariant).
+    snapshot.serial_work_busy = false;
     let mut baseline_snapshot = ReducerState::test_ready(now()).snapshot();
     baseline_snapshot.operation = None;
     let baseline = repairs_vm(&baseline_snapshot, now(), Language::ZhCn);

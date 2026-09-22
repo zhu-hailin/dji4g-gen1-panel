@@ -53,7 +53,6 @@ pub struct DeviceToolsState {
     point_to_expert: bool,
     apn_cid: String,
     apn_value: String,
-    hide_history: bool,
     error: Option<String>,
     notice: Option<String>,
     context: Option<(DeviceEpoch, u64)>,
@@ -77,7 +76,6 @@ impl DeviceToolsState {
         self.apn_value.clear();
         self.error = None;
         self.notice = None;
-        self.hide_history = false;
     }
 
     /// Debug-only tab selector for the screenshot harness; it never changes any other state.
@@ -368,7 +366,8 @@ pub(crate) fn render(
     let device_present = snapshot.app.device.is_some();
     // A tool task and a repair operation share the serial actor, so both disable every write
     // button while the tab row itself stays usable.
-    let busy = tools.busy()
+    let busy = snapshot.serial_work_busy
+        || tools.busy()
         || snapshot.operation.as_ref().is_some_and(|operation| {
             matches!(
                 operation.state,
@@ -391,11 +390,11 @@ pub(crate) fn render(
     match state.tab {
         ToolTab::Preset => render_preset(ui, snapshot, sink, state, now, language, can_act),
         ToolTab::Query => render_query(ui, tools, sink, state, can_act),
-        ToolTab::Expert => render_expert(ui, tools, sink, state, can_act),
+        ToolTab::Expert => render_expert(ui, snapshot, sink, state, can_act, language),
     }
     render_feedback(ui, state);
     ui.add_space(14.0);
-    render_history(ui, tools, state);
+    render_history(ui, tools, state, sink);
 }
 
 /// Current target: identity, AT port and device/SIM epoch. Nothing here is rendered from a
@@ -574,9 +573,9 @@ fn render_preset(
     let tools = &snapshot.device_tools;
     let profile = &tools.profile;
     render_profile_section(ui, tools, sink, state, now, language, can_act);
-    render_capability_section(ui, tools, now, language);
+    render_capability_section(ui, tools, now, language, sink, state, can_act);
     render_connection_section(ui, profile);
-    render_controlled_actions(ui, snapshot, profile, sink, state, can_act);
+    render_controlled_actions(ui, snapshot, profile, sink, state, now, language);
 }
 
 fn render_profile_section(
@@ -654,6 +653,9 @@ fn render_capability_section(
     tools: &DeviceToolsSnapshot,
     now: SystemTime,
     language: Language,
+    sink: &dyn crate::app::PanelCommandSink,
+    state: &mut DeviceToolsState,
+    can_act: bool,
 ) {
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -662,9 +664,16 @@ fn render_capability_section(
         });
         for id in ToolReadId::ALL {
             let row = tools.capability(id);
-            let (status_text, tone) = row.map_or(("未查询", StatusTone::Neutral), |row| {
-                feature_status_text(row.status)
+            let querying = tools.task.as_ref().is_some_and(|task| {
+                task.phase.is_active() && task.operation == ToolOperationKind::Read(id)
             });
+            let (status_text, tone) = if querying {
+                ("本项查询中", StatusTone::Progress)
+            } else {
+                row.map_or(("未查询", StatusTone::Neutral), |row| {
+                    feature_status_text(row.status)
+                })
+            };
             egui::CollapsingHeader::new(
                 RichText::new(format!(
                     "{}    {} {}",
@@ -675,33 +684,54 @@ fn render_capability_section(
                 .color(tone.color()),
             )
             .id_salt(("device-tools-capability", id.key()))
-            .show(ui, |ui| match row {
-                Some(row) => {
-                    wrapped_label(
-                        ui,
-                        detail_text(format!(
-                            "原因：{}（{}）",
-                            tool_outcome_text(row.reason),
-                            row.reason.code()
-                        )),
-                    );
-                    wrapped_label(
-                        ui,
-                        detail_text(format!(
-                            "采集：{} · 设备代次 {} · SIM 会话 {}",
-                            observed_time_text(Some(row.observed_at), now, language),
-                            row.context.device_epoch.0,
-                            row.context.sim_epoch
-                        )),
-                    );
-                    if id == ToolReadId::SmsStorage
-                        && matches!(row.status, FeatureStatus::Supported | FeatureStatus::Empty)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            can_act,
+                            egui::Button::new(if row.is_some() {
+                                "重新查询此项"
+                            } else {
+                                "查询此项"
+                            }),
+                        )
+                        .clicked()
                     {
-                        wrapped_label(ui, meta_text("存储查询可用不代表模块支持发送短信。"));
+                        send_tool_command(sink, state, UiCommand::RunToolRead { id });
                     }
-                }
-                None => {
-                    wrapped_label(ui, meta_text("尚未执行此查询。"));
+                    if querying {
+                        ui.spinner();
+                        ui.label(meta_text("本项查询中；下方保留上次结果与采集时间"));
+                    }
+                });
+                match row {
+                    Some(row) => {
+                        wrapped_label(
+                            ui,
+                            detail_text(format!(
+                                "原因：{}（{}）",
+                                tool_outcome_text(row.reason),
+                                row.reason.code()
+                            )),
+                        );
+                        wrapped_label(
+                            ui,
+                            detail_text(format!(
+                                "采集：{} · 设备代次 {} · SIM 会话 {}",
+                                observed_time_text(Some(row.observed_at), now, language),
+                                row.context.device_epoch.0,
+                                row.context.sim_epoch
+                            )),
+                        );
+                        if id == ToolReadId::SmsStorage
+                            && matches!(row.status, FeatureStatus::Supported | FeatureStatus::Empty)
+                        {
+                            wrapped_label(ui, meta_text("存储查询可用不代表模块支持发送短信。"));
+                        }
+                    }
+                    None => {
+                        wrapped_label(ui, meta_text("尚未执行此查询。"));
+                    }
                 }
             });
             ui.separator();
@@ -767,8 +797,28 @@ fn render_controlled_actions(
     profile: &dji4g_application::ModuleProfile,
     sink: &dyn crate::app::PanelCommandSink,
     state: &mut DeviceToolsState,
-    can_act: bool,
+    now: SystemTime,
+    language: Language,
 ) {
+    use dji4g_application::ActionReadinessKey as Key;
+    let apn = super::action_availability::repair_action_availability(
+        snapshot,
+        Key::EditApn,
+        now,
+        language,
+    );
+    let usb = super::action_availability::repair_action_availability(
+        snapshot,
+        Key::SetUsbNetworkProfile,
+        now,
+        language,
+    );
+    let restart = super::action_availability::repair_action_availability(
+        snapshot,
+        Key::RestartModule,
+        now,
+        language,
+    );
     section_frame(ui, |ui| {
         ui.label(section_heading("受控操作"));
         wrapped_label(
@@ -794,7 +844,7 @@ fn render_controlled_actions(
             );
             let filled = !state.apn_cid.trim().is_empty() && !state.apn_value.trim().is_empty();
             if ui
-                .add_enabled(can_act && filled, egui::Button::new("修改 APN"))
+                .add_enabled(apn.enabled && filled, egui::Button::new("修改 APN"))
                 .clicked()
             {
                 state.notice = None;
@@ -822,8 +872,8 @@ fn render_controlled_actions(
                 }
             }
         });
-        if snapshot.app.device.is_none() {
-            wrapped_label(ui, meta_text("未检测到设备，受控操作已禁用。"));
+        if let Some(reason) = &apn.reason {
+            wrapped_label(ui, meta_text(&reason.text));
         }
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
@@ -837,7 +887,7 @@ fn render_controlled_actions(
                     ui.label(meta_text(usb_profile_text(current)));
                     if ui
                         .add_enabled(
-                            can_act,
+                            usb.enabled,
                             egui::Button::new(format!("切换为{}", usb_profile_text(target))),
                         )
                         .on_hover_text("通过受控修复流程切换；会重枚举模块")
@@ -861,10 +911,13 @@ fn render_controlled_actions(
                 }
             }
         });
+        if let Some(reason) = &usb.reason {
+            wrapped_label(ui, meta_text(&reason.text));
+        }
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(can_act, egui::Button::new("重启模块"))
+                .add_enabled(restart.enabled, egui::Button::new("重启模块"))
                 .on_hover_text("AT+CFUN=1,1；会中断当前连接")
                 .clicked()
             {
@@ -873,6 +926,9 @@ fn render_controlled_actions(
             }
             ui.label(meta_text("重启会暂时中断模块连接。"));
         });
+        if let Some(reason) = &restart.reason {
+            wrapped_label(ui, meta_text(&reason.text));
+        }
     });
 }
 
@@ -983,11 +1039,13 @@ fn run_query(sink: &dyn crate::app::PanelCommandSink, state: &mut DeviceToolsSta
 
 fn render_expert(
     ui: &mut Ui,
-    tools: &DeviceToolsSnapshot,
+    snapshot: &ControllerSnapshot,
     sink: &dyn crate::app::PanelCommandSink,
     state: &mut DeviceToolsState,
     can_act: bool,
+    language: Language,
 ) {
+    let tools = &snapshot.device_tools;
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(section_heading("专家终端"));
@@ -1014,10 +1072,31 @@ fn render_expert(
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace),
             );
+            let write_availability = ValidatedToolLine::parse(state.expert_input.trim())
+                .ok()
+                .and_then(|line| classify_known_write(&line))
+                .map(|write| {
+                    use dji4g_application::ActionReadinessKey as Key;
+                    let key = match write {
+                        ToolWriteId::RestartModule => Key::RestartModule,
+                        ToolWriteId::SetUsbNetProfile(_) => Key::SetUsbNetworkProfile,
+                        ToolWriteId::SetApn { .. } => Key::EditApn,
+                    };
+                    super::action_availability::repair_action_availability(
+                        snapshot,
+                        key,
+                        SystemTime::now(),
+                        language,
+                    )
+                });
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
-                        can_act && !state.expert_input.trim().is_empty(),
+                        can_act
+                            && write_availability
+                                .as_ref()
+                                .is_none_or(|value| value.enabled)
+                            && !state.expert_input.trim().is_empty(),
                         egui::Button::new("执行"),
                     )
                     .clicked()
@@ -1030,6 +1109,9 @@ fn render_expert(
                     state.notice = None;
                 }
             });
+            if let Some(reason) = write_availability.and_then(|value| value.reason) {
+                wrapped_label(ui, meta_text(reason.text));
+            }
         } else {
             wrapped_label(
                 ui,
@@ -1153,7 +1235,12 @@ fn render_feedback(ui: &mut Ui, state: &DeviceToolsState) {
 // Terminal output
 // ---------------------------------------------------------------------------------------------
 
-fn render_history(ui: &mut Ui, tools: &DeviceToolsSnapshot, state: &mut DeviceToolsState) {
+fn render_history(
+    ui: &mut Ui,
+    tools: &DeviceToolsSnapshot,
+    state: &mut DeviceToolsState,
+    sink: &dyn crate::app::PanelCommandSink,
+) {
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(section_heading("终端输出"));
@@ -1176,28 +1263,16 @@ fn render_history(ui: &mut Ui, tools: &DeviceToolsSnapshot, state: &mut DeviceTo
             }
             if ui
                 .add_enabled(!tools.history.is_empty(), egui::Button::new("清空"))
+                .on_hover_text("清空现有内存记录；正在运行的任务完成后仍可能产生新记录。")
                 .clicked()
             {
-                // UI-local hide: the panel has no clear-history command, so the bounded
-                // application-side history is left untouched and only its display is hidden.
-                state.hide_history = true;
+                send_tool_command(sink, state, UiCommand::ClearToolHistory);
             }
         });
         wrapped_label(
             ui,
             meta_text("「复制原始响应」可能包含设备或账户信息，请谨慎粘贴分享。"),
         );
-        if state.hide_history {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(meta_text(
-                    "终端输出已隐藏（仅隐藏本地显示，不影响模块状态）。",
-                ));
-                if ui.button("恢复显示").clicked() {
-                    state.hide_history = false;
-                }
-            });
-            return;
-        }
         if tools.history.is_empty() {
             wrapped_label(ui, meta_text("暂无任务记录；运行任意查询后在此查看响应。"));
             return;
@@ -1213,6 +1288,15 @@ fn render_history(ui: &mut Ui, tools: &DeviceToolsSnapshot, state: &mut DeviceTo
                 }
             });
     });
+}
+
+fn send_tool_command(
+    sink: &dyn crate::app::PanelCommandSink,
+    state: &mut DeviceToolsState,
+    command: UiCommand,
+) {
+    state.notice = None;
+    state.error = sink.try_send(command).err().map(send_error_text);
 }
 
 fn render_history_entry(ui: &mut Ui, entry: &ToolHistoryEntry) {
@@ -1507,6 +1591,49 @@ mod tests {
     struct RecordingSink {
         sent: std::sync::Mutex<Vec<UiCommand>>,
         repairs: std::sync::Mutex<Vec<ControlledRepairRequest>>,
+    }
+
+    #[test]
+    fn capability_retry_sends_only_that_read_and_clear_is_a_real_command() {
+        let sink = RecordingSink::default();
+        let mut state = DeviceToolsState::default();
+        send_tool_command(
+            &sink,
+            &mut state,
+            UiCommand::RunToolRead {
+                id: ToolReadId::Temperature,
+            },
+        );
+        send_tool_command(&sink, &mut state, UiCommand::ClearToolHistory);
+        assert!(matches!(
+            sink.sent.lock().unwrap().as_slice(),
+            [
+                UiCommand::RunToolRead {
+                    id: ToolReadId::Temperature
+                },
+                UiCommand::ClearToolHistory
+            ]
+        ));
+        assert!(sink.repairs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejected_clear_reports_error_without_claiming_the_history_was_cleared() {
+        struct Full;
+        impl crate::app::PanelCommandSink for Full {
+            fn try_send(&self, _: UiCommand) -> Result<(), UiSendError> {
+                Err(UiSendError::QueueFull)
+            }
+            fn prepare_repair_now(&self, _: ControlledRepairRequest) {}
+            fn prepare_action_now(&self, _: dji4g_application::ActionRequest) {}
+        }
+        let mut state = DeviceToolsState {
+            notice: Some("上次提示".into()),
+            ..Default::default()
+        };
+        send_tool_command(&Full, &mut state, UiCommand::ClearToolHistory);
+        assert!(state.notice.is_none());
+        assert!(state.error.as_deref().unwrap().contains("队列"));
     }
 
     impl crate::app::PanelCommandSink for RecordingSink {

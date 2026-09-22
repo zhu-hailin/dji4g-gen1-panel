@@ -2,7 +2,7 @@
 //! column, the live rate section on the right, then the Windows network facts and the hotspot
 //! control across the full width.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use dji4g_application::{AdapterMetrics, ControllerSnapshot, UiCommand};
 use dji4g_domain::{ActionKind, NumberLookup, Timeline};
@@ -499,17 +499,14 @@ fn preview_values(values: &[String]) -> String {
     }
 }
 
-pub(crate) fn render(
+pub(crate) fn render_summary(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
     language: Language,
-    sink: &dyn PanelCommandSink,
-    rate_history: &crate::ui::RateHistory,
-    temperature_history: &crate::ui::TemperatureHistory,
     probes: Option<&FeatureProbeView>,
-) {
+) -> Option<crate::app::Page> {
+    let mut destination = None;
     let vm = overview_vm_with_probes(snapshot, language, probes);
-    let cellular = snapshot.app.cellular.as_ref();
     ui.heading("概览");
     let availability = super::availability_vm(
         &snapshot.app,
@@ -529,68 +526,113 @@ pub(crate) fn render(
             }
         });
         wrapped_label(ui, &availability.reason.text);
-        ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            let diagnostics = super::diagnostics_vm(snapshot, language);
-            for id in [
-                dji4g_application::DiagnosticCheckId::UsbDevice,
-                dji4g_application::DiagnosticCheckId::Cellular,
-                dji4g_application::DiagnosticCheckId::BoundPublic,
-            ] {
-                if let Some(row) = diagnostics.rows.iter().find(|row| row.id == id) {
-                    ui.label(
-                        RichText::new(format!("{} · {}", row.label.text, row.state.label.text))
-                            .color(row.state.tone.color()),
-                    );
+        let next = super::driver_setup::next_step_vm(snapshot, std::time::SystemTime::now());
+        if next.state != super::driver_setup::GuideState::Passed {
+            wrapped_label(ui, meta_text(next.text));
+            if let Some(page) = next.destination {
+                if ui
+                    .button(if page == crate::app::Page::Settings {
+                        "打开设置"
+                    } else {
+                        "查看诊断原因"
+                    })
+                    .clicked()
+                {
+                    destination = Some(page);
                 }
             }
-        });
+        }
     });
-    let connection = |ui: &mut Ui| {
-        section_frame(ui, |ui| {
-            ui.label(section_heading("蜂窝网络"));
-            info_grid(ui, "overview-cellular-grid", |ui| {
-                for (label, value) in [
-                    ("运营商", &vm.carrier.text),
-                    ("接入制式", &vm.radio_access_technology.text),
-                    ("信号", &vm.signal.text),
-                    ("注册", &vm.registration.text),
-                    ("SIM", &vm.sim.text),
-                ] {
-                    ui.label(field_label(label));
-                    wrapped_label(ui, value);
-                    ui.end_row();
+    section_frame(ui, |ui| {
+        let values = [
+            ("运营商", vm.carrier.text.clone()),
+            ("信号", vm.signal.text.clone()),
+            (
+                "下行",
+                vm.down_rate
+                    .map(super::format_rate_1dp)
+                    .unwrap_or_else(|| "--".into()),
+            ),
+            (
+                "上行",
+                vm.up_rate
+                    .map(super::format_rate_1dp)
+                    .unwrap_or_else(|| "--".into()),
+            ),
+            ("温度", vm.temperature.text.clone()),
+        ];
+        let count = if ui.available_width() >= 620.0 { 5 } else { 3 };
+        for row in values.chunks(count) {
+            ui.columns(count, |columns| {
+                for (column, (label, value)) in columns.iter_mut().zip(row) {
+                    column.label(meta_text(*label));
+                    wrapped_label(column, RichText::new(value).strong());
+                }
+            });
+        }
+    });
+    destination
+}
+
+pub(crate) fn render(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    language: Language,
+    sink: &dyn PanelCommandSink,
+    rate_history: &crate::ui::RateHistory,
+    temperature_history: &crate::ui::TemperatureHistory,
+    probes: Option<&FeatureProbeView>,
+) -> Option<crate::app::Page> {
+    let mut destination = None;
+    let vm = overview_vm_with_probes(snapshot, language, probes);
+    let cellular = snapshot.app.cellular.as_ref();
+    section_frame(ui, |ui| {
+        let tab_id = egui::Id::new("overview-chart-tab");
+        let mut tab = ui.data(|data| data.get_temp::<u8>(tab_id)).unwrap_or(0);
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut tab, 0, "收发速率");
+            ui.selectable_value(&mut tab, 1, "模块温度");
+        });
+        ui.data_mut(|data| data.insert_temp(tab_id, tab));
+        if tab == 0 {
+            render_rate_section(ui, rate_history, vm.down_rate, vm.up_rate, language);
+        } else {
+            render_temperature_section(
+                ui,
+                &vm,
+                temperature_history,
+                snapshot.app.observed_at,
+                language,
+            );
+        }
+    });
+    egui::CollapsingHeader::new("连接检查与使用引导")
+        .default_open(
+            super::driver_setup::next_step_vm(snapshot, SystemTime::now()).state
+                == super::driver_setup::GuideState::Failed,
+        )
+        .show(ui, |ui| {
+            super::driver_setup::render_guide(ui, snapshot, std::time::SystemTime::now(), language);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("诊断").clicked() {
+                    destination = Some(crate::app::Page::Diagnostics);
+                }
+                if ui.button("驱动与连接修复").clicked() {
+                    destination = Some(crate::app::Page::Repairs);
+                }
+                if ui.button("收发短信").clicked() {
+                    destination = Some(crate::app::Page::Sms);
                 }
             });
         });
-    };
-    let rates = |ui: &mut Ui| {
-        section_frame(ui, |ui| {
-            render_rate_section(ui, rate_history, vm.down_rate, vm.up_rate, language);
-        });
-    };
-    if ui.available_width() >= 800.0 {
-        ui.columns(2, |columns| {
-            connection(&mut columns[0]);
-            rates(&mut columns[1]);
-        });
-    } else {
-        connection(ui);
-        rates(ui);
-    }
-    section_frame(ui, |ui| {
-        render_temperature_section(
-            ui,
-            &vm,
-            temperature_history,
-            snapshot.app.observed_at,
-            language,
-        );
-    });
     section_frame(ui, |ui| {
         egui::CollapsingHeader::new("设备与 SIM 详情").show(ui, |ui| {
             info_grid(ui, "overview-device-details", |ui| {
                 for (label, value) in [
+                    ("运营商", &vm.carrier.text),
+                    ("接入制式", &vm.radio_access_technology.text),
+                    ("注册", &vm.registration.text),
+                    ("SIM", &vm.sim.text),
                     ("型号", &vm.device.text),
                     ("固件", &vm.firmware.text),
                     ("PDP 状态", &vm.pdp.text),
@@ -714,6 +756,7 @@ pub(crate) fn render(
             });
         }
     });
+    destination
 }
 
 /// The 温度 value cell: the reading (or the honest 未读取到) plus its firmware-scope note, the

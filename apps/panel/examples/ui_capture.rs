@@ -169,6 +169,10 @@ mod capture {
     /// The page list for each mode. `pages` walks the whole navigation strip.
     fn screens(mode: &str) -> Vec<Screen> {
         match mode {
+            "onboarding-absent"
+            | "onboarding-healthy"
+            | "onboarding-missing-port"
+            | "onboarding-driver" => vec![Screen::Overview],
             "sms" | "mail" => vec![
                 Screen::SmsList,
                 Screen::SmsDetail,
@@ -177,6 +181,15 @@ mod capture {
                 Screen::SmsCompose,
                 Screen::SmsConfirmation,
             ],
+            "probe-off" | "missing-port" | "missing-sim" | "dns-failed" => vec![Screen::Overview],
+            "send-progress"
+            | "send-submitted"
+            | "send-failed"
+            | "send-unknown"
+            | "delete-partial"
+            | "sms-detail-scrolled" => vec![Screen::SmsDetail],
+            "draft-replace" => vec![Screen::SmsCompose],
+            "single-query" | "single-query-detail" => vec![Screen::ToolsPreset],
             "wireless" => vec![Screen::Wireless],
             "overview" => vec![Screen::Overview],
             "tools" => vec![
@@ -212,7 +225,9 @@ mod capture {
         resized: bool,
         page_started: std::time::Instant,
         requested: bool,
+        detail_clicked: bool,
         screens: Vec<Screen>,
+        mode: String,
         /// Observation cycles already published for the overview review, and the wall clock the
         /// first one is dated from; together they give the temperature trend a real timeline.
         overview_cycles: usize,
@@ -246,6 +261,7 @@ mod capture {
                     ..(*snapshot.app).clone()
                 });
             }
+            apply_extra_fixture(&mut snapshot, &self.mode);
             let _ = self.snapshot_tx.send(Arc::new(snapshot));
         }
 
@@ -259,7 +275,9 @@ mod capture {
         /// reviewed with data in it too.  No device is contacted: the screenshots are evidence
         /// about layout only.
         fn publish_overview_fixture(&mut self) {
-            if !matches!(self.screens[self.page], Screen::Overview) {
+            if !matches!(self.screens[self.page], Screen::Overview)
+                || self.mode.starts_with("onboarding-")
+            {
                 return;
             }
             let cycle = self.overview_cycles;
@@ -319,6 +337,9 @@ mod capture {
                 up_bytes_per_sec: Some(up),
             });
             snapshot.app = Arc::new(app);
+            // Apply the selected scenario after the common chart sample is built. Otherwise
+            // every overview tick replaces fault/settings fixtures with a healthy snapshot.
+            apply_extra_fixture(&mut snapshot, &self.mode);
             let probe = {
                 let cellular = snapshot.app.cellular.as_ref();
                 dji4g_panel::feature_probe::FeatureProbeState {
@@ -362,6 +383,56 @@ mod capture {
     }
 
     impl eframe::App for Capture {
+        fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+            if self.mode == "single-query-detail"
+                && !self.detail_clicked
+                && self.page_started.elapsed() >= Duration::from_millis(900)
+            {
+                self.detail_clicked = true;
+                input.focused = true;
+                let pos = egui::pos2(240.0, 177.0);
+                input.events.push(egui::Event::PointerMoved(pos));
+                for pressed in [true, false] {
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+            }
+            if self.ticks == 8
+                && matches!(
+                    self.mode.as_str(),
+                    "single-query-detail" | "sms-detail-scrolled" | "onboarding-driver"
+                )
+            {
+                // Exercise the real scroll containers with invented input, just as a wheel
+                // would; this never invokes a device command through the no-op sink.
+                input.events.push(egui::Event::PointerMoved(egui::pos2(
+                    self.size.x * 0.75,
+                    self.size.y
+                        - if self.mode == "onboarding-driver" {
+                            180.0
+                        } else {
+                            100.0
+                        },
+                )));
+                input.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(
+                        0.0,
+                        if self.mode == "single-query-detail" {
+                            -610.0
+                        } else {
+                            -1000.0
+                        },
+                    ),
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+
         fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
             if self.page >= self.screens.len() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -412,14 +483,35 @@ mod capture {
             );
             self.app.sample_temperature_on_observation();
             self.screens[self.page].apply(&mut self.app);
+            if self.mode == "draft-replace" {
+                self.app.set_review_reply_replace();
+            }
+            if self.mode == "onboarding-driver" {
+                self.app.review_onboarding_with_driver(true);
+            } else if self.mode.starts_with("onboarding-") {
+                self.app.review_onboarding();
+            }
             egui::TopBottomPanel::top("simulated-review").show(ctx, |ui| {
                 ui.label("界面验收 · 模拟数据 · 不连接设备 / 不发送短信");
             });
             self.app.render(ctx, frame);
             self.ticks += 1;
-            if self.ticks >= self.screens[self.page].settle_ticks()
+            let settle_ticks = if matches!(
+                self.mode.as_str(),
+                "single-query-detail" | "sms-detail-scrolled"
+            ) {
+                30
+            } else {
+                self.screens[self.page].settle_ticks()
+            };
+            if self.ticks >= settle_ticks
                 && !self.requested
-                && self.page_started.elapsed() >= Duration::from_millis(500)
+                && self.page_started.elapsed()
+                    >= Duration::from_millis(if self.mode == "single-query-detail" {
+                        1500
+                    } else {
+                        500
+                    })
             {
                 self.requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
@@ -500,7 +592,7 @@ mod capture {
             }
             if index % 5 == 0 {
                 message.multipart = Some(SmsMultipartInfo {
-                    reference: index as u8,
+                    reference: dji4g_domain::SmsConcatReference::EightBit(index as u8),
                     total: 3,
                     sequence: 2,
                 });
@@ -708,6 +800,228 @@ mod capture {
         tools
     }
 
+    /// Hardware-free scenario deltas, all applied to invented snapshots.
+    fn apply_extra_fixture(snapshot: &mut dji4g_application::ControllerSnapshot, mode: &str) {
+        use dji4g_application::*;
+        use dji4g_domain::*;
+        let now = SystemTime::now();
+        if mode == "onboarding-absent" {
+            *snapshot = demo_snapshot(DemoScenario::Absent, now);
+            return;
+        }
+        let mode = if mode == "onboarding-missing-port" {
+            "missing-port"
+        } else {
+            mode
+        };
+        let failure = |stable| {
+            FailureCode::new(
+                ErrorCode::Unsupported,
+                StableCode::try_from_static(stable).unwrap(),
+            )
+        };
+        if matches!(
+            mode,
+            "probe-off" | "missing-port" | "missing-sim" | "dns-failed"
+        ) {
+            let epoch = DeviceEpoch(1);
+            let cycle = RefreshCycleId(12);
+            let mut state = ReducerState::test_ready(now);
+            if mode == "probe-off" {
+                state.set_active_probe(false);
+            }
+            state = reduce_state(
+                &state,
+                BackendEvent::RefreshStarted {
+                    cycle,
+                    epoch,
+                    scheduled: CheckMask::only(if matches!(mode, "dns-failed" | "probe-off") {
+                        DiagnosticCheckId::BoundDns
+                    } else if mode == "missing-sim" {
+                        DiagnosticCheckId::Cellular
+                    } else {
+                        DiagnosticCheckId::AtControl
+                    }),
+                },
+                now,
+            );
+            let event = if mode == "probe-off" {
+                BackendEvent::ProbeFinished {
+                    cycle,
+                    epoch,
+                    result: CheckResult::Unexecuted {
+                        reason: UnexecutedReason::DisabledBySetting,
+                    },
+                }
+            } else if mode == "dns-failed" {
+                BackendEvent::ProbeFinished {
+                    cycle,
+                    epoch,
+                    result: CheckResult::Passed {
+                        value: ProbeObservationDto {
+                            epoch,
+                            adapter_id: "{adapter}".into(),
+                            gateway: ProbeStageDto::Passed,
+                            public: ProbeStageDto::Passed,
+                            dns: ProbeStageDto::Failed {
+                                code: failure("probe:dns_failed"),
+                            },
+                            protocol_coverage: Some(ProtocolCoverage::AllRequiredFamilies),
+                            system_route: None,
+                        },
+                        observed_at: now,
+                    },
+                }
+            } else if mode == "missing-port" {
+                BackendEvent::AtFinished {
+                    cycle,
+                    epoch,
+                    result: CheckResult::Unavailable {
+                        code: failure("at:port_unavailable"),
+                        observed_at: now,
+                    },
+                }
+            } else {
+                let mut cellular = snapshot.app.cellular.clone().unwrap_or(CellularSnapshot {
+                    sim: SimState::Missing,
+                    registration: RegistrationState::NotRegistered,
+                    attached: AttachState::Detached,
+                    carrier: None,
+                    radio_access_technology: None,
+                    signal_rssi_dbm: None,
+                    apn: None,
+                    pdp_address: None,
+                    pdp_state: None,
+                    firmware: None,
+                    serving_cell: None,
+                    sim_identity: None,
+                    numbers: None,
+                    temperature_celsius: None,
+                    temperature_status: FeatureStatus::NotProbed,
+                });
+                cellular.sim = SimState::Missing;
+                cellular.registration = RegistrationState::NotRegistered;
+                cellular.attached = AttachState::Detached;
+                cellular.carrier = None;
+                cellular.radio_access_technology = None;
+                cellular.signal_rssi_dbm = None;
+                cellular.pdp_address = None;
+                cellular.pdp_state = None;
+                BackendEvent::AtFinished {
+                    cycle,
+                    epoch,
+                    result: CheckResult::Passed {
+                        value: AtObservation {
+                            availability: AtControlAvailability::Available,
+                            cellular: Some(cellular),
+                        },
+                        observed_at: now,
+                    },
+                }
+            };
+            state = reduce_state(&state, event, now);
+            state = reduce_state(&state, BackendEvent::RefreshFinished { cycle, epoch }, now);
+            let evidence = state.snapshot();
+            snapshot.diagnostics = evidence.diagnostics;
+            snapshot.settings = evidence.settings;
+            let app = Arc::make_mut(&mut snapshot.app);
+            app.availability = evidence.app.availability;
+            if mode == "missing-port" {
+                if let Some(device) = app.device.as_mut() {
+                    device.at_port = None;
+                }
+                app.cellular = None;
+            }
+            if mode == "missing-sim" {
+                app.cellular = evidence.app.cellular.clone();
+            }
+            if mode == "dns-failed" {
+                if let Some(network) = app.network.as_mut() {
+                    network.bound_dns = BoundDnsStatus::Failed;
+                }
+            }
+            if mode == "probe-off" {
+                if let Some(network) = app.network.as_mut() {
+                    network.bound_public = BoundPublicStatus::Incomplete;
+                    network.bound_dns = BoundDnsStatus::Incomplete;
+                }
+            }
+        }
+        if mode.starts_with("send-") {
+            let result = match mode {
+                "send-submitted" => Some(SmsSendResult::Submitted),
+                "send-failed" => Some(SmsSendResult::Failed),
+                "send-unknown" => Some(SmsSendResult::OutcomeUnknown),
+                _ => None,
+            };
+            snapshot.sms_send = Some(SmsSendSnapshot {
+                request_id: 22,
+                phase: if result.is_some() {
+                    SmsSendPhase::Finished
+                } else {
+                    SmsSendPhase::WaitingForResult
+                },
+                result,
+                failure: None,
+            });
+            snapshot.serial_work_busy = result.is_none();
+        }
+        if mode == "delete-partial" {
+            snapshot.sms_send = None;
+            let fragments = snapshot
+                .sms_messages
+                .iter()
+                .take(3)
+                .filter_map(|message| message.fragments.first().cloned())
+                .collect::<Vec<_>>();
+            snapshot.sms_delete = Some(SmsDeleteSnapshot {
+                request_id: 25,
+                total: fragments.len(),
+                finished: true,
+                items: fragments
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, fragment)| SmsDeleteItemSnapshot {
+                        fragment,
+                        result: if index == 0 {
+                            SmsDeleteItemResult::Deleted
+                        } else if index == 1 {
+                            SmsDeleteItemResult::Failed
+                        } else {
+                            SmsDeleteItemResult::NotAttempted
+                        },
+                        code: if index == 1 {
+                            Some("sms:delete_rejected".into())
+                        } else {
+                            None
+                        },
+                    })
+                    .collect(),
+            });
+        }
+        if matches!(mode, "draft-replace" | "sms-detail-scrolled") {
+            snapshot.sms_send = None;
+        }
+        if matches!(mode, "single-query" | "single-query-detail") {
+            use dji4g_at_protocol::ToolReadId;
+            let context = ToolContext {
+                device_epoch: DeviceEpoch(7),
+                sim_epoch: 3,
+                identity: simulated_identity(),
+                at_port: "COM7".into(),
+            };
+            let request = ToolRequest {
+                id: 80,
+                context,
+                operation: ToolOperation::Read(ToolReadId::Attention),
+            };
+            let mut task = ToolTaskSnapshot::new(&request, 1);
+            task.phase = ToolPhase::Running;
+            snapshot.device_tools.task = Some(task);
+            snapshot.serial_work_busy = true;
+        }
+    }
+
     pub fn main() -> eframe::Result {
         let args = std::env::args().collect::<Vec<_>>();
         let width = args
@@ -727,7 +1041,10 @@ mod capture {
         let sms_fixture_wanted = screens.iter().any(|screen| screen.is_sms_fixture());
 
         // New directory for this round: the previous round's screenshots must stay untouched.
-        let output = PathBuf::from("docs/implementation-20260919/screenshots")
+        let output = args
+            .get(5)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("docs/implementation-20260922/screenshots"))
             .join(format!(
                 "{}x{}-{}pct",
                 width,
@@ -750,10 +1067,24 @@ mod capture {
                 let mut snapshot = demo_snapshot(DemoScenario::Available, SystemTime::now());
                 if sms_fixture_wanted {
                     let (messages, summary) = sms_fixture();
-                    snapshot.sms_messages = messages;
+                    snapshot.sms_messages = messages
+                        .into_iter()
+                        .map(|message| dji4g_domain::SmsDisplayMessage {
+                            fragments: if message.direction == dji4g_domain::SmsDirection::Incoming
+                            {
+                                vec![message.fragment_key()]
+                            } else {
+                                Vec::new()
+                            },
+                            delete_allowed: message.direction
+                                == dji4g_domain::SmsDirection::Incoming,
+                            message,
+                        })
+                        .collect();
                     snapshot.sms_inbox = summary;
                     snapshot.sms_send = Some(sms_send_fixture());
                 }
+                apply_extra_fixture(&mut snapshot, &mode);
                 let snapshot = Arc::new(snapshot);
                 let (snapshot_tx, rx) = dji4g_application::sync::watch::channel(snapshot);
                 let probe = Arc::new(std::sync::Mutex::new(
@@ -776,7 +1107,9 @@ mod capture {
                     resized: false,
                     page_started: std::time::Instant::now(),
                     requested: false,
+                    detail_clicked: false,
                     screens,
+                    mode,
                     // The simulated timeline ends at "now": the newest cycle is the current
                     // reading, and the window covers the ten minutes before it.
                     review_base: SystemTime::now() - Duration::from_secs(660),

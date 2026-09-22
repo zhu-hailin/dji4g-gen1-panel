@@ -32,7 +32,7 @@ fn fragment(
         SmsStatus::Received,
     );
     message.multipart = Some(SmsMultipartInfo {
-        reference,
+        reference: dji4g_domain::SmsConcatReference::EightBit(reference),
         total,
         sequence,
     });

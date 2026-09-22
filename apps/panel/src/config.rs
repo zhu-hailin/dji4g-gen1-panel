@@ -26,6 +26,7 @@ static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The only user-controlled configuration values persisted by the panel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigV1 {
+    pub onboarding_completed: bool,
     pub language: LanguageCode,
     pub autostart: bool,
     pub start_minimized: bool,
@@ -36,6 +37,7 @@ pub struct ConfigV1 {
 impl Default for ConfigV1 {
     fn default() -> Self {
         Self {
+            onboarding_completed: false,
             language: LanguageCode::ZhCn,
             autostart: false,
             start_minimized: false,
@@ -65,6 +67,7 @@ impl ConfigV1 {
             | AutostartStatus::Failed { .. } => None,
         }?;
         Some(Self {
+            onboarding_completed: false,
             language: settings.language,
             autostart,
             start_minimized: settings.start_minimized,
@@ -491,6 +494,8 @@ fn io_error(code: &'static str, error: IoFailure) -> ConfigError {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigDocument {
+    #[serde(default)]
+    onboarding_completed: bool,
     schema_version: u32,
     language: String,
     autostart: bool,
@@ -501,6 +506,7 @@ struct ConfigDocument {
 
 fn encode_config(config: &ConfigV1) -> Result<String, ConfigError> {
     let document = ConfigDocument {
+        onboarding_completed: config.onboarding_completed,
         schema_version: 1,
         language: match config.language {
             LanguageCode::ZhCn => "zh-CN".to_owned(),
@@ -545,6 +551,7 @@ fn decode_config(bytes: &[u8]) -> Result<ConfigV1, &'static str> {
         _ => return Err("config:parse_failed"),
     };
     Ok(ConfigV1 {
+        onboarding_completed: document.onboarding_completed,
         language,
         autostart: document.autostart,
         start_minimized: document.start_minimized,
@@ -637,6 +644,18 @@ impl std::error::Error for StartupParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_config_opens_onboarding_and_completed_roundtrips() {
+        let old = b"schema_version = 1\nlanguage = \"zh-CN\"\nautostart = false\nstart_minimized = false\nactive_probe = true\nlog_level = \"info\"\n";
+        let mut config = decode_config(old).unwrap();
+        assert!(!config.onboarding_completed);
+        config.onboarding_completed = true;
+        assert_eq!(
+            decode_config(encode_config(&config).unwrap().as_bytes()).unwrap(),
+            config
+        );
+    }
 
     #[test]
     fn invalid_utf8_is_not_a_default_success() {

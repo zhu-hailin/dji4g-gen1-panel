@@ -623,69 +623,77 @@ fn adapter_metrics_sampled_moves_the_snapshot_and_a_none_sample_clears_it() {
 
 #[test]
 fn sms_commands_queue_module_requests_and_delete_waits_for_confirmation() {
-    let mut controller = Controller::for_test(NOW);
-    assert!(controller.ingest_sms(message(3, "hi")));
-    assert_eq!(controller.snapshot().sms_inbox.message_count, 1);
-
+    let sms = Arc::new(FakeSmsPort::with_replies([
+        SmsReply::Messages(vec![message(3, "hi")]),
+        SmsReply::Message(message(3, "hi")),
+        SmsReply::Delete,
+    ]));
+    let (_, mut runner) = sms_runner(sms.clone(), Arc::new(MetricsAdapter { metrics: None }));
+    runner.run_one_refresh();
+    for command in [UiCommand::SmsRefresh, UiCommand::SmsRead { index: 3 }] {
+        runner.handle().try_send(command).unwrap();
+        assert!(runner.poll_commands());
+        assert!(runner.poll_sms_requests());
+    }
+    let fragments = runner.controller().snapshot().sms_messages[0]
+        .fragments
+        .clone();
     assert_eq!(
-        controller.handle_command(UiCommand::SmsRefresh),
+        runner
+            .controller_mut()
+            .handle_command(UiCommand::SmsDelete {
+                fragments: fragments.clone()
+            }),
         Ok(CommandReceipt::Accepted)
     );
+    assert_eq!(runner.controller().snapshot().sms_inbox.message_count, 1);
+    assert!(!runner.controller().snapshot().sms_delete.unwrap().finished);
+    finish_delete(&mut runner);
+    assert_eq!(runner.controller().snapshot().sms_inbox.message_count, 0);
     assert_eq!(
-        controller.handle_command(UiCommand::SmsRead { index: 3 }),
-        Ok(CommandReceipt::Accepted)
+        sms.calls(),
+        vec!["query", "enable", "list", "read", "delete_checked"]
     );
-    assert_eq!(
-        controller.handle_command(UiCommand::SmsDelete { index: 3 }),
-        Ok(CommandReceipt::Accepted)
-    );
-
-    assert_eq!(
-        controller.take_sms_requests(),
-        vec![
-            SmsRequest::Refresh,
-            SmsRequest::Read { index: 3 },
-            SmsRequest::Delete { index: 3 },
-        ]
-    );
-    assert!(controller.take_sms_requests().is_empty());
-    // A queued delete must not hide a message that is still on the module; removal happens only
-    // through `confirm_sms_delete` after the module reports the final OK.
-    assert_eq!(
-        controller.snapshot().sms_inbox.message_count,
-        1,
-        "a queued delete keeps the local copy until the module confirms"
-    );
-    assert!(controller.confirm_sms_delete(3));
-    assert_eq!(controller.snapshot().sms_inbox.message_count, 0);
+    assert_eq!(*sms.deleted_keys.lock().unwrap(), fragments);
+    assert_eq!(sms.unchecked_delete_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn mark_sms_read_and_confirm_sms_delete_apply_only_after_the_module_acts() {
-    let mut controller = Controller::for_test(NOW);
+    let sms = Arc::new(FakeSmsPort::with_replies([SmsReply::Delete]));
+    let (_, mut runner) = sms_runner(sms.clone(), Arc::new(MetricsAdapter { metrics: None }));
+    runner.run_one_refresh();
     let mut stored = message(4, "验证码 000000");
     stored.read = Some(false);
-    assert!(controller.ingest_sms(stored.clone()));
-    controller.record_sms_probe(FeatureStatus::Supported, Some((2, 30)));
-    assert_eq!(
-        controller.snapshot().sms_inbox.unread_count,
-        1,
-        "explicitly unread counts as unread"
-    );
-
-    // The module-side read succeeded: mark the exact stored copy read.
-    assert!(controller.mark_sms_read(&stored));
-    assert_eq!(controller.snapshot().sms_inbox.unread_count, 0);
+    assert!(runner.controller_mut().ingest_sms(stored.clone()));
+    runner
+        .controller_mut()
+        .record_sms_probe(FeatureStatus::Supported, Some((2, 30)));
+    assert_eq!(runner.controller().snapshot().sms_inbox.unread_count, 1);
+    assert!(runner.controller_mut().mark_sms_read(&stored));
+    assert_eq!(runner.controller().snapshot().sms_inbox.unread_count, 0);
+    assert!(!runner.controller_mut().mark_sms_read(&stored));
+    let fragments = runner.controller().snapshot().sms_messages[0]
+        .fragments
+        .clone();
+    let mut wrong = fragments.clone();
+    wrong[0].index = 9;
     assert!(
-        !controller.mark_sms_read(&stored),
-        "already read is a no-op"
+        runner
+            .controller_mut()
+            .handle_command(UiCommand::SmsDelete { fragments: wrong })
+            .is_err()
     );
-
-    // A failed delete leaves the store untouched; a successful one removes exactly that index.
-    assert!(!controller.confirm_sms_delete(9));
-    assert_eq!(controller.snapshot().sms_inbox.message_count, 1);
-    assert!(controller.confirm_sms_delete(4));
-    assert_eq!(controller.snapshot().sms_inbox.message_count, 0);
+    assert_eq!(sms.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runner.controller().snapshot().sms_inbox.message_count, 1);
+    runner
+        .controller_mut()
+        .handle_command(UiCommand::SmsDelete { fragments })
+        .unwrap();
+    assert_eq!(runner.controller().snapshot().sms_inbox.message_count, 1);
+    finish_delete(&mut runner);
+    assert_eq!(runner.controller().snapshot().sms_inbox.message_count, 0);
+    assert_eq!(sms.unchecked_delete_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -809,7 +817,7 @@ fn repeated_send_is_rejected_while_first_is_queued() {
 enum SmsReply {
     Messages(Vec<SmsMessage>),
     Message(SmsMessage),
-    Ok,
+    Delete,
     Sent(SmsSendResult),
 
     Err(&'static str, dji4g_domain::ErrorCode),
@@ -832,6 +840,8 @@ struct FakeSmsPort {
     list_calls: AtomicUsize,
     read_calls: AtomicUsize,
     delete_calls: AtomicUsize,
+    unchecked_delete_calls: AtomicUsize,
+    deleted_keys: Mutex<Vec<dji4g_domain::SmsFragmentKey>>,
     send_calls: AtomicUsize,
     send_delay: Duration,
     send_gate: Option<Arc<AtomicBool>>,
@@ -989,21 +999,34 @@ impl SmsPort for FakeSmsPort {
         _target: &TargetContext,
         _index: u32,
     ) -> PortFuture<'_, Result<(), PortError>> {
+        self.unchecked_delete_calls.fetch_add(1, Ordering::SeqCst);
+        panic!("unchecked delete must never be dispatched");
+    }
+
+    fn delete_checked(
+        &self,
+        _target: &TargetContext,
+        fragment: &dji4g_domain::SmsFragmentKey,
+        control: dji4g_domain::SmsDeleteControl,
+    ) -> PortFuture<'_, dji4g_domain::SmsDeleteReceipt> {
         self.delete_calls.fetch_add(1, Ordering::SeqCst);
-        self.record("delete");
-        match self.next_reply() {
-            Ok(SmsReply::Ok) => Box::pin(async { Ok(()) }),
-            Ok(SmsReply::Err(code, category)) => {
-                Box::pin(async move { Err(PortError::new(category, code)) })
+        self.record("delete_checked");
+        self.deleted_keys.lock().unwrap().push(fragment.clone());
+        let receipt = match self.next_reply() {
+            Ok(SmsReply::Delete) => {
+                control.mark_delete_attempted();
+                dji4g_domain::SmsDeleteReceipt {
+                    result: dji4g_domain::SmsDeleteItemResult::Deleted,
+                    code: None,
+                }
             }
-            Ok(_) => Box::pin(async {
-                Err(PortError::new(
-                    dji4g_domain::ErrorCode::Internal,
-                    "test:wrong_reply",
-                ))
-            }),
-            Err(error) => Box::pin(async move { Err(error) }),
-        }
+            Ok(SmsReply::Err(code, _)) => dji4g_domain::SmsDeleteReceipt {
+                result: dji4g_domain::SmsDeleteItemResult::Failed,
+                code: Some(code.into()),
+            },
+            _ => panic!("wrong reply for checked deletion"),
+        };
+        Box::pin(async move { receipt })
     }
 
     fn send(
@@ -1267,7 +1290,7 @@ fn runner_read_marks_the_stored_message_read() {
 
 #[test]
 fn runner_delete_removes_the_message_only_after_the_module_confirms() {
-    let sms = Arc::new(FakeSmsPort::with_replies([SmsReply::Ok]));
+    let sms = Arc::new(FakeSmsPort::with_replies([SmsReply::Delete]));
     let (_clock, mut runner) =
         sms_runner(Arc::clone(&sms), Arc::new(MetricsAdapter { metrics: None }));
     runner.run_one_refresh();
@@ -1275,7 +1298,11 @@ fn runner_delete_removes_the_message_only_after_the_module_confirms() {
 
     runner
         .handle()
-        .try_send(UiCommand::SmsDelete { index: 5 })
+        .try_send(UiCommand::SmsDelete {
+            fragments: runner.controller().snapshot().sms_messages[0]
+                .fragments
+                .clone(),
+        })
         .expect("queue delete");
     assert!(runner.poll_commands(), "the queued command must be handled");
     assert_eq!(
@@ -1284,16 +1311,17 @@ fn runner_delete_removes_the_message_only_after_the_module_confirms() {
         "the queued delete must not remove the local copy"
     );
 
-    assert!(runner.poll_sms_requests());
+    finish_delete(&mut runner);
     assert_eq!(sms.delete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sms.unchecked_delete_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         runner.controller().snapshot().sms_inbox.message_count,
         0,
         "the confirmed delete removes the local copy"
     );
     assert_eq!(
-        runner.controller().snapshot().sms_inbox.status,
-        FeatureStatus::Supported
+        runner.controller().snapshot().sms_delete.unwrap().items[0].result,
+        dji4g_domain::SmsDeleteItemResult::Deleted
     );
 }
 
@@ -1310,14 +1338,24 @@ fn runner_delete_failure_keeps_the_local_copy() {
 
     runner
         .handle()
-        .try_send(UiCommand::SmsDelete { index: 5 })
+        .try_send(UiCommand::SmsDelete {
+            fragments: runner.controller().snapshot().sms_messages[0]
+                .fragments
+                .clone(),
+        })
         .expect("queue delete");
     assert!(runner.poll_commands(), "the queued command must be handled");
-    assert!(runner.poll_sms_requests());
+    finish_delete(&mut runner);
 
     let snapshot = runner.controller().snapshot();
     assert_eq!(snapshot.sms_inbox.message_count, 1);
-    assert_eq!(snapshot.sms_inbox.status, FeatureStatus::TransportFailure);
+    let batch = snapshot.sms_delete.unwrap();
+    assert_eq!(
+        batch.items[0].result,
+        dji4g_domain::SmsDeleteItemResult::Failed
+    );
+    assert_eq!(batch.items[0].code.as_deref(), Some("sms:timeout"));
+    assert_eq!(sms.unchecked_delete_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1713,28 +1751,41 @@ fn identical_sends_are_each_recorded_as_a_distinct_transaction() {
 
 #[test]
 fn a_module_delete_never_removes_a_local_outgoing_record() {
-    let mut controller = Controller::for_test(NOW);
-    assert!(controller.ingest_sms(SmsMessage::new_outgoing(
+    let sms = Arc::new(FakeSmsPort::with_replies([SmsReply::Delete]));
+    let (_, mut runner) = sms_runner(sms.clone(), Arc::new(MetricsAdapter { metrics: None }));
+    runner.run_one_refresh();
+    assert!(runner.controller_mut().ingest_sms(SmsMessage::new_outgoing(
         3,
         1,
         0,
         "+8613800138000",
         "本地发送",
         SmsEncoding::Gsm7,
-        SmsStatus::Submitted,
+        SmsStatus::Submitted
     )));
-    assert!(controller.ingest_sms(message(3, "incoming")));
-    assert_eq!(controller.snapshot().sms_inbox.message_count, 2);
-
-    assert!(
-        controller.confirm_sms_delete(3),
-        "the module copy with index 3 is still removed"
-    );
-    let state = controller.state();
+    assert!(runner.controller_mut().ingest_sms(message(3, "incoming")));
+    assert_eq!(runner.controller().snapshot().sms_inbox.message_count, 2);
+    let fragments = runner
+        .controller()
+        .snapshot()
+        .sms_messages
+        .iter()
+        .find(|row| row.direction == SmsDirection::Incoming)
+        .unwrap()
+        .fragments
+        .clone();
+    runner
+        .controller_mut()
+        .handle_command(UiCommand::SmsDelete { fragments })
+        .unwrap();
+    finish_delete(&mut runner);
+    let state = runner.controller().state();
     let stored = state.sms_store().messages();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].direction, SmsDirection::Outgoing);
+    assert_eq!(sms.unchecked_delete_calls.load(Ordering::SeqCst), 0);
 }
+
 #[test]
 fn send_has_queued_snapshot_before_worker_starts() {
     let mut controller = Controller::for_test(NOW);
@@ -2057,5 +2108,23 @@ fn inbox_failure_retains_code_and_success_clears_it() {
                 .map(|e| e.code.stable().as_str()),
             failed.then_some("sms:port_busy")
         );
+    }
+}
+
+fn finish_delete(runner: &mut ControllerRunner) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        runner.poll_sms_requests();
+        if runner
+            .controller()
+            .snapshot()
+            .sms_delete
+            .as_ref()
+            .is_some_and(|batch| batch.finished)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "delete worker did not finish");
+        std::thread::sleep(Duration::from_millis(1));
     }
 }

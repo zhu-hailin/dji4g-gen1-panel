@@ -48,6 +48,8 @@ fn snapshot(availability: Availability, freshness: Freshness) -> ControllerSnaps
         sms_inbox: Default::default(),
         sms_messages: Vec::new(),
         sms_send: None,
+        sms_delete: None,
+        serial_work_busy: false,
         sms_refresh_pending: false,
         sms_inbox_failure: None,
         device_tools: Default::default(),

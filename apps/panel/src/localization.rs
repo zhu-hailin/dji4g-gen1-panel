@@ -1804,6 +1804,15 @@ pub fn stable_code_text(code: &str) -> Option<TextKey> {
         | "probe:http_invalid"
         | "probe:http_too_large"
         | "probe:socket_option_failed" => TextKey::ErrorProbeFailed,
+        "app:sim_missing" => TextKey::SimMissing,
+        "app:sim_pin_required" => TextKey::SimPinRequired,
+        "app:sim_puk_required" => TextKey::SimPukRequired,
+        "app:sim_rejected" => TextKey::SimRejected,
+        "app:sim_unobserved" => TextKey::SimUnknown,
+        "app:registration_rejected" => TextKey::RegistrationDenied,
+        "app:registration_not_ready" => TextKey::RegistrationNotRegistered,
+        "app:packet_not_attached" => TextKey::AttachDetached,
+        "app:cellular_unobserved" => TextKey::ErrorCapabilityUnavailable,
         "app:missing_before_state" => TextKey::ErrorEvidenceExpired,
         "app:target_absent" => TextKey::ErrorDeviceRemoved,
         "app:refresh_not_action" => TextKey::ErrorUnsupported,
@@ -2270,5 +2279,18 @@ pub fn timeline_kind_text(value: TimelineEventKind) -> TextKey {
         TimelineEventKind::DeviceArrived => TextKey::TimelineDeviceArrived,
         TimelineEventKind::AdapterLinkChanged => TextKey::TimelineAdapterLinkChanged,
         TimelineEventKind::DnsChanged => TextKey::TimelineDnsChanged,
+    }
+}
+
+#[test]
+fn cellular_readiness_codes_show_device_state_instead_of_internal_error() {
+    for (code, expected) in [
+        ("app:sim_missing", TextKey::SimMissing),
+        ("app:sim_pin_required", TextKey::SimPinRequired),
+        ("app:sim_puk_required", TextKey::SimPukRequired),
+        ("app:sim_rejected", TextKey::SimRejected),
+        ("app:registration_rejected", TextKey::RegistrationDenied),
+    ] {
+        assert_eq!(stable_code_text(code), Some(expected));
     }
 }

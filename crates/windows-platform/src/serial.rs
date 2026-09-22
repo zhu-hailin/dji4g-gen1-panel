@@ -14,7 +14,10 @@ use dji4g_at_protocol::{
     AtCommand, AtEvent, AtFinalCode, AtResponse, ProtocolError, ProtocolErrorKind, RetryPolicy,
     StreamingParser, ToolParseError, ToolResponse, ToolResponseParser, ToolWireRequest,
 };
-use dji4g_domain::{DeviceEpoch, SmsSendPhase, SmsTransactionControl};
+use dji4g_domain::{
+    DeviceEpoch, SmsDeleteControl, SmsDeleteReceipt, SmsFragmentKey, SmsSendPhase,
+    SmsTransactionControl,
+};
 
 /// Cancellation and write-attempt handle for one tool transaction. The platform crate must not
 /// depend on the application crate, so the shared primitive comes from the domain crate.
@@ -103,6 +106,11 @@ impl fmt::Display for ActorError {
 impl std::error::Error for ActorError {}
 
 enum Request {
+    CheckedDelete {
+        expected: SmsFragmentKey,
+        control: SmsDeleteControl,
+        reply: OperationReply<SmsDeleteReceipt>,
+    },
     Execute {
         command: AtCommand,
         reply: OperationReply<AtResponse>,
@@ -152,6 +160,7 @@ pub struct AtSessionActor {
     cancellation: Arc<dyn SerialIoCancellation>,
     completion: Receiver<()>,
     worker: Option<thread::JoinHandle<()>>,
+    drop_timeout: Duration,
 }
 
 static SERIAL_LEASES: OnceLock<(Mutex<HashSet<String>>, Condvar)> = OnceLock::new();
@@ -207,11 +216,32 @@ const STATE_REMOVED: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 
 struct ActorState {
+    delete_cleanup: Mutex<Option<SmsDeleteControl>>,
     epoch: DeviceEpoch,
     terminal: AtomicU8,
     outstanding: AtomicUsize,
     submission_gate: Mutex<()>,
     binding: Mutex<Option<AtPortBinding>>,
+}
+
+struct WorkerCompletion {
+    state: Arc<ActorState>,
+    completed: mpsc::Sender<()>,
+}
+
+impl Drop for WorkerCompletion {
+    fn drop(&mut self) {
+        if let Some(control) = self
+            .state
+            .delete_cleanup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            control.mark_cleanup_complete();
+        }
+        let _ = self.completed.send(());
+    }
 }
 
 impl ActorState {
@@ -338,6 +368,7 @@ impl AtSessionActor {
         let (sender, receiver) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
         let (cancellation_ready, cancellation_receiver) = mpsc::sync_channel(1);
         let state = Arc::new(ActorState {
+            delete_cleanup: Mutex::new(None),
             epoch,
             terminal: AtomicU8::new(STATE_RUNNING),
             outstanding: AtomicUsize::new(0),
@@ -349,13 +380,17 @@ impl AtSessionActor {
         let worker = thread::Builder::new()
             .name("dji4g-at-session".to_owned())
             .spawn(move || {
+                let _completion = WorkerCompletion {
+                    state: Arc::clone(&worker_state),
+                    completed,
+                };
                 // Local declaration order preserves serial-before-lease destruction on unwind.
                 let lease = lease;
                 let serial = serial;
                 match serial.cancellation_handle() {
                     Ok(cancellation) => {
                         if cancellation_ready.send(Ok(cancellation)).is_ok() {
-                            run_actor(epoch, serial, receiver, worker_state);
+                            run_actor(epoch, serial, receiver, Arc::clone(&worker_state));
                         } else {
                             drop(serial);
                         }
@@ -366,7 +401,6 @@ impl AtSessionActor {
                     }
                 }
                 drop(lease);
-                let _ = completed.send(());
             })
             .map_err(|error| ActorError::Io(error.kind()))?;
         // The production canceller must own a handle for this exact worker before callers can
@@ -380,7 +414,174 @@ impl AtSessionActor {
             cancellation,
             completion,
             worker: Some(worker),
+            drop_timeout: Duration::from_secs(2),
         })
+    }
+
+    /// The caller can cancel a native open: its worker handle is registered before opening.
+    #[cfg(windows)]
+    pub(crate) fn open_selected_delete(
+        epoch: DeviceEpoch,
+        selected: &SelectedPort,
+        control: &SmsDeleteControl,
+    ) -> Result<Self, ActorError> {
+        let lease = loop {
+            if control.is_cancelled() || control.is_expired() {
+                return Err(ActorError::Io(io::ErrorKind::Interrupted));
+            }
+            match SerialLease::acquire(
+                selected.interface_path(),
+                control.remaining().min(Duration::from_millis(25)),
+            ) {
+                Ok(lease) => break lease,
+                Err(ActorError::LeaseBusy) => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        let binding = Some(AtPortBinding {
+            epoch,
+            interface_path: selected.interface_path().to_owned(),
+            container_id: selected.container_id().map(str::to_owned),
+            identity: Vec::new(),
+        });
+        let selected = selected.clone();
+        Self::spawn_delete_opener(
+            epoch,
+            binding,
+            Some(lease),
+            control,
+            || {
+                OwnedWorkerThreadHandle::duplicate_current().map(|worker_thread| {
+                    Arc::new(WindowsSynchronousIoCancellation { worker_thread })
+                        as Arc<dyn SerialIoCancellation>
+                })
+            },
+            move || {
+                WindowsSerialPort::open(&selected)
+                    .map(|serial| Box::new(serial) as Box<dyn SerialIo>)
+            },
+        )
+    }
+
+    fn spawn_delete_opener(
+        epoch: DeviceEpoch,
+        binding: Option<AtPortBinding>,
+        lease: Option<SerialLease>,
+        control: &SmsDeleteControl,
+        register_cancellation: impl FnOnce() -> io::Result<Arc<dyn SerialIoCancellation>>
+        + Send
+        + 'static,
+        open: impl FnOnce() -> io::Result<Box<dyn SerialIo>> + Send + 'static,
+    ) -> Result<Self, ActorError> {
+        let (sender, receiver) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
+        let (ready, ready_receiver) = mpsc::sync_channel(1);
+        let (completed, completion) = mpsc::channel();
+        let state = Arc::new(ActorState {
+            epoch,
+            terminal: AtomicU8::new(STATE_RUNNING),
+            outstanding: AtomicUsize::new(0),
+            submission_gate: Mutex::new(()),
+            delete_cleanup: Mutex::new(None),
+            binding: Mutex::new(binding),
+        });
+        let worker_state = Arc::clone(&state);
+        let worker_control = control.clone();
+        let worker = thread::Builder::new()
+            .name("dji4g-sms-delete".into())
+            .spawn(move || {
+                let _completion = WorkerCompletion {
+                    state: Arc::clone(&worker_state),
+                    completed,
+                };
+                let lease = lease;
+                let cancellation = register_cancellation();
+                let ready = match cancellation {
+                    Ok(cancellation) => ready.send(Ok(cancellation)).is_ok(),
+                    Err(error) => {
+                        let _ = ready.send(Err(os_io(error)));
+                        false
+                    }
+                };
+                if ready && !worker_control.is_cancelled() && !worker_control.is_expired() {
+                    if let Ok(serial) = open() {
+                        run_actor(epoch, serial, receiver, Arc::clone(&worker_state));
+                    }
+                }
+                drop(lease);
+            })
+            .map_err(|error| ActorError::Io(error.kind()))?;
+        let cancellation = ready_receiver.recv().map_err(|_| ActorError::Closed)??;
+        Ok(Self {
+            sender,
+            state,
+            cancellation,
+            completion,
+            worker: Some(worker),
+            drop_timeout: Duration::ZERO,
+        })
+    }
+
+    pub(crate) fn execute_checked_delete(
+        &self,
+        expected: SmsFragmentKey,
+        control: SmsDeleteControl,
+    ) -> SmsDeleteReceipt {
+        let (reply, response) = mpsc::channel();
+        if let Err(error) = self.try_send(|state| Request::CheckedDelete {
+            expected,
+            control: control.clone(),
+            reply: OperationReply {
+                sender: Some(reply),
+                state,
+            },
+        }) {
+            return crate::sms_delete::actor_failure(error, &control);
+        }
+        loop {
+            // Consume a deterministic final acknowledgement before checking a simultaneous cancel.
+            match response.try_recv() {
+                Ok(result) => {
+                    return result
+                        .unwrap_or_else(|error| crate::sms_delete::actor_failure(error, &control));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return crate::sms_delete::actor_failure(ActorError::Closed, &control);
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            if control.is_cancelled() || control.is_expired() {
+                self.invalidate_epoch();
+                return crate::sms_delete::actor_failure(
+                    ActorError::Io(io::ErrorKind::Interrupted),
+                    &control,
+                );
+            }
+            match response.recv_timeout(control.remaining().min(Duration::from_millis(25))) {
+                Ok(result) => {
+                    return result
+                        .unwrap_or_else(|error| crate::sms_delete::actor_failure(error, &control));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return crate::sms_delete::actor_failure(ActorError::Closed, &control);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    pub(crate) fn close_delete_and_wait(
+        &mut self,
+        control: &SmsDeleteControl,
+        timeout: Duration,
+    ) -> Result<(), ActorError> {
+        control.mark_cleanup_pending();
+        *self.state.delete_cleanup.lock().unwrap() = Some(control.clone());
+        self.drop_timeout = Duration::ZERO;
+        let result = self.close_and_wait(timeout);
+        if self.worker.is_none() {
+            control.mark_cleanup_complete();
+        }
+        result
     }
 
     #[cfg(windows)]
@@ -626,7 +827,7 @@ pub fn probe_at_port(epoch: DeviceEpoch, port: &SelectedPort) -> Result<Vec<Stri
 
 impl Drop for AtSessionActor {
     fn drop(&mut self) {
-        let _ = self.close_and_wait(Duration::from_secs(2));
+        let _ = self.close_and_wait(self.drop_timeout);
     }
 }
 
@@ -655,6 +856,23 @@ fn run_actor(
         }
         let Some(request) = request else { break };
         match request {
+            Request::CheckedDelete {
+                expected,
+                control,
+                reply,
+            } => {
+                let receipt =
+                    crate::sms_delete::delete_in_session(epoch, &expected, &control, |command| {
+                        execute_delete_command(epoch, serial.as_mut(), &state, command, &control)
+                    });
+                reply.send(Ok(receipt));
+                // A checked delete owns the whole session; late bytes never enter another request.
+                let _gate = state
+                    .submission_gate
+                    .lock()
+                    .expect("submission gate poisoned");
+                state.finish_closed_locked();
+            }
             Request::Execute { command, reply } => {
                 let mut replies = vec![reply];
                 drain_duplicate_reads(&receiver, &mut pending, &command, &mut replies);
@@ -842,6 +1060,61 @@ fn execute_once(
                 if !state.is_running() {
                     return Err(ActorError::Protocol(parser.finish_removed()));
                 }
+                return if response.final_code == AtFinalCode::Ok {
+                    Ok(response)
+                } else {
+                    Err(ActorError::FinalCode(response.final_code))
+                };
+            }
+        }
+    }
+}
+
+/// One typed command under the fragment's absolute deadline; no command is retried.
+fn execute_delete_command(
+    epoch: DeviceEpoch,
+    serial: &mut dyn SerialIo,
+    state: &ActorState,
+    command: AtCommand,
+    control: &SmsDeleteControl,
+) -> Result<AtResponse, ActorError> {
+    let mut parser = StreamingParser::new(epoch, command.clone());
+    let check = || {
+        if !state.is_running() {
+            return Err(state.terminal_error());
+        }
+        if control.is_cancelled() {
+            return Err(ActorError::Io(io::ErrorKind::Interrupted));
+        }
+        if control.is_expired() {
+            return Err(ActorError::Io(io::ErrorKind::TimedOut));
+        }
+        Ok(())
+    };
+    {
+        // Synchronize invalidation with the attempt flag before entering potentially blocked I/O.
+        let _gate = state
+            .submission_gate
+            .lock()
+            .expect("submission gate poisoned");
+        check()?;
+        if matches!(command, AtCommand::SmsDelete { .. }) {
+            control.mark_delete_attempted();
+        }
+    }
+    serial
+        .write_all(command.encode().as_bytes())
+        .map_err(|error| io_error(&mut parser, error))?;
+    loop {
+        check()?;
+        let bytes = match serial.read_chunk() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) => return Err(io_error(&mut parser, error)),
+        };
+        check()?;
+        for event in parser.push(&bytes).map_err(ActorError::Protocol)? {
+            if let AtEvent::Response(response) = event {
                 return if response.final_code == AtFinalCode::Ok {
                     Ok(response)
                 } else {

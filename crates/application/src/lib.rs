@@ -10,6 +10,7 @@ mod monitor;
 mod ports;
 mod reducer;
 mod sms;
+mod sms_delete;
 pub mod sync;
 
 pub use confirmation::{
@@ -68,4 +69,8 @@ pub use dji4g_domain::{
 pub use dji4g_domain::{
     SMS_SEND_TIMEOUT, SmsFailureDetail, SmsSendPhase, SmsSendSnapshot, SmsTransactionControl,
 };
+pub use dji4g_domain::{
+    SmsDeleteControl, SmsDeleteItemResult, SmsDeleteReceipt, SmsDisplayMessage, SmsFragmentKey,
+};
 pub use sms::{MAX_STORED, SmsStore};
+pub use sms_delete::{SmsDeleteItemSnapshot, SmsDeleteSnapshot};

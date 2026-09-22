@@ -19,7 +19,7 @@ try {
  Push-Location $repoRoot
  try {
   $destinationPath=[IO.Path]::GetFullPath($Destination)
-  & cargo rustc -p dji4g-panel --bin dji4g-portable --release --offline -- -C target-feature=+crt-static "--emit=link=$destinationPath"
+  & cargo rustc -p dji4g-panel --bin dji4g-portable --release --offline --locked -- -C target-feature=+crt-static "--emit=link=$destinationPath"
   if ($LASTEXITCODE -ne 0) { throw 'Standalone build failed' }
  } finally { Pop-Location }
  [pscustomobject]@{File=[IO.Path]::GetFullPath($Destination);Sha256=(Get-FileHash -LiteralPath $Destination).Hash;Bytes=(Get-Item -LiteralPath $Destination).Length} | ConvertTo-Json

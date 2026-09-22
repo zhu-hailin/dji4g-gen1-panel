@@ -120,7 +120,7 @@ pub enum UiCommand {
     /// Delete one stored message. Queued for the runner's `SmsPort`; the local copy is removed
     /// only after the module confirms the deletion through [`Controller::confirm_sms_delete`].
     SmsDelete {
-        index: u32,
+        fragments: Vec<dji4g_domain::SmsFragmentKey>,
     },
     /// Send one message. Dispatched **only after the UI has obtained the single user confirmation
     /// for this exact recipient and body** (research §6.3): the controller itself records the
@@ -154,6 +154,8 @@ pub enum UiCommand {
     CancelExpertToolPlan {
         id: u64,
     },
+    /// Clear only the in-memory transcript history, not capabilities or the running task.
+    ClearToolHistory,
     /// Terminal result of the panel-side `config.toml` write for one settings revision.
     SettingsPersisted(crate::SettingsSaveOutcome),
     /// Terminal result of the panel-side autostart registration write.
@@ -174,7 +176,7 @@ pub enum SmsRequest {
         index: u32,
     },
     Delete {
-        index: u32,
+        request_id: u64,
     },
     /// One user-confirmed send. The controller never deduplicates `(recipient, body)`: every send
     /// is an explicit user action, so repeats are legitimate distinct submissions.
@@ -277,6 +279,8 @@ pub struct Controller {
     sms_requests: VecDeque<SmsRequest>,
     sms_send: Option<crate::SmsSendSnapshot>,
     sms_refresh_pending: bool,
+    sms_delete: Option<crate::SmsDeleteSnapshot>,
+    sms_read_in_flight: bool,
     sms_inbox_failure: Option<(DeviceEpoch, u64, crate::PortError)>,
     next_sms_request_id: u64,
     sms_send_context: Option<(DeviceEpoch, u64)>,
@@ -310,6 +314,8 @@ impl Controller {
             sms_requests: VecDeque::new(),
             sms_send: None,
             sms_refresh_pending: false,
+            sms_delete: None,
+            sms_read_in_flight: false,
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
@@ -342,6 +348,8 @@ impl Controller {
             sms_requests: VecDeque::new(),
             sms_send: None,
             sms_refresh_pending: false,
+            sms_delete: None,
+            sms_read_in_flight: false,
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
@@ -362,6 +370,8 @@ impl Controller {
         snapshot.feedback = self.feedback.clone();
         snapshot.sms_send = self.sms_send.clone();
         snapshot.sms_refresh_pending = self.sms_refresh_pending;
+        snapshot.sms_delete = self.sms_delete.clone();
+        snapshot.serial_work_busy = self.serial_work_busy();
         snapshot.sms_inbox_failure = self
             .sms_inbox_failure
             .as_ref()
@@ -379,7 +389,7 @@ impl Controller {
     }
 
     pub fn prepare_action(&mut self, action: ActionRequest) -> Result<ActionPlanId, PrepareError> {
-        if self.sms_active() || self.tool_active() {
+        if self.serial_work_busy() {
             return Err(PrepareError::Busy);
         }
         if self.prepared.as_ref().is_some_and(|plan| {
@@ -434,7 +444,7 @@ impl Controller {
     /// Kept for deterministic tests and any blocking consumer; the production runner uses
     /// [`Self::begin_confirmation`] so it never blocks on UAC, IPC, or hotspot work.
     pub fn confirm_action(&mut self, id: ActionPlanId) -> Result<ConfirmResult, ConfirmError> {
-        if self.sms_active() {
+        if self.serial_work_busy() {
             return Err(ConfirmError::Busy);
         }
         let (token, _requires_elevation) = self.revalidate_and_consume(id)?;
@@ -452,7 +462,7 @@ impl Controller {
     /// The runner polls [`Self::poll_operation_completion`] every loop iteration; the Running
     /// phases are published here so the UI sees honest progress while the executor works.
     pub fn begin_confirmation(&mut self, id: ActionPlanId) -> Result<ConfirmResult, ConfirmError> {
-        if self.sms_active() {
+        if self.serial_work_busy() {
             return Err(ConfirmError::Busy);
         }
         let (token, requires_elevation) = self.revalidate_and_consume(id)?;
@@ -734,7 +744,11 @@ impl Controller {
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsRefresh => {
-                if self.sms_active() {
+                if self.sms_active()
+                    || self.sms_delete_active()
+                    || self.sms_read_in_flight
+                    || self.operation_pending.is_some()
+                {
                     return self.reject_sms_busy();
                 }
                 if self.tool_active() {
@@ -748,7 +762,11 @@ impl Controller {
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsRead { index } => {
-                if self.sms_active() {
+                if self.sms_active()
+                    || self.sms_delete_active()
+                    || self.sms_read_in_flight
+                    || self.operation_pending.is_some()
+                {
                     return self.reject_sms_busy();
                 }
                 // A tool task holds the port: the read is refused rather than queued behind a
@@ -759,22 +777,14 @@ impl Controller {
                 self.sms_requests.push_back(SmsRequest::Read { index });
                 Ok(CommandReceipt::Accepted)
             }
-            UiCommand::SmsDelete { index } => {
-                if self.sms_active() {
-                    return self.reject_sms_busy();
-                }
-                if self.tool_active() {
-                    return self.reject_sms_tool_busy();
-                }
-                self.sms_requests.push_back(SmsRequest::Delete { index });
-                // The local copy is deliberately kept until the module confirms the deletion
-                // through `confirm_sms_delete`: a queued or failed delete must never make the
-                // inbox lie about what is still stored on the module.
+            UiCommand::SmsDelete { fragments } => self.queue_sms_delete(fragments),
+            UiCommand::ClearToolHistory => {
+                self.clear_tool_history();
                 Ok(CommandReceipt::Accepted)
             }
             UiCommand::SmsSend { recipient, body } => {
-                if self.sms_active() || self.tool_active() {
-                    return self.reject_sms_tool_busy();
+                if self.serial_work_busy() {
+                    return self.reject_sms_busy();
                 }
                 if self.operation_pending.is_some()
                     || self
@@ -847,6 +857,10 @@ impl Controller {
     #[must_use]
     pub fn serial_work_busy(&self) -> bool {
         self.sms_active()
+            || self.sms_delete_active()
+            || self.sms_read_in_flight
+            || self.sms_refresh_pending
+            || !self.sms_requests.is_empty()
             || self.tool_active()
             || self.operation_pending.is_some()
             || self
@@ -1080,6 +1094,8 @@ impl Controller {
     pub fn tool_start_conflict(&self) -> bool {
         let now = self.clock.system_now();
         self.sms_active()
+            || self.sms_delete_active()
+            || self.sms_read_in_flight
             || !self.sms_requests.is_empty()
             || self.operation_pending.is_some()
             || self
@@ -1152,6 +1168,98 @@ impl Controller {
         self.state.publish_only_change();
     }
 
+    fn queue_sms_delete(
+        &mut self,
+        fragments: Vec<dji4g_domain::SmsFragmentKey>,
+    ) -> Result<CommandReceipt, UiSendError> {
+        if self.serial_work_busy() {
+            return self.reject_sms_busy();
+        }
+        let context = (self.state.epoch().0, self.state.sim_epoch());
+        let unique: HashSet<_> = fragments.iter().collect();
+        let group_matches = self.state.sms_store().display_messages().iter().any(|row| {
+            row.delete_allowed
+                && row.fragments.len() == fragments.len()
+                && row.fragments.iter().all(|part| unique.contains(part))
+        });
+        if fragments.is_empty()
+            || fragments.len() > crate::MAX_STORED
+            || unique.len() != fragments.len()
+            || !group_matches
+            || fragments.iter().any(|part| {
+                (part.device_epoch, part.sim_epoch) != context
+                    || !self.state.sms_store().contains_fragment(part)
+            })
+        {
+            self.report_feedback(failure(
+                ErrorCode::EvidenceExpired,
+                "sms:delete_target_changed",
+            ));
+            return Err(UiSendError::Closed);
+        }
+        let id = self.next_sms_request_id;
+        self.next_sms_request_id = id.saturating_add(1);
+        self.sms_delete = Some(crate::SmsDeleteSnapshot::new(id, fragments));
+        self.sms_requests
+            .push_back(SmsRequest::Delete { request_id: id });
+        self.state.publish_only_change();
+        Ok(CommandReceipt::Accepted)
+    }
+
+    pub fn sms_delete_active(&self) -> bool {
+        self.sms_delete
+            .as_ref()
+            .is_some_and(|batch| !batch.finished)
+    }
+
+    pub(crate) fn sms_delete_snapshot(&self) -> Option<&crate::SmsDeleteSnapshot> {
+        self.sms_delete.as_ref()
+    }
+
+    pub(crate) fn record_sms_delete_item(
+        &mut self,
+        request_id: u64,
+        index: usize,
+        receipt: crate::SmsDeleteReceipt,
+    ) {
+        let Some(batch) = self
+            .sms_delete
+            .as_mut()
+            .filter(|b| b.request_id == request_id)
+        else {
+            return;
+        };
+        let Some(item) = batch.items.get_mut(index) else {
+            return;
+        };
+        item.result = receipt.result;
+        item.code = receipt.code;
+        let fragment = item.fragment.clone();
+        if item.result == crate::SmsDeleteItemResult::Deleted
+            && (self.state.epoch().0, self.state.sim_epoch())
+                == (fragment.device_epoch, fragment.sim_epoch)
+        {
+            self.state.remove_sms_fragment(&fragment);
+        }
+        self.state.publish_only_change();
+    }
+
+    pub(crate) fn finish_sms_delete(&mut self, request_id: u64) {
+        if let Some(batch) = self
+            .sms_delete
+            .as_mut()
+            .filter(|b| b.request_id == request_id)
+        {
+            batch.finished = true;
+            self.state.publish_only_change();
+        }
+    }
+
+    pub(crate) fn set_sms_read_in_flight(&mut self, active: bool) {
+        self.sms_read_in_flight = active;
+        self.state.publish_only_change();
+    }
+
     /// Drop every conclusion tied to the previous device or SIM.
     fn invalidate_tool_context(&mut self) {
         self.tool_requests.clear();
@@ -1209,6 +1317,14 @@ impl Controller {
 
     /// Store one listed SMS message; returns whether it was new. The runner feeds listed messages
     /// through this after the `SmsPort` returns, and the snapshot's `sms_inbox` follows.
+    pub fn reconcile_sms_listed_slots(&mut self, listed: &[SmsMessage]) {
+        let mut listed = listed.to_vec();
+        for message in &mut listed {
+            message.sim_epoch = self.state.sim_epoch();
+        }
+        self.state.reconcile_sms_listed_slots(&listed);
+    }
+
     pub fn ingest_sms(&mut self, mut message: SmsMessage) -> bool {
         // The port layer cannot know the current SIM session; stamp it here so dedup and
         // display stay scoped to the SIM that is actually present.

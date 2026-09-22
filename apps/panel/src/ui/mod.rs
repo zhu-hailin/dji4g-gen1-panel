@@ -17,9 +17,11 @@ use crate::localization::{
     hotspot_title, hotspot_unsupported_reason, rollback_outcome, unexecuted_reason,
 };
 
+pub mod action_availability;
 pub mod device_tools;
 pub mod diagnostics;
 pub(crate) mod driver_setup;
+pub mod onboarding;
 pub mod overview;
 pub mod repairs;
 pub mod settings;

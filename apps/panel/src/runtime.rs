@@ -467,6 +467,27 @@ impl SmsPort for ProductionSms {
         })
     }
 
+    fn delete_checked(
+        &self,
+        target: &TargetContext,
+        fragment: &dji4g_domain::SmsFragmentKey,
+        control: dji4g_domain::SmsDeleteControl,
+    ) -> PortFuture<'_, dji4g_domain::SmsDeleteReceipt> {
+        let target = target.clone();
+        let fragment = fragment.clone();
+        Box::pin(async move {
+            match self.target_device(&target) {
+                Ok((device, epoch)) => {
+                    dji4g_windows_platform::sms_delete_checked(&device, epoch, &fragment, control)
+                }
+                Err(error) => dji4g_domain::SmsDeleteReceipt {
+                    result: dji4g_domain::SmsDeleteItemResult::Failed,
+                    code: Some(error.code.stable.as_str().to_owned()),
+                },
+            }
+        })
+    }
+
     fn send(
         &self,
         target: &TargetContext,
@@ -3075,7 +3096,7 @@ mod tests {
     fn sms_record_maps_unread_state_and_preserves_multipart_metadata() {
         let mut decoded = decoded_sms("10086", "first fragment");
         decoded.multipart = Some(dji4g_domain::SmsMultipartInfo {
-            reference: 9,
+            reference: dji4g_domain::SmsConcatReference::EightBit(9),
             total: 2,
             sequence: 1,
         });
@@ -3090,7 +3111,7 @@ mod tests {
         assert_eq!(
             message.multipart,
             Some(dji4g_domain::SmsMultipartInfo {
-                reference: 9,
+                reference: dji4g_domain::SmsConcatReference::EightBit(9),
                 total: 2,
                 sequence: 1,
             })

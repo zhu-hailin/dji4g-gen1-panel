@@ -920,6 +920,69 @@ fn one_task_at_a_time_is_enforced_across_sms_repairs_and_tools() {
 }
 
 #[test]
+fn tool_busy_rejects_sms_with_the_feedback_consumed_by_the_composer() {
+    let mut controller = controller();
+    controller
+        .handle_command(UiCommand::RunToolRead {
+            id: ToolReadId::SignalQuality,
+        })
+        .unwrap();
+    assert!(
+        controller
+            .handle_command(UiCommand::SmsSend {
+                recipient: "+8613800138000".into(),
+                body: "test".into(),
+            })
+            .is_err()
+    );
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.feedback.unwrap().code.stable.as_str(), "sms:busy");
+    assert!(snapshot.sms_send.is_none());
+    assert!(controller.take_sms_requests().is_empty());
+}
+
+#[test]
+fn clearing_history_keeps_capabilities_profile_and_running_task() {
+    let mut controller = controller();
+    controller.finish_tool_task(ToolReceipt {
+        id: 1,
+        operation: ToolOperationKind::Read(ToolReadId::SignalQuality),
+        outcome: ToolOutcome::Ok,
+        elapsed: Duration::from_millis(10),
+        context: context(),
+        saw_final_code: true,
+        payload_lines: 1,
+        transcript: Arc::new(ToolTranscript::from_lines(vec!["+CSQ: 20,99".into()])),
+    });
+    controller
+        .handle_command(UiCommand::RunToolRead {
+            id: ToolReadId::Model,
+        })
+        .unwrap();
+    let before = controller.snapshot().device_tools;
+    assert_eq!(before.history.len(), 1);
+    controller
+        .handle_command(UiCommand::ClearToolHistory)
+        .unwrap();
+    let after = controller.snapshot().device_tools;
+    assert!(after.history.is_empty());
+    assert_eq!(before.task, after.task);
+    assert_eq!(before.capabilities, after.capabilities);
+    assert_eq!(before.profile, after.profile);
+    controller.finish_tool_task(ToolReceipt {
+        id: 2,
+        operation: ToolOperationKind::Read(ToolReadId::Model),
+        outcome: ToolOutcome::Ok,
+        elapsed: Duration::ZERO,
+        context: context(),
+        saw_final_code: true,
+        payload_lines: 1,
+        transcript: Arc::new(ToolTranscript::from_lines(vec!["EC200A".into()])),
+    });
+    assert_eq!(controller.snapshot().device_tools.history.len(), 1);
+}
+
+#[test]
 fn an_expert_command_needs_its_own_confirmation_and_runs_at_most_once() {
     let tools = FakeTools::new(vec![(ToolOutcome::OutcomeUnknown, 0)]);
     let controller = controller();

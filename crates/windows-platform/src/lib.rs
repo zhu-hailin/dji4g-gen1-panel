@@ -19,9 +19,13 @@ pub mod tray;
 
 pub use adapter::*;
 
-/// Resolve the OS shell independently of PATH and user-supplied environment variables.
+/// Resolve an executable that ships with Windows, independently of PATH and user-supplied
+/// environment variables.
+///
+/// `relative` is relative to the system directory (`C:\Windows\System32` by default), e.g.
+/// `"schtasks.exe"` or `"WindowsPowerShell/v1.0/powershell.exe"`.
 #[cfg(windows)]
-pub fn driver_setup_powershell() -> std::io::Result<std::path::PathBuf> {
+pub fn system_executable(relative: &str) -> std::io::Result<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     let mut buffer = vec![0u16; 32768];
     // SAFETY: the writable buffer holds exactly the advertised number of UTF-16 units.
@@ -34,10 +38,18 @@ pub fn driver_setup_powershell() -> std::io::Result<std::path::PathBuf> {
     if length == 0 || length >= buffer.len() {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(
-        std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]))
-            .join("WindowsPowerShell/v1.0/powershell.exe"),
-    )
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join(relative))
+}
+
+#[cfg(not(windows))]
+pub fn system_executable(_relative: &str) -> std::io::Result<std::path::PathBuf> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Resolve the OS shell independently of PATH and user-supplied environment variables.
+#[cfg(windows)]
+pub fn driver_setup_powershell() -> std::io::Result<std::path::PathBuf> {
+    system_executable("WindowsPowerShell/v1.0/powershell.exe")
 }
 
 #[cfg(not(windows))]
@@ -55,6 +67,8 @@ pub use repair::*;
 pub use serial::*;
 pub use single_instance::*;
 pub use sms::*;
+mod sms_delete;
+pub use sms_delete::sms_delete_checked;
 mod sms_transaction;
 pub use sms_transaction::{SmsSubmitReceipt, sms_send_controlled};
 pub use tray::{

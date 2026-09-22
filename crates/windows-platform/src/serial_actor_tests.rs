@@ -956,3 +956,332 @@ mod tool_transactions {
         }
     }
 }
+
+#[test]
+fn checked_delete_refuses_unverified_slot_before_cmgd() {
+    let (actor, state) = actor_with_reads([
+        Ok(b"OK\r\n".to_vec()),
+        Ok(b"Quectel\r\nOK\r\n".to_vec()),
+        Ok(b"+CMGF: 1\r\nOK\r\n".to_vec()),
+    ]);
+    let result = actor.execute_checked_delete(
+        delete_key(),
+        dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1)),
+    );
+    assert_eq!(
+        result.result,
+        dji4g_domain::SmsDeleteItemResult::NotAttempted
+    );
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .all(|bytes| !bytes.starts_with(b"AT+CMGD")),
+        "legacy index-only path deletes without mode, storage or payload verification"
+    );
+}
+
+const DELETE_PDU: &str = "00040B912120550521F300004210203040502305E8329BFD06";
+
+#[test]
+fn checked_delete_each_preflight_error_prevents_delete() {
+    for stage in 0..5 {
+        let mut reads = delete_reads("OK\r\n");
+        reads[stage] = Ok(b"ERROR\r\n".to_vec());
+        let (actor, state) = actor_with_reads(reads);
+        let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
+        let receipt = actor.execute_checked_delete(delete_key(), control.clone());
+        assert_ne!(receipt.result, dji4g_domain::SmsDeleteItemResult::Deleted);
+        assert!(!control.delete_attempted());
+        assert_eq!(state.lock().unwrap().writes.len(), stage + 1);
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .all(|line| !line.starts_with(b"AT+CMGD"))
+        );
+    }
+}
+
+#[test]
+fn checked_delete_deadline_cancels_blocked_open_before_any_at_write() {
+    let state = Arc::new((Mutex::new(BlockingState::default()), Condvar::new()));
+    let cancel_state = state.clone();
+    let open_state = state.clone();
+    let control = dji4g_domain::SmsDeleteControl::new(Duration::from_millis(50));
+    let mut actor = AtSessionActor::spawn_delete_opener(
+        DeviceEpoch(7),
+        None,
+        None,
+        &control,
+        move || Ok(Arc::new(BlockingCancellation(cancel_state))),
+        move || {
+            let (lock, changed) = &*open_state;
+            let guard = lock.lock().unwrap();
+            let _guard = changed.wait_while(guard, |state| !state.released).unwrap();
+            Err(io::ErrorKind::Interrupted.into())
+        },
+    )
+    .unwrap();
+    let result = actor.execute_checked_delete(delete_key(), control.clone());
+    assert_eq!(
+        result.result,
+        dji4g_domain::SmsDeleteItemResult::NotAttempted
+    );
+    assert!(!control.delete_attempted());
+    assert!(state.0.lock().unwrap().released);
+    assert!(state.0.lock().unwrap().writes.is_empty());
+    actor
+        .close_delete_and_wait(&control, Duration::from_secs(1))
+        .unwrap();
+    assert!(!control.cleanup_pending());
+}
+
+struct DeleteBlockingSerial {
+    state: Arc<(Mutex<BlockingState>, Condvar)>,
+    block_write: bool,
+}
+
+impl SerialIo for DeleteBlockingSerial {
+    fn cancellation_handle(&self) -> io::Result<Arc<dyn SerialIoCancellation>> {
+        Ok(Arc::new(BlockingCancellation(self.state.clone())))
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        state.writes.push(bytes.to_vec());
+        changed.notify_all();
+        if state.writes.len() == 6 && self.block_write {
+            let _state = changed.wait_while(state, |state| !state.released).unwrap();
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(())
+    }
+    fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        if state.writes.len() == 6 {
+            let _state = changed.wait_while(state, |state| !state.released).unwrap();
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(state.reads.pop_front().expect("preflight response"))
+    }
+}
+
+#[test]
+fn checked_delete_cancel_and_deadline_reach_actual_delete_read_and_write() {
+    for block_write in [false, true] {
+        for explicit_cancel in [false, true] {
+            let state = Arc::new((
+                Mutex::new(BlockingState {
+                    reads: delete_reads("OK\r\n")
+                        .into_iter()
+                        .map(Result::unwrap)
+                        .collect(),
+                    ..BlockingState::default()
+                }),
+                Condvar::new(),
+            ));
+            let actor = AtSessionActor::spawn(
+                DeviceEpoch(7),
+                Box::new(DeleteBlockingSerial {
+                    state: state.clone(),
+                    block_write,
+                }),
+            );
+            let control = dji4g_domain::SmsDeleteControl::new(if explicit_cancel {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(100)
+            });
+            let canceller = if explicit_cancel {
+                let control = control.clone();
+                let state = state.clone();
+                Some(thread::spawn(move || {
+                    wait_for_writes(&state, 6);
+                    control.cancel();
+                }))
+            } else {
+                None
+            };
+            let result = actor.execute_checked_delete(delete_key(), control.clone());
+            if let Some(canceller) = canceller {
+                canceller.join().unwrap();
+            }
+            assert_eq!(
+                result.result,
+                dji4g_domain::SmsDeleteItemResult::OutcomeUnknown
+            );
+            assert!(control.delete_attempted());
+            assert!(
+                state.0.lock().unwrap().released,
+                "native cancellation handle was not invoked"
+            );
+            assert_eq!(state.0.lock().unwrap().writes.len(), 6);
+        }
+    }
+}
+
+fn delete_key() -> dji4g_domain::SmsFragmentKey {
+    use dji4g_domain::{SmsMessage, SmsStatus, SmsStorageId};
+    let decoded = dji4g_at_protocol::decode_deliver_pdu(DELETE_PDU).unwrap();
+    let mut message = SmsMessage::new(
+        1,
+        SmsStorageId("SM".into()),
+        7,
+        1,
+        decoded.sender,
+        decoded.body,
+        decoded.encoding,
+        SmsStatus::Received,
+    );
+    message.service_centre_timestamp = decoded.timestamp;
+    message.multipart = decoded.multipart;
+    message.fragment_key()
+}
+
+fn delete_reads(final_response: &str) -> Vec<io::Result<Vec<u8>>> {
+    [
+        "OK\r\n".to_owned(),
+        "Quectel\r\nOK\r\n".into(),
+        "+CMGF: 0\r\nOK\r\n".into(),
+        "+CPMS: \"SM\",3,20,\"ME\",0,20,\"ME\",0,20\r\nOK\r\n".into(),
+        format!("+CMGR: 1,,24\r\n{DELETE_PDU}\r\nOK\r\n"),
+        final_response.into(),
+    ]
+    .into_iter()
+    .map(|line| Ok(line.into_bytes()))
+    .collect()
+}
+
+#[test]
+fn checked_delete_matches_payload_and_requires_final_ok_without_retry() {
+    use dji4g_domain::{SmsDeleteControl, SmsDeleteItemResult};
+    for (final_response, expected) in [
+        ("OK\r\n", SmsDeleteItemResult::Deleted),
+        ("ERROR\r\n", SmsDeleteItemResult::Failed),
+        ("+CMS ERROR: 321\r\n", SmsDeleteItemResult::Failed),
+        ("+CME ERROR: 10\r\n", SmsDeleteItemResult::Failed),
+    ] {
+        let (actor, state) = actor_with_reads(delete_reads(final_response));
+        let control = SmsDeleteControl::new(Duration::from_secs(2));
+        let result = actor.execute_checked_delete(delete_key(), control.clone());
+        assert_eq!(result.result, expected);
+        assert!(control.delete_attempted());
+        assert_eq!(
+            state.lock().unwrap().writes,
+            [
+                b"AT\r".to_vec(),
+                b"ATI\r".to_vec(),
+                b"AT+CMGF?\r".to_vec(),
+                b"AT+CPMS?\r".to_vec(),
+                b"AT+CMGR=1\r".to_vec(),
+                b"AT+CMGD=1\r".to_vec()
+            ]
+        );
+    }
+}
+
+#[test]
+fn checked_delete_refuses_changed_payload_unknown_storage_and_other_holder() {
+    for case in 0..4 {
+        let mut reads = delete_reads("OK\r\n");
+        let mut key = delete_key();
+        match case {
+            0 => key.payload_fingerprint = [0; 32],
+            1 => key.storage.0.clear(),
+            2 => reads[3] = Ok(b"+CPMS: \"ME\",3,20\r\nOK\r\n".to_vec()),
+            _ => reads[3] = Ok(b"+CPMS: 3,20\r\nOK\r\n".to_vec()),
+        }
+        let (actor, state) = actor_with_reads(reads);
+        let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
+        let result = actor.execute_checked_delete(key, control.clone());
+        assert_eq!(
+            result.result,
+            dji4g_domain::SmsDeleteItemResult::NotAttempted
+        );
+        assert!(!control.delete_attempted());
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .all(|line| !line.starts_with(b"AT+CMGD"))
+        );
+    }
+}
+
+#[test]
+fn checked_delete_partial_write_and_missing_final_are_unknown_and_never_retried() {
+    for fail_write in [true, false] {
+        let mut reads = delete_reads("OK\r\n");
+        reads[5] = Err(io::Error::from(io::ErrorKind::NotConnected));
+        let (actor, state) = actor_with_state(FakeState {
+            reads: reads.into_iter().collect(),
+            fail_write_at: fail_write.then_some(5),
+            ..FakeState::default()
+        });
+        let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
+        let result = actor.execute_checked_delete(delete_key(), control.clone());
+        assert_eq!(
+            result.result,
+            dji4g_domain::SmsDeleteItemResult::OutcomeUnknown
+        );
+        assert!(control.delete_attempted());
+        assert_eq!(state.lock().unwrap().write_attempts, 6);
+    }
+}
+
+#[test]
+fn checked_delete_deadline_actively_cancels_blocked_preflight_io() {
+    let (actor, state) = blocking_actor(&[]);
+    let mut key = delete_key();
+    key.device_epoch = 8;
+    let control = dji4g_domain::SmsDeleteControl::new(Duration::from_millis(40));
+    let start = std::time::Instant::now();
+    let result = actor.execute_checked_delete(key, control.clone());
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        result.result,
+        dji4g_domain::SmsDeleteItemResult::NotAttempted
+    );
+    assert!(!control.delete_attempted());
+    assert!(state.0.lock().unwrap().released);
+}
+
+#[test]
+fn checked_delete_close_timeout_holds_lease_and_clears_cleanup_only_after_drop() {
+    let path = "checked-delete-slow-cleanup";
+    let dropped = Arc::new(AtomicBool::new(false));
+    let lease = super::SerialLease::acquire(path, Duration::ZERO).unwrap();
+    let mut actor = AtSessionActor::spawn_with_lease(
+        DeviceEpoch(7),
+        Box::new(SlowDropSerial(dropped.clone())),
+        None,
+        Some(lease),
+    )
+    .unwrap();
+    let control = dji4g_domain::SmsDeleteControl::new(Duration::from_secs(1));
+    assert_eq!(
+        actor.close_delete_and_wait(&control, Duration::from_millis(1)),
+        Err(ActorError::CloseTimeout)
+    );
+    assert!(control.cleanup_pending());
+    assert!(matches!(
+        super::SerialLease::acquire(path, Duration::ZERO),
+        Err(ActorError::LeaseBusy)
+    ));
+    drop(actor);
+    let start = std::time::Instant::now();
+    while control.cleanup_pending() && start.elapsed() < Duration::from_secs(1) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!control.cleanup_pending());
+    assert!(dropped.load(Ordering::Acquire));
+    let _lease = super::SerialLease::acquire(path, Duration::ZERO).unwrap();
+}

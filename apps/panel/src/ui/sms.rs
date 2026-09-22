@@ -16,7 +16,10 @@ mod compose;
 pub(crate) use compose::SmsComposeState;
 
 use dji4g_application::{ControllerSnapshot, UiCommand};
-use dji4g_domain::{FeatureStatus, SmsDirection, SmsEncoding, SmsMessage, SmsStatus};
+use dji4g_domain::{
+    FeatureStatus, SmsDeleteItemResult, SmsDirection, SmsDisplayMessage, SmsEncoding,
+    SmsFragmentKey, SmsMessage, SmsStatus,
+};
 use eframe::egui::{self, RichText, Ui};
 
 use super::{StatusTone, meta_text, scale, sms_layout, wrapped_label};
@@ -30,6 +33,9 @@ use crate::localization::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SmsRowVm {
     pub index: u32,
+    pub stable_id: [u8; 32],
+    pub fragments: Vec<SmsFragmentKey>,
+    pub delete_allowed: bool,
     /// `Some(true)` unread, `Some(false)` read, `None` while the read state is unknown.
     pub unread: Option<bool>,
     pub sender_masked: String,
@@ -120,9 +126,18 @@ pub fn outgoing_state(status: SmsStatus) -> (StatusTone, TextKey) {
         SmsStatus::Submitted => (StatusTone::Positive, TextKey::SmsOutgoingSubmitted),
         SmsStatus::Failed => (StatusTone::Negative, TextKey::SmsOutgoingFailed),
         SmsStatus::OutcomeUnknown | SmsStatus::Received | SmsStatus::Incomplete => {
-            (StatusTone::Neutral, TextKey::SmsOutgoingUnknown)
+            (StatusTone::Caution, TextKey::SmsOutgoingUnknown)
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn an_unknown_submission_is_a_caution_not_a_neutral_receipt() {
+    assert_eq!(
+        outgoing_state(SmsStatus::OutcomeUnknown).0,
+        StatusTone::Caution
+    );
 }
 
 /// Right-aligned vocabulary of one row, ordered left to right: encoding, fragment count, then the
@@ -138,9 +153,9 @@ pub fn row_tags(row: &SmsRowVm, language: Language) -> Vec<SmsRowTag> {
         text: sms_encoding_text(row.encoding, language),
         tone: StatusTone::Neutral,
     }];
-    if let Some((sequence, total)) = row.multipart {
+    if let Some((_, total)) = row.multipart {
         tags.push(SmsRowTag {
-            text: format!("{sequence}/{total}"),
+            text: format!("已读取 {} / {total} 个分片", row.fragments.len()),
             tone: StatusTone::Neutral,
         });
     }
@@ -157,8 +172,21 @@ pub fn row_tags(row: &SmsRowVm, language: Language) -> Vec<SmsRowTag> {
 /// are placed in the VM so an explicit row click can reveal/copy them in place.
 #[must_use]
 pub fn sms_row_vm(message: &SmsMessage, _language: Language) -> SmsRowVm {
+    let fragments = if message.direction == SmsDirection::Incoming {
+        vec![message.fragment_key()]
+    } else {
+        Vec::new()
+    };
+    let display = SmsDisplayMessage {
+        message: message.clone(),
+        fragments: fragments.clone(),
+        delete_allowed: message.direction == SmsDirection::Incoming,
+    };
     SmsRowVm {
         index: message.index,
+        stable_id: display.stable_id(),
+        fragments,
+        delete_allowed: display.delete_allowed,
         unread: message.read.map(|read| !read),
         sender_masked: message.sender_masked(),
         sender_full: message.sender().to_owned(),
@@ -171,6 +199,14 @@ pub fn sms_row_vm(message: &SmsMessage, _language: Language) -> SmsRowVm {
         status: message.status,
         direction: message.direction,
     }
+}
+
+fn display_row_vm(message: &SmsDisplayMessage, language: Language) -> SmsRowVm {
+    let mut row = sms_row_vm(&message.message, language);
+    row.stable_id = message.stable_id();
+    row.fragments = message.fragments.clone();
+    row.delete_allowed = message.delete_allowed;
+    row
 }
 
 #[must_use]
@@ -237,12 +273,17 @@ fn list_viewport_id() -> egui::Id {
 pub(crate) fn render(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
-    messages: &[SmsMessage],
+    messages: &[SmsDisplayMessage],
     language: Language,
     sink: &dyn UiCommandSink,
     state: &mut SmsComposeState,
 ) {
-    let vm = sms_vm(snapshot, messages, language);
+    let mut vm = sms_vm(snapshot, &[], language);
+    vm.rows = messages
+        .iter()
+        .map(|message| display_row_vm(message, language))
+        .collect();
+    state.serial_busy = snapshot.serial_work_busy;
     ui.horizontal_wrapped(|ui| {
         ui.vertical(|ui| {
             ui.heading("短信中心");
@@ -253,7 +294,10 @@ pub(crate) fn render(
                 state.open = true;
             }
             if ui
-                .add_enabled(!snapshot.sms_refresh_pending, egui::Button::new("刷新列表"))
+                .add_enabled(
+                    !snapshot.sms_refresh_pending && !snapshot.serial_work_busy,
+                    egui::Button::new("刷新列表"),
+                )
                 .clicked()
             {
                 refresh(sink, state);
@@ -262,10 +306,14 @@ pub(crate) fn render(
     });
     ui.add_space(16.0);
     compose::render(ui, state, snapshot, sink);
-    let busy = snapshot
-        .sms_send
-        .as_ref()
-        .is_some_and(|send| send.is_active())
+    if let Some(deletion) = &snapshot.sms_delete {
+        render_delete_result(ui, deletion);
+    }
+    let busy = snapshot.serial_work_busy
+        || snapshot
+            .sms_send
+            .as_ref()
+            .is_some_and(|send| send.is_active())
         || snapshot.operation.as_ref().is_some_and(|operation| {
             matches!(
                 operation.state,
@@ -434,11 +482,10 @@ fn render_inbox(
                             || row.body.to_lowercase().contains(&query))
                 })
                 .collect();
-            if state.selected.is_some_and(|key| {
-                !rows
-                    .iter()
-                    .any(|r| (r.direction == SmsDirection::Outgoing, r.index) == key)
-            }) {
+            if state
+                .selected
+                .is_some_and(|key| !rows.iter().any(|r| r.stable_id == key))
+            {
                 state.selected = None;
             }
             // Everything the frame has left, minus the footer note, is the workspace. One
@@ -586,7 +633,7 @@ fn render_list(
 ) {
     for row in rows {
         let outgoing = row.direction == SmsDirection::Outgoing;
-        let key = (outgoing, row.index);
+        let key = row.stable_id;
         let selected = state.selected == Some(key);
         let frame = egui::Frame::none()
             .rounding(10.0)
@@ -622,7 +669,11 @@ fn render_list(
                 ui.horizontal_wrapped(|ui| {
                     ui.label(meta_text(row.timestamp.as_deref().unwrap_or("时间未提供")));
                     if outgoing {
-                        ui.label(meta_text(outgoing_state(row.status).1.to_string(language)));
+                        let (tone, label) = outgoing_state(row.status);
+                        ui.colored_label(
+                            tone.color(),
+                            format!("{} {}", tone.marker(), label.to_string(language)),
+                        );
                     }
                 });
             })
@@ -635,7 +686,7 @@ fn render_list(
         }
         if response.clicked() {
             state.selected = Some(key);
-            if !outgoing {
+            if !outgoing && !state.serial_busy {
                 state.error = sink
                     .try_send(UiCommand::SmsRead { index: row.index })
                     .err()
@@ -655,7 +706,7 @@ fn render_detail(
 ) {
     let Some(row) = rows
         .iter()
-        .find(|row| state.selected == Some((row.direction == SmsDirection::Outgoing, row.index)))
+        .find(|row| state.selected == Some(row.stable_id))
     else {
         empty_panel(
             ui,
@@ -701,7 +752,13 @@ fn render_detail(
                 .copy_text(format!("{}\n{}", row.sender_full, row.body));
         }
         if row.direction == SmsDirection::Incoming {
-            render_delete_button(ui, row, language, sink);
+            if ui
+                .add_enabled(!state.serial_busy, egui::Button::new("回复"))
+                .clicked()
+            {
+                state.begin_reply(&row.sender_full);
+            }
+            render_delete_button(ui, row, language, sink, state);
         } else {
             badge(
                 ui,
@@ -714,28 +771,132 @@ fn render_detail(
 /// Per-row delete with an in-page two-click confirmation: the first click arms the button for
 /// [`CONFIRM_ARM_WINDOW`] and the second dispatches. No deletion is ever sent unconfirmed, and
 /// only incoming rows reach this path (an outgoing record has no module copy to delete).
-fn render_delete_button(ui: &mut Ui, row: &SmsRowVm, language: Language, sink: &dyn UiCommandSink) {
-    let armed_id = egui::Id::new(("sms-row-delete-armed", row.index));
-    let armed = ui
-        .data(|data| data.get_temp::<Instant>(armed_id))
-        .is_some_and(|at| at.elapsed() < CONFIRM_ARM_WINDOW);
+fn render_delete_button(
+    ui: &mut Ui,
+    row: &SmsRowVm,
+    _language: Language,
+    sink: &dyn UiCommandSink,
+    state: &mut SmsComposeState,
+) {
+    let armed_id = egui::Id::new(("sms-row-delete-armed", row.stable_id));
+    let enabled = row.delete_allowed && !row.fragments.is_empty() && !state.serial_busy;
+    if !enabled {
+        ui.data_mut(|data| data.remove::<Instant>(armed_id));
+    }
+    let armed = enabled
+        && ui
+            .data(|data| data.get_temp::<Instant>(armed_id))
+            .is_some_and(|at| at.elapsed() < CONFIRM_ARM_WINDOW);
     let label = if armed {
-        TextKey::ButtonSmsDeleteConfirm
+        format!("确认删除 {} 个已读取分片", row.fragments.len())
+    } else if row.status == SmsStatus::Incomplete {
+        format!("删除已读取 {} 个分片", row.fragments.len())
     } else {
-        TextKey::ButtonSmsDelete
+        format!("删除短信（{} 个分片）", row.fragments.len())
     };
-    let button = egui::Button::new(RichText::new(label.to_string(language)).color(if armed {
-        StatusTone::Negative.color()
-    } else {
-        scale::SECONDARY
-    }));
-    if ui.add(button).clicked() {
+    if ui
+        .add_enabled(
+            enabled,
+            egui::Button::new(RichText::new(label).color(if armed {
+                StatusTone::Negative.color()
+            } else {
+                scale::SECONDARY
+            })),
+        )
+        .clicked()
+    {
         if armed {
             ui.data_mut(|data| data.remove::<Instant>(armed_id));
-            let _ = sink.try_send(UiCommand::SmsDelete { index: row.index });
+            state.error = sink
+                .try_send(UiCommand::SmsDelete {
+                    fragments: row.fragments.clone(),
+                })
+                .err()
+                .map(|error| compose::enqueue_error(error).to_owned());
         } else {
             ui.data_mut(|data| data.insert_temp(armed_id, Instant::now()));
         }
+    }
+    if !row.delete_allowed {
+        wrapped_label(
+            ui,
+            meta_text("分片身份存在冲突，暂不能删除；请重新读取并核对。"),
+        );
+    }
+}
+
+fn delete_result_text(deletion: &dji4g_application::SmsDeleteSnapshot) -> (StatusTone, String) {
+    let deleted = deletion
+        .items
+        .iter()
+        .filter(|item| item.result == SmsDeleteItemResult::Deleted)
+        .count();
+    let unknown = deletion
+        .items
+        .iter()
+        .filter(|item| item.result == SmsDeleteItemResult::OutcomeUnknown)
+        .count();
+    if !deletion.finished {
+        return (
+            StatusTone::Progress,
+            format!("正在删除：已确认 {deleted} / {} 个分片", deletion.total),
+        );
+    }
+    if deleted == deletion.total && deletion.total > 0 {
+        return (
+            StatusTone::Positive,
+            format!("已确认删除全部 {} 个已读取分片", deletion.total),
+        );
+    }
+    if unknown > 0 {
+        return (
+            StatusTone::Caution,
+            format!(
+                "删除结果未知：已确认 {deleted} / {} 个，{unknown} 个未能确认。请刷新核对，不会自动重试。",
+                deletion.total
+            ),
+        );
+    }
+    if deleted > 0 {
+        return (
+            StatusTone::Caution,
+            format!(
+                "部分删除：已确认 {deleted} / {} 个分片，其余失败或未执行。",
+                deletion.total
+            ),
+        );
+    }
+    (
+        StatusTone::Negative,
+        "未确认删除任何分片；请查看原因并重新读取。".into(),
+    )
+}
+
+fn render_delete_result(ui: &mut Ui, deletion: &dji4g_application::SmsDeleteSnapshot) {
+    let (tone, text) = delete_result_text(deletion);
+    wrapped_label(
+        ui,
+        RichText::new(format!("{} {text}", tone.marker())).color(tone.color()),
+    );
+    if deletion.items.len() > 1 || deletion.items.iter().any(|item| item.code.is_some()) {
+        egui::CollapsingHeader::new("删除分片结果").show(ui, |ui| {
+            for item in &deletion.items {
+                let result = match item.result {
+                    SmsDeleteItemResult::Deleted => "已确认删除",
+                    SmsDeleteItemResult::Failed => "失败",
+                    SmsDeleteItemResult::OutcomeUnknown => "结果未知",
+                    SmsDeleteItemResult::NotAttempted => "未执行",
+                };
+                let code = item.code.as_deref().unwrap_or("");
+                wrapped_label(
+                    ui,
+                    meta_text(format!(
+                        "{} #{} · {result} {code}",
+                        item.fragment.storage.0, item.fragment.index
+                    )),
+                );
+            }
+        });
     }
 }
 
@@ -775,6 +936,17 @@ mod tests {
         SmsInboxSummary, SmsMessage, SmsMultipartInfo, SmsStatus, SmsStorageId,
     };
 
+    fn display_messages(messages: &[SmsMessage]) -> Vec<SmsDisplayMessage> {
+        messages
+            .iter()
+            .map(|message| SmsDisplayMessage {
+                message: message.clone(),
+                fragments: vec![message.fragment_key()],
+                delete_allowed: message.direction == SmsDirection::Incoming,
+            })
+            .collect()
+    }
+
     fn snapshot(summary: SmsInboxSummary) -> ControllerSnapshot {
         ControllerSnapshot {
             publication_revision: 7,
@@ -804,6 +976,8 @@ mod tests {
             sms_inbox: summary,
             sms_messages: Vec::new(),
             sms_send: None,
+            sms_delete: None,
+            serial_work_busy: false,
             sms_refresh_pending: false,
             sms_inbox_failure: None,
             device_tools: Default::default(),
@@ -823,7 +997,7 @@ mod tests {
         );
         message.service_centre_timestamp = Some("24/09/10,12:00:00+32".to_owned());
         message.multipart = Some(SmsMultipartInfo {
-            reference: 1,
+            reference: dji4g_domain::SmsConcatReference::EightBit(1),
             total: 3,
             sequence: 2,
         });
@@ -841,6 +1015,67 @@ mod tests {
             SmsEncoding::Other,
             status,
         )
+    }
+
+    #[test]
+    fn physical_storage_and_payload_changes_cannot_reuse_a_selection() {
+        let original = message(7, Some(false), SmsStatus::Received);
+        let mut other_storage = original.clone();
+        other_storage.storage = SmsStorageId("ME".into());
+        let replacement = SmsMessage::new(
+            7,
+            original.storage.clone(),
+            1,
+            0,
+            "+8613800138000",
+            "replacement",
+            SmsEncoding::Ucs2,
+            SmsStatus::Received,
+        );
+        assert_ne!(
+            sms_row_vm(&original, Language::ZhCn).stable_id,
+            sms_row_vm(&other_storage, Language::ZhCn).stable_id
+        );
+        assert_ne!(
+            sms_row_vm(&original, Language::ZhCn).stable_id,
+            sms_row_vm(&replacement, Language::ZhCn).stable_id
+        );
+        let mut read = original.clone();
+        read.read = Some(true);
+        assert_eq!(
+            sms_row_vm(&original, Language::ZhCn).stable_id,
+            sms_row_vm(&read, Language::ZhCn).stable_id
+        );
+    }
+
+    #[test]
+    fn delete_receipts_distinguish_all_partial_and_unknown() {
+        use dji4g_application::{SmsDeleteItemSnapshot, SmsDeleteSnapshot};
+        let fragment = message(7, None, SmsStatus::Received).fragment_key();
+        let mut deletion = SmsDeleteSnapshot {
+            request_id: 1,
+            total: 2,
+            finished: true,
+            items: vec![
+                SmsDeleteItemSnapshot {
+                    fragment: fragment.clone(),
+                    result: SmsDeleteItemResult::Deleted,
+                    code: None,
+                },
+                SmsDeleteItemSnapshot {
+                    fragment,
+                    result: SmsDeleteItemResult::Failed,
+                    code: Some("sms:delete_rejected".into()),
+                },
+            ],
+        };
+        assert!(delete_result_text(&deletion).1.contains("部分删除"));
+        deletion.items[1].result = SmsDeleteItemResult::OutcomeUnknown;
+        assert_eq!(delete_result_text(&deletion).0, StatusTone::Caution);
+        assert!(delete_result_text(&deletion).1.contains("不会自动重试"));
+        deletion.items[1].result = SmsDeleteItemResult::Deleted;
+        assert_eq!(delete_result_text(&deletion).0, StatusTone::Positive);
+        assert!(delete_result_text(&deletion).1.contains("全部 2"));
     }
 
     #[test]
@@ -1028,7 +1263,7 @@ mod tests {
         );
         assert_eq!(
             outgoing_state(SmsStatus::OutcomeUnknown),
-            (StatusTone::Neutral, TextKey::SmsOutgoingUnknown)
+            (StatusTone::Caution, TextKey::SmsOutgoingUnknown)
         );
     }
 
@@ -1040,7 +1275,7 @@ mod tests {
         );
         let tags = row_tags(&row, Language::ZhCn);
         let texts = tags.iter().map(|tag| tag.text.as_str()).collect::<Vec<_>>();
-        assert_eq!(texts, ["UCS2", "2/3", "未完整"]);
+        assert_eq!(texts, ["UCS2", "已读取 1 / 3 个分片", "未完整"]);
         assert_eq!(tags[0].tone, StatusTone::Neutral);
         assert_eq!(tags[1].tone, StatusTone::Neutral);
         assert_eq!(tags[2].tone, StatusTone::Caution);
@@ -1142,7 +1377,7 @@ mod tests {
                     render(
                         ui,
                         &snapshot,
-                        &messages,
+                        &display_messages(&messages),
                         Language::ZhCn,
                         &sink,
                         &mut SmsComposeState::default(),
@@ -1190,7 +1425,14 @@ mod tests {
                 },
                 |context| {
                     egui::CentralPanel::default().show(context, |ui| {
-                        render(ui, &snapshot, &messages, Language::ZhCn, &sink, &mut state);
+                        render(
+                            ui,
+                            &snapshot,
+                            &display_messages(&messages),
+                            Language::ZhCn,
+                            &sink,
+                            &mut state,
+                        );
                     });
                 },
             );

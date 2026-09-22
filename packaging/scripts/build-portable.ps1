@@ -1,7 +1,8 @@
 [CmdletBinding()]
-param([string]$OutputDirectory = 'dist', [string]$LocalDriverDirectory)
+param([string]$OutputDirectory = 'dist', [string]$LocalDriverDirectory, [string]$BinaryDirectory)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+$binaryRoot = if ($BinaryDirectory) { (Resolve-Path -LiteralPath $BinaryDirectory).Path } else { Join-Path $repoRoot 'target/x86_64-pc-windows-msvc/release' }
 $output = if ([IO.Path]::IsPathRooted($OutputDirectory)) { [IO.Path]::GetFullPath($OutputDirectory) } else { [IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDirectory)) }
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 $archiveName = if ($LocalDriverDirectory) { 'dji4g-panel-windows-x64-local-offline.zip' } else { 'dji4g-panel-windows-x64-portable.zip' }
@@ -10,7 +11,7 @@ if (Test-Path -LiteralPath $archive) { throw 'Portable archive already exists; u
 $staging = Join-Path $output ('portable-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $staging | Out-Null
 foreach ($name in @('dji4g-panel.exe','dji4g-helper.exe')) {
-    $binary = Join-Path $repoRoot ('target/x86_64-pc-windows-msvc/release/' + $name)
+    $binary = Join-Path $binaryRoot $name
     if (!(Test-Path -LiteralPath $binary)) { throw "Missing release binary: $name" }
     Copy-Item -LiteralPath $binary -Destination $staging
 }
@@ -20,7 +21,7 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/THIRD-PARTY-NOTICES.txt') -Des
 if ($LocalDriverDirectory) {
     $driverSource = (Resolve-Path -LiteralPath $LocalDriverDirectory).Path
     Copy-Item -LiteralPath $driverSource -Destination (Join-Path $staging 'drivers') -Recurse
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'target/x86_64-pc-windows-msvc/release/dji4g-driver-setup.exe') -Destination $staging
+    Copy-Item -LiteralPath (Join-Path $binaryRoot 'dji4g-driver-setup.exe') -Destination $staging
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/LOCAL_OFFLINE_DRIVERS.md') -Destination $staging
     $driverCheck = Start-Process -FilePath (Join-Path $staging 'dji4g-driver-setup.exe') -ArgumentList '--check' -WindowStyle Hidden -Wait -PassThru
     if ($driverCheck.ExitCode -ne 0) { throw 'Local driver validation failed; no archive produced' }

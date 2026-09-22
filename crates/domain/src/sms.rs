@@ -8,7 +8,7 @@ use crate::FeatureStatus;
 
 /// Storage class a message lives in (3GPP TS 27.005 `CPMS`). Kept as an open string: the
 /// firmware may report holders beyond `SM`/`ME` (e.g. `MT`), and none of them may be guessed at.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct SmsStorageId(pub String);
 
 /// Message encoding actually decoded by the PDU codec.
@@ -20,11 +20,18 @@ pub enum SmsEncoding {
     Other,
 }
 
+/// Reference width is part of identity, including when both numeric values are equal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum SmsConcatReference {
+    EightBit(u8),
+    SixteenBit(u16),
+}
+
 /// Long-message concatenation header (3GPP TS 23.040 §9.2.3.24).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SmsMultipartInfo {
     /// Concatenated reference number (may repeat across windows).
-    pub reference: u8,
+    pub reference: SmsConcatReference,
     /// Total number of fragments.
     pub total: u8,
     /// One-based fragment sequence.
@@ -48,7 +55,7 @@ pub enum SmsStatus {
 /// Outgoing records are local bookkeeping of a user-confirmed submission: the module reports no
 /// storage index for them, so their `index` is a locally assigned transaction identifier used only
 /// to keep repeated sends distinct, and their `sender` slot carries the recipient.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum SmsDirection {
     Incoming,
     Outgoing,
@@ -79,6 +86,88 @@ pub struct SmsMessage {
     pub status: SmsStatus,
     /// Whether the module delivered this message to us or we submitted it.
     pub direction: SmsDirection,
+}
+
+/// Exact physical fragment identity captured when the user selected a displayed message.
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct SmsFragmentKey {
+    pub device_epoch: u64,
+    pub sim_epoch: u64,
+    pub storage: SmsStorageId,
+    pub index: u32,
+    pub payload_fingerprint: [u8; 32],
+}
+
+impl std::fmt::Debug for SmsFragmentKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SmsFragmentKey")
+            .field("device_epoch", &self.device_epoch)
+            .field("sim_epoch", &self.sim_epoch)
+            .field("storage", &self.storage)
+            .field("index", &self.index)
+            .field("payload_fingerprint", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Presentation plus the complete set of raw physical fragments behind it. Never serialized.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmsDisplayMessage {
+    pub message: SmsMessage,
+    pub fragments: Vec<SmsFragmentKey>,
+    /// False for outgoing records or conflicting fragment evidence.
+    pub delete_allowed: bool,
+}
+
+impl SmsDisplayMessage {
+    #[must_use]
+    pub fn stable_id(&self) -> [u8; 32] {
+        if self.message.direction == SmsDirection::Outgoing {
+            return self.message.content_digest();
+        }
+        let mut material = Vec::with_capacity(128);
+        material.extend_from_slice(b"dji4g-sms-display-v1\0");
+        material.extend_from_slice(&self.message.device_epoch.to_le_bytes());
+        material.extend_from_slice(&self.message.sim_epoch.to_le_bytes());
+        append_field(&mut material, self.message.storage.0.as_bytes());
+        material.push(0); // Incoming direction.
+        let mut fragments = self.fragments.iter().collect::<Vec<_>>();
+        fragments.sort_by(|a, b| {
+            (
+                a.device_epoch,
+                a.sim_epoch,
+                &a.storage.0,
+                a.index,
+                a.payload_fingerprint,
+            )
+                .cmp(&(
+                    b.device_epoch,
+                    b.sim_epoch,
+                    &b.storage.0,
+                    b.index,
+                    b.payload_fingerprint,
+                ))
+        });
+        fragments.dedup();
+        material.extend_from_slice(&(fragments.len() as u64).to_le_bytes());
+        for fragment in fragments {
+            material.extend_from_slice(&fragment.device_epoch.to_le_bytes());
+            material.extend_from_slice(&fragment.sim_epoch.to_le_bytes());
+            append_field(&mut material, fragment.storage.0.as_bytes());
+            material.extend_from_slice(&fragment.index.to_le_bytes());
+            material.extend_from_slice(&fragment.payload_fingerprint);
+        }
+        crate::sha256(&material)
+    }
+}
+
+impl std::ops::Deref for SmsDisplayMessage {
+    type Target = SmsMessage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
 }
 
 impl SmsMessage {
@@ -158,27 +247,70 @@ impl SmsMessage {
         &self.body
     }
 
-    /// Content digest used for deduplication together with the storage/epoch/direction/type/
-    /// sender/time tuple (research §6.2: an index alone can be reused and is not a stable
-    /// identity).
+    /// The caller must check Incoming before interpreting this key as a module location.
+    #[must_use]
+    pub fn fragment_key(&self) -> SmsFragmentKey {
+        SmsFragmentKey {
+            device_epoch: self.device_epoch,
+            sim_epoch: self.sim_epoch,
+            storage: self.storage.clone(),
+            index: self.index,
+            payload_fingerprint: self.payload_fingerprint(),
+        }
+    }
+
+    /// Immutable payload identity, independent of physical location and read/status evidence.
+    #[must_use]
+    pub fn payload_fingerprint(&self) -> [u8; 32] {
+        let mut material = Vec::with_capacity(128);
+        material.extend_from_slice(b"dji4g-sms-payload-v1\0");
+        append_field(&mut material, self.sender.as_bytes());
+        append_field(&mut material, self.body.as_bytes());
+        match &self.service_centre_timestamp {
+            Some(timestamp) => {
+                material.push(1);
+                append_field(&mut material, timestamp.as_bytes());
+            }
+            None => material.push(0),
+        }
+        material.push(match self.encoding {
+            SmsEncoding::Gsm7 => 0,
+            SmsEncoding::Ucs2 => 1,
+            SmsEncoding::Other => 2,
+        });
+        match self.multipart {
+            Some(info) => {
+                material.push(1);
+                match info.reference {
+                    SmsConcatReference::EightBit(reference) => {
+                        material.extend_from_slice(&[0, reference]);
+                    }
+                    SmsConcatReference::SixteenBit(reference) => {
+                        material.push(1);
+                        material.extend_from_slice(&reference.to_be_bytes());
+                    }
+                }
+                material.extend_from_slice(&[info.total, info.sequence]);
+            }
+            None => material.push(0),
+        }
+        crate::sha256(&material)
+    }
+
+    /// Deduplication combines physical/session context with the immutable payload identity.
     #[must_use]
     pub fn content_digest(&self) -> [u8; 32] {
         let mut material = Vec::with_capacity(128);
-        material.extend_from_slice(b"dji4g-sms-content-v1\0");
+        material.extend_from_slice(b"dji4g-sms-content-v2\0");
         material.extend_from_slice(&self.index.to_le_bytes());
-        material.extend_from_slice(self.storage.0.as_bytes());
+        append_field(&mut material, self.storage.0.as_bytes());
         material.push(match self.direction {
             SmsDirection::Incoming => 0,
             SmsDirection::Outgoing => 1,
         });
         material.extend_from_slice(&self.device_epoch.to_le_bytes());
         material.extend_from_slice(&self.sim_epoch.to_le_bytes());
-        material.extend_from_slice(self.sender.as_bytes());
-        material.push(0);
-        material.extend_from_slice(self.body.as_bytes());
-        if let Some(timestamp) = &self.service_centre_timestamp {
-            material.extend_from_slice(timestamp.as_bytes());
-        }
+        material.extend_from_slice(&self.payload_fingerprint());
         crate::sha256(&material)
     }
 
@@ -194,6 +326,11 @@ impl SmsMessage {
             self.sender.chars().skip(count - 4).collect::<String>()
         )
     }
+}
+
+fn append_field(material: &mut Vec<u8>, value: &[u8]) {
+    material.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    material.extend_from_slice(value);
 }
 
 impl std::fmt::Debug for SmsMessage {

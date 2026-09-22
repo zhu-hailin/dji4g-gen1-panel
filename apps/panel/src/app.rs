@@ -257,6 +257,12 @@ pub fn map_autostart_state(value: AutostartObservedState) -> AutostartKnownState
     }
 }
 
+/// Logical size of the full panel window.
+pub const PANEL_WINDOW_SIZE: [f32; 2] = [1100.0, 760.0];
+
+/// Smallest full-panel window.
+pub const PANEL_MIN_SIZE: [f32; 2] = [800.0, 600.0];
+
 #[derive(Clone)]
 pub struct PanelInputs {
     pub snapshot_rx: dji4g_application::sync::watch::Receiver<Arc<ControllerSnapshot>>,
@@ -336,6 +342,8 @@ fn panel_window_handle() -> Option<isize> {
 }
 
 pub struct PanelApp {
+    onboarding: crate::ui::onboarding::OnboardingState,
+    loaded_config: ConfigV1,
     snapshot_rx: dji4g_application::sync::watch::Receiver<Arc<ControllerSnapshot>>,
     commands: Arc<dyn UiCommandSink>,
     snapshot: Arc<ControllerSnapshot>,
@@ -402,6 +410,65 @@ pub struct PanelApp {
 }
 
 impl PanelApp {
+    /// Call only for the production launch after loading its persisted configuration.
+    /// Demo/headless constructors deliberately leave onboarding hidden.
+    pub fn configure_onboarding(&mut self, config: &ConfigV1) {
+        self.loaded_config = config.clone();
+        self.onboarding.completed = config.onboarding_completed;
+        if !config.onboarding_completed {
+            self.open_onboarding();
+        }
+    }
+
+    pub fn open_onboarding(&mut self) {
+        self.onboarding.open = true;
+        if !self.snapshot.serial_work_busy {
+            self.send(UiCommand::Refresh);
+        }
+    }
+
+    /// Explicit visual fixture: it uses only the supplied snapshot and starts no worker.
+    pub fn review_onboarding(&mut self) {
+        self.onboarding.open = true;
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn review_onboarding_with_driver(&mut self, bundled: bool) {
+        self.review_onboarding();
+        self.onboarding.driver_fixture = Some(bundled);
+    }
+
+    fn finish_onboarding(&mut self) {
+        self.onboarding.open = false;
+        self.onboarding.completed = true;
+        let mut config = ConfigV1::from_settings(&self.snapshot.settings)
+            .unwrap_or_else(|| self.loaded_config.clone());
+        // Keep current non-registry settings even when autostart cannot be observed yet.
+        config.language = self.snapshot.settings.language;
+        config.start_minimized = self.snapshot.settings.start_minimized;
+        config.active_probe = self.snapshot.settings.active_probe;
+        config.log_level = self.snapshot.settings.log_level;
+        config.onboarding_completed = true;
+        self.loaded_config = config.clone();
+        let result = self
+            .settings_backend
+            .as_ref()
+            .ok_or_else(|| ConfigError::new("config:path_unavailable"))
+            .and_then(|backend| backend.save_config(&config));
+        if let Err(error) = result {
+            self.toast = Some(ToastState {
+                text: LocalizedText {
+                    key: TextKey::ErrorInternal,
+                    text: format!(
+                        "已进入面板，但引导完成状态保存失败（{}）；下次启动可能再次显示。",
+                        error.stable_code()
+                    ),
+                },
+                expires_at: SystemTime::now() + Duration::from_secs(12),
+            });
+        }
+    }
+
     #[must_use]
     pub fn new(inputs: PanelInputs, cc: &eframe::CreationContext<'_>) -> Self {
         let font_warning = match crate::font::install_chinese_font(&cc.egui_ctx) {
@@ -422,6 +489,8 @@ impl PanelApp {
         let language = language_from_code(snapshot.settings.language);
         let persisted_revision = snapshot.settings.revision;
         Self {
+            onboarding: Default::default(),
+            loaded_config: ConfigV1::default(),
             snapshot_rx: inputs.snapshot_rx,
             commands: inputs.commands,
             snapshot,
@@ -471,6 +540,8 @@ impl PanelApp {
         let language = language_from_code(snapshot.settings.language);
         let persisted_revision = snapshot.settings.revision;
         Self {
+            onboarding: Default::default(),
+            loaded_config: ConfigV1::default(),
             snapshot_rx: inputs.snapshot_rx,
             commands: inputs.commands,
             snapshot,
@@ -680,7 +751,16 @@ impl PanelApp {
     #[cfg(debug_assertions)]
     pub fn set_review_sms_view(&mut self, outgoing: bool, selected: Option<u32>) {
         self.sms_compose.outgoing = outgoing;
-        self.sms_compose.selected = selected.map(|index| (outgoing, index));
+        self.sms_compose.selected = selected.and_then(|index| {
+            self.snapshot
+                .sms_messages
+                .iter()
+                .find(|message| {
+                    message.index == index
+                        && (message.direction == dji4g_domain::SmsDirection::Outgoing) == outgoing
+                })
+                .map(|message| message.stable_id())
+        });
     }
     /// Type a search string so the "no results" state can be captured.
     #[cfg(debug_assertions)]
@@ -694,6 +774,10 @@ impl PanelApp {
     #[cfg(debug_assertions)]
     pub fn set_review_sms_confirmation(&mut self) {
         self.sms_compose.review_confirmation();
+    }
+    #[cfg(debug_assertions)]
+    pub fn set_review_reply_replace(&mut self) {
+        self.sms_compose.review_reply_replace();
     }
     /// Aim the device-tools page at one tab (0 预设 / 1 查询 / 2 专家) for hardware-free review.
     #[cfg(debug_assertions)]
@@ -1010,7 +1094,9 @@ impl PanelApp {
             _ => None,
         };
 
-        if let Some(config) = config {
+        if let Some(mut config) = config {
+            config.onboarding_completed = self.onboarding.completed;
+            self.loaded_config = config.clone();
             self.persisted_revision = revision;
             let result = match self.settings_backend.as_ref() {
                 Some(backend) => backend.save_config(&config).map_err(config_failure_code),
@@ -1085,6 +1171,23 @@ impl PanelApp {
 
     pub fn render(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.support_report.poll();
+        if self.onboarding.open {
+            match crate::ui::onboarding::render(
+                ctx,
+                &self.snapshot,
+                SystemTime::now(),
+                self.onboarding.driver_fixture,
+            ) {
+                crate::ui::onboarding::OnboardingAction::Enter => self.finish_onboarding(),
+                crate::ui::onboarding::OnboardingAction::Refresh => self.send(UiCommand::Refresh),
+                crate::ui::onboarding::OnboardingAction::InstallBundledDriver => {
+                    self.start_driver_install(ctx)
+                }
+                crate::ui::onboarding::OnboardingAction::None => {}
+            }
+            ctx.request_repaint_after(Duration::from_millis(250));
+            return;
+        }
         let now = SystemTime::now();
         let snapshot = Arc::clone(&self.snapshot);
         self.wireless_history.observe(&snapshot);
@@ -1209,24 +1312,14 @@ impl PanelApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.page {
                             Page::Overview => {
-                                crate::ui::driver_setup::render_guide(
+                                if let Some(destination) = overview::render_summary(
                                     ui,
                                     &snapshot,
-                                    now,
                                     self.language,
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.button("查看诊断原因").clicked() {
-                                        self.page = Page::Diagnostics;
-                                    }
-                                    if ui.button("驱动与连接修复").clicked() {
-                                        self.page = Page::Repairs;
-                                    }
-                                    if ui.button("收发短信").clicked() {
-                                        self.page = Page::Sms;
-                                    }
-                                });
-                                ui.add_space(10.0);
+                                    probe_view.as_ref(),
+                                ) {
+                                    self.page = destination;
+                                }
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut self.wireless_view, false, "连接概况");
                                     ui.selectable_value(&mut self.wireless_view, true, "无线观测");
@@ -1239,7 +1332,7 @@ impl PanelApp {
                                         &self.wireless_history,
                                     );
                                 } else {
-                                    overview::render(
+                                    if let Some(destination) = overview::render(
                                         ui,
                                         &snapshot,
                                         self.language,
@@ -1247,7 +1340,9 @@ impl PanelApp {
                                         &self.rate_history,
                                         &self.temperature_history,
                                         probe_view.as_ref(),
-                                    );
+                                    ) {
+                                        self.page = destination;
+                                    }
                                 }
                             }
                             Page::Diagnostics => {
@@ -1295,6 +1390,9 @@ impl PanelApp {
                                 );
                                 ui.separator();
                                 ui.horizontal_wrapped(|ui| {
+                                    if ui.button("重新查看首次使用引导").clicked() {
+                                        self.open_onboarding();
+                                    }
                                     if ui.button("使用说明").clicked() {
                                         show_help_dialog();
                                     }
@@ -1359,22 +1457,17 @@ impl PanelApp {
     /// Restarting or exiting in the middle of one would abandon a worker that still owns the
     /// port, so the button refuses instead of interrupting it.
     fn serial_work_busy(&self) -> bool {
-        let snapshot = &self.snapshot;
-        snapshot
-            .sms_send
-            .as_ref()
-            .is_some_and(|send| send.is_active())
-            || snapshot.device_tools.busy()
-            || snapshot
-                .operation
+        self.snapshot.serial_work_busy
+            || self
+                .snapshot
+                .prepared_action
                 .as_ref()
-                .is_some_and(|operation| matches!(operation.state, OperationState::Running { .. }))
-            || snapshot.prepared_action.as_ref().is_some_and(|prepared| {
-                matches!(
-                    prepared.state,
-                    dji4g_application::PreparedActionState::AwaitingConfirmation
-                )
-            })
+                .is_some_and(|prepared| {
+                    matches!(
+                        prepared.state,
+                        dji4g_application::PreparedActionState::AwaitingConfirmation
+                    )
+                })
     }
 
     /// Restart the panel.
@@ -1888,6 +1981,84 @@ mod tests {
     fn panel() -> PanelApp {
         let snapshot = Arc::new(ReducerState::new(SystemTime::UNIX_EPOCH).snapshot());
         PanelApp::from_snapshot(snapshot, Arc::new(NoopSink))
+    }
+
+    #[test]
+    fn first_run_skip_persists_and_settings_can_reopen_without_resetting_preferences() {
+        struct Backend(Mutex<Vec<ConfigV1>>);
+        impl SettingsBackend for Backend {
+            fn save_config(&self, config: &ConfigV1) -> Result<(), ConfigError> {
+                self.0.lock().unwrap().push(config.clone());
+                Ok(())
+            }
+            fn set_autostart(&self, _: bool) -> Result<AutostartObservedState, PlatformError> {
+                panic!("onboarding never changes registry")
+            }
+        }
+        let backend = Arc::new(Backend(Mutex::new(Vec::new())));
+        let mut app = panel();
+        assert!(
+            !app.onboarding.open,
+            "demo and headless callers skip by default"
+        );
+        app.settings_backend = Some(backend.clone());
+        let config = ConfigV1 {
+            autostart: true,
+            ..ConfigV1::default()
+        };
+        app.configure_onboarding(&config);
+        assert!(app.onboarding.open);
+        app.finish_onboarding();
+        assert!(!app.onboarding.open);
+        let saved = backend.0.lock().unwrap()[0].clone();
+        assert!(saved.onboarding_completed);
+        assert!(
+            saved.autostart,
+            "unknown registry state must preserve loaded intent"
+        );
+        let mut next = panel();
+        next.configure_onboarding(&saved);
+        assert!(!next.onboarding.open);
+        next.open_onboarding();
+        assert!(next.onboarding.open);
+        assert!(next.onboarding.completed);
+    }
+
+    #[test]
+    fn onboarding_save_failure_still_enters_and_reports_unsaved_state() {
+        let mut app = panel();
+        app.configure_onboarding(&ConfigV1::default());
+        app.finish_onboarding();
+        assert!(!app.onboarding.open);
+        assert!(app.toast.as_ref().unwrap().text.text.contains("保存失败"));
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .text
+                .text
+                .contains("下次启动可能再次显示")
+        );
+    }
+
+    #[test]
+    fn first_run_checks_once_and_visual_fixture_never_starts_backend_work() {
+        let sink = Arc::new(RecordingSink::default());
+        let snapshot = Arc::new(ReducerState::new(SystemTime::UNIX_EPOCH).snapshot());
+        let mut app = PanelApp::from_snapshot(snapshot, sink.clone());
+        app.review_onboarding();
+        assert!(sink.sent.lock().unwrap().is_empty());
+        app.configure_onboarding(&ConfigV1::default());
+        assert!(matches!(
+            sink.sent.lock().unwrap().as_slice(),
+            [UiCommand::Refresh]
+        ));
+        app.open_onboarding();
+        assert_eq!(
+            sink.sent.lock().unwrap().len(),
+            2,
+            "explicit reopening requests new evidence"
+        );
     }
 
     fn panel_with_recording_tray(counter: Arc<AtomicUsize>) -> PanelApp {

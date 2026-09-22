@@ -14,7 +14,8 @@ use dji4g_application::{
 use eframe::egui;
 
 use dji4g_panel::app::{
-    NativeSettingsBackend, PanelApp, PanelInputs, SettingsBackend, map_autostart_state,
+    NativeSettingsBackend, PANEL_MIN_SIZE, PANEL_WINDOW_SIZE, PanelApp, PanelInputs,
+    SettingsBackend, map_autostart_state,
 };
 use dji4g_panel::config::{ConfigLoadOutcome, ConfigPaths, ConfigStore, StartupOptions};
 use dji4g_panel::localization::{Language, LocalizedText, TextKey};
@@ -265,11 +266,17 @@ fn main() {
             None
         }
     };
-    let start_hidden = startup.start_to_tray(config.start_minimized) && tray.is_some();
+    let start_hidden = config.onboarding_completed
+        && startup.start_to_tray(config.start_minimized)
+        && tray.is_some();
+    #[cfg(debug_assertions)]
+    let configure_first_run = !demo_active;
+    #[cfg(not(debug_assertions))]
+    let configure_first_run = true;
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1100.0, 760.0])
-        .with_min_inner_size([800.0, 600.0])
+        .with_inner_size(PANEL_WINDOW_SIZE)
+        .with_min_inner_size(PANEL_MIN_SIZE)
         .with_resizable(true)
         .with_visible(!start_hidden);
     // The brand PNG is a repository asset; a decode failure degrades to the platform default
@@ -286,6 +293,9 @@ fn main() {
         native_options,
         Box::new(move |cc| {
             let mut app = PanelApp::new(inputs, cc);
+            if configure_first_run {
+                app.configure_onboarding(&config);
+            }
             if let Some(tray) = tray {
                 app.attach_tray(tray);
             }

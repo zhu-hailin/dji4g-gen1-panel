@@ -3,13 +3,13 @@
 use std::time::SystemTime;
 
 use dji4g_application::{ActionReadinessKey, ControlledRepairRequest, ControllerSnapshot};
-use dji4g_domain::{ActionKind, DnsProfile, Freshness, HotspotStatus};
+use dji4g_domain::{ActionKind, DnsProfile, HotspotStatus};
 use eframe::egui::{self, RichText, Ui};
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::{field_label, meta_text, scale, section_frame, section_heading, wrapped_label};
 use crate::app::PanelCommandSink;
-use crate::localization::{Language, LocalizedText, TextKey, failure_text};
+use crate::localization::{Language, LocalizedText, TextKey};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepairActionVm {
@@ -31,65 +31,14 @@ pub struct RepairsVm {
 #[must_use]
 pub fn repairs_vm(snapshot: &ControllerSnapshot, now: SystemTime, language: Language) -> RepairsVm {
     let app = snapshot.app.as_ref();
-    // While an operation is running the controller refuses new prepares (PrepareError::Busy);
-    // reflect that honestly instead of leaving clickable buttons that silently no-op.
-    let operation_running = matches!(
-        snapshot
-            .operation
-            .as_ref()
-            .map(|operation| &operation.state),
-        Some(dji4g_application::OperationState::Running { .. })
-    );
-    let operation_running = operation_running
-        || snapshot
-            .sms_send
-            .as_ref()
-            .is_some_and(|send| send.phase != dji4g_application::SmsSendPhase::Finished);
-    let target_available = app.device.is_some()
-        && app.freshness == Freshness::Fresh
-        && !matches!(
-            app.availability,
-            dji4g_domain::Availability::NotDetected | dji4g_domain::Availability::UnsupportedDevice
-        );
-    let readiness_of = |key: ActionReadinessKey| -> bool {
-        snapshot
-            .action_readiness
-            .iter()
-            .find(|entry| entry.key == key)
-            .is_some_and(|entry| entry.ready.is_ok())
-    };
-    let readiness_reason = |key: ActionReadinessKey| -> Option<LocalizedText> {
-        snapshot
-            .action_readiness
-            .iter()
-            .find(|entry| entry.key == key)
-            .and_then(|entry| entry.ready.as_ref().err())
-            .map(|code| failure_text(code, language))
-    };
-    let base_enabled = target_available && !operation_running;
-    // One shared builder so every action gets the same readiness-derived enablement and reason.
     let build = |action: ActionKind, key: ActionReadinessKey, _title: TextKey| {
-        let ready = readiness_of(key);
-        let reason = if operation_running {
-            Some(LocalizedText::new(language, TextKey::CommandFeedbackBusy))
-        } else if app.device.is_none() {
-            Some(LocalizedText::new(
-                language,
-                TextKey::AvailabilityNotDetectedReason,
-            ))
-        } else if app.freshness != Freshness::Fresh {
-            Some(LocalizedText::new(language, TextKey::ErrorEvidenceExpired))
-        } else if ready {
-            None
-        } else {
-            readiness_reason(key)
-        };
-        let title = crate::localization::action_text(&action, language);
+        let availability =
+            super::action_availability::repair_action_availability(snapshot, key, now, language);
         RepairActionVm {
+            title: crate::localization::action_text(&action, language),
             action,
-            title,
-            enabled: base_enabled && ready,
-            disabled_reason: reason,
+            enabled: availability.enabled,
+            disabled_reason: availability.reason,
         }
     };
     let hotspot_enabled = matches!(
@@ -184,12 +133,8 @@ pub fn repairs_vm(snapshot: &ControllerSnapshot, now: SystemTime, language: Lang
         .iter_mut()
         .find(|entry| matches!(entry.action, ActionKind::ToggleHotspot { .. }))
     {
-        action.enabled = action.enabled && hotspot_enabled && !operation_running;
+        action.enabled = action.enabled && hotspot_enabled;
     }
-    if !target_available || operation_running {
-        actions.iter_mut().for_each(|action| action.enabled = false);
-    }
-    let _ = now;
     RepairsVm {
         title: LocalizedText::new(language, TextKey::RepairsTitle),
         notice: LocalizedText::new(language, TextKey::RepairsReadOnlyNotice),
@@ -205,7 +150,7 @@ pub(crate) fn render(
     language: Language,
     sink: &dyn PanelCommandSink,
 ) -> bool {
-    let vm = repairs_vm(snapshot, SystemTime::now(), language);
+    let vm = repairs_vm(snapshot, now, language);
     ui.heading(vm.title.text.clone());
     wrapped_label(
         ui,

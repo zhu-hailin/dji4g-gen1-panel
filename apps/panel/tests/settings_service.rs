@@ -48,6 +48,8 @@ fn initial_snapshot() -> Arc<ControllerSnapshot> {
         sms_inbox: Default::default(),
         sms_messages: Vec::new(),
         sms_send: None,
+        sms_delete: None,
+        serial_work_busy: false,
         sms_refresh_pending: false,
         sms_inbox_failure: None,
         device_tools: Default::default(),
@@ -196,6 +198,7 @@ fn a_pending_toggle_drives_one_save_and_one_registration_per_revision() {
             .expect("save call lock")
             .as_slice(),
         &[ConfigV1 {
+            onboarding_completed: false,
             language: LanguageCode::ZhCn,
             autostart: true,
             start_minimized: true,
@@ -245,6 +248,22 @@ fn a_pending_toggle_drives_one_save_and_one_registration_per_revision() {
         1
     );
     assert_eq!(recorded_commands(&harness.sink).len(), 2);
+}
+
+#[test]
+fn ordinary_settings_updates_preserve_completed_onboarding() {
+    let mut harness = harness(Ok(()), Ok(AutostartObservedState::Enabled));
+    harness.app.configure_onboarding(&ConfigV1 {
+        onboarding_completed: true,
+        ..ConfigV1::default()
+    });
+    harness.snapshot_tx.send(saving_snapshot(1, true)).unwrap();
+    harness.app.receive_latest_nonblocking(&harness.context);
+    let saves = harness.calls.saves.lock().unwrap();
+    assert_eq!(saves.len(), 1);
+    assert!(saves[0].onboarding_completed);
+    assert!(saves[0].autostart);
+    assert!(!saves[0].active_probe);
 }
 
 #[test]
