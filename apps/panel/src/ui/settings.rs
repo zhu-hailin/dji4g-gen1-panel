@@ -353,6 +353,7 @@ mod tests {
 
     fn snapshot() -> ControllerSnapshot {
         ControllerSnapshot {
+            host_network: dji4g_application::HostNetworkSnapshot::default(),
             publication_revision: 0,
             app: Arc::new(dji4g_domain::AppSnapshot {
                 revision: 0,

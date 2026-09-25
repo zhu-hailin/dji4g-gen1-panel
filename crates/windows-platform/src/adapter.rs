@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, net::IpAddr, str::FromStr};
 
 use dji4g_domain::DeviceEpoch;
+use dji4g_domain::{HostAdapter, HostDefaultRoute, IpFamily};
 
 use crate::{DjiDevice, PlatformError};
 
@@ -456,8 +457,66 @@ fn collect_platform_network() -> Result<(Vec<RawAdapter>, Vec<RawRoute>), Platfo
     native::collect()
 }
 
+/// Enumerate every Windows adapter and both families' default routes.  This is deliberately
+/// independent of a DJI binding so the help page also works when the module is absent.
+pub fn observe_host_adapters() -> Result<(Vec<HostAdapter>, Vec<HostDefaultRoute>), PlatformError> {
+    let (adapters, routes) = collect_platform_network()?;
+    let adapters = adapters
+        .into_iter()
+        .map(|row| {
+            #[cfg(windows)]
+            let alias = native::read_alias(row.luid)?;
+            #[cfg(not(windows))]
+            let alias = row.friendly_name.clone();
+            Ok(HostAdapter {
+                guid: row.guid.canonical(),
+                luid: row.luid,
+                alias,
+                up: row.oper_up,
+            })
+        })
+        .collect::<Result<Vec<_>, PlatformError>>()?;
+    let defaults = routes
+        .into_iter()
+        .filter(|route| route.prefix_len == 0)
+        .filter_map(|route| {
+            let adapter = adapters.iter().find(|adapter| adapter.luid == route.luid)?;
+            let raw = route.route_metric;
+            let _ = adapter;
+            Some(HostDefaultRoute {
+                family: match route.family {
+                    AddressFamily::Ipv4 => IpFamily::V4,
+                    AddressFamily::Ipv6 => IpFamily::V6,
+                },
+                luid: route.luid,
+                metric: raw,
+            })
+        })
+        .collect();
+    Ok((adapters, defaults))
+}
+
 #[cfg(windows)]
 mod native {
+    pub(super) fn read_alias(luid: u64) -> Result<String, PlatformError> {
+        let mut row = MIB_IF_ROW2 {
+            InterfaceLuid: NET_LUID_LH { Value: luid },
+            ..MIB_IF_ROW2::default()
+        };
+        let status = unsafe { GetIfEntry2(&mut row) };
+        if status != NO_ERROR {
+            return Err(os_error("net:adapter_alias_unavailable", status));
+        }
+        let end = row
+            .Alias
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(row.Alias.len());
+        String::from_utf16(&row.Alias[..end]).map_err(|_| PlatformError {
+            code: "net:adapter_alias_invalid",
+            os_code: None,
+        })
+    }
     /// One `GetIfEntry2` row per LUID covers both address families' octets.
     pub(crate) fn byte_counters(luid: u64) -> Option<(u64, u64)> {
         let mut row = MIB_IF_ROW2 {

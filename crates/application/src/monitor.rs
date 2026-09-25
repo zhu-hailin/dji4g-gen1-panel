@@ -123,6 +123,11 @@ pub fn rate_tick_due(last: Option<SystemTime>, now: SystemTime, period: Duration
 }
 
 pub struct ControllerRunner {
+    host_port: Option<Arc<dyn crate::HostNetworkPort>>,
+    pending_host:
+        Option<mpsc::Receiver<Result<crate::host_network::HostNetworkOutcome, crate::PortError>>>,
+    host_auto_requested: bool,
+    last_host_trigger: Option<Instant>,
     controller: Controller,
     commands: mpsc::Receiver<UiCommand>,
     refresh: Arc<RefreshSignal>,
@@ -266,6 +271,10 @@ impl ControllerRunner {
         let initial = Arc::new(controller.snapshot());
         let (handle, commands, refresh) = ControllerHandle::channels(initial);
         let runner = Self {
+            host_port: None,
+            pending_host: None,
+            host_auto_requested: false,
+            last_host_trigger: None,
             controller,
             commands,
             refresh,
@@ -293,6 +302,12 @@ impl ControllerRunner {
     #[must_use]
     pub fn with_ports(mut self, ports: MonitorPorts) -> Self {
         self.ports = Some(ports);
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_network_port(mut self, port: Arc<dyn crate::HostNetworkPort>) -> Self {
+        self.host_port = Some(port);
         self
     }
 
@@ -370,6 +385,13 @@ impl ControllerRunner {
 
     pub async fn run(mut self) {
         loop {
+            if !self.host_auto_requested && self.host_port.is_some() {
+                self.host_auto_requested = true;
+                let _ = self
+                    .controller
+                    .handle_command(UiCommand::InspectHostNetwork);
+                self.publish();
+            }
             // Collect a background operation's terminal result before anything else, so the
             // Finished state is published promptly (bounded by IDLE_POLL_INTERVAL) and the
             // runner thread never blocks on the executor itself.
@@ -397,10 +419,25 @@ impl ControllerRunner {
             if self.poll_tool_requests() {
                 self.publish();
             }
+            if self.poll_host_requests() {
+                self.publish();
+            }
             // An explicit user command and the automatic monitoring cadence share one scan path.
             // Relying on the signal alone left a release build permanently unscanned, because its
             // only startup `Refresh` was compiled out and no other producer sets the signal.
             let signaled = self.refresh.take();
+            if signaled
+                && self.host_port.is_some()
+                && self
+                    .last_host_trigger
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
+            {
+                self.last_host_trigger = Some(Instant::now());
+                let _ = self
+                    .controller
+                    .handle_command(UiCommand::InspectHostNetwork);
+                self.publish();
+            }
             self.refresh_deferred |= signaled;
             if !self.sms_pending()
                 && !self.tool_pending()
@@ -418,6 +455,71 @@ impl ControllerRunner {
                 self.publish();
             }
         }
+    }
+
+    /// Advance one host task without taking the serial port or blocking the UI/controller loop.
+    pub fn poll_host_requests(&mut self) -> bool {
+        if let Some(receiver) = &self.pending_host {
+            match receiver.try_recv() {
+                Ok(Ok(outcome)) => {
+                    self.pending_host = None;
+                    self.controller.complete_host_request(outcome);
+                    return true;
+                }
+                Ok(Err(error)) => {
+                    self.pending_host = None;
+                    self.controller.fail_host_request(&error);
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_host = None;
+                    self.controller.fail_host_request(&crate::PortError::new(
+                        dji4g_domain::ErrorCode::Internal,
+                        "host:worker_lost",
+                    ));
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Empty) => return false,
+            }
+        }
+        let Some(request) = self.controller.take_host_request() else {
+            return false;
+        };
+        let Some(port) = self.host_port.as_ref().cloned() else {
+            self.controller.fail_host_request(&crate::PortError::new(
+                dji4g_domain::ErrorCode::CapabilityUnavailable,
+                "host:port_unavailable",
+            ));
+            return true;
+        };
+        self.pending_host = Some(spawn_stage(move || {
+            use crate::host_network::{HostNetworkOutcome as O, HostNetworkRequest as R};
+            let timeout =
+                || crate::PortError::new(dji4g_domain::ErrorCode::Timeout, "host:task_timeout");
+            match request {
+                R::Inspect => {
+                    poll_ready(port.inspect(), Duration::from_secs(30), || Err(timeout()))
+                        .map(O::Inspected)
+                }
+                R::Prepare(id) => {
+                    poll_ready(port.prepare_repair(id), Duration::from_secs(30), || {
+                        Err(timeout())
+                    })
+                    .map(O::Prepared)
+                }
+                R::Apply(id) => poll_ready(port.apply_repair(id), Duration::from_secs(30), || {
+                    Err(timeout())
+                })
+                .map(O::Applied),
+                R::Restore(id) => {
+                    poll_ready(port.restore_repair(id), Duration::from_secs(30), || {
+                        Err(timeout())
+                    })
+                    .map(|()| O::Restored)
+                }
+            }
+        }));
+        true
     }
 
     /// Run one scan of the periodic monitoring cadence if, and only if, it is due.

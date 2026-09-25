@@ -6,6 +6,7 @@ mod confirmation;
 mod controller;
 mod device_tools;
 mod features;
+mod host_network;
 mod monitor;
 mod ports;
 mod reducer;
@@ -33,6 +34,9 @@ pub use device_tools::{
     transcript_from_response,
 };
 pub use features::{FeatureCapability, FeatureKey};
+pub use host_network::{
+    HostNetworkPhase, HostNetworkPort, HostNetworkSnapshot, ProxyRepairPreview, ProxyRepairResult,
+};
 pub use monitor::{
     ControllerRunner, MonitorPorts, RATE_READ_TIMEOUT, RATE_TICK_INTERVAL, REFRESH_INTERVAL,
     STAGE_TIMEOUT, periodic_refresh_due, rate_tick_due,

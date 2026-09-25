@@ -59,7 +59,7 @@ function Get-Sha256Hex([byte[]]$bytes) {
 $expectedIdentity = [ordered]@{
     name = 'Dji4GPanel'
     publisher = 'CN=Dji4GPanel Development'
-    version = '0.1.5.0'
+    version = '0.1.6.0'
     processor_architecture = 'x64'
 }
 

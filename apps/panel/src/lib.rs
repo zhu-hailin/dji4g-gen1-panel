@@ -14,6 +14,7 @@ pub mod font;
 pub mod localization;
 pub mod logging;
 pub mod native_dialog;
+pub mod proxy_repair;
 pub mod runtime;
 pub mod sms_archive;
 pub mod support_report;

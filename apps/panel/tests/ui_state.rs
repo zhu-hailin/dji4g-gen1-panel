@@ -66,6 +66,7 @@ fn network_with_rates(down: u64, up: u64) -> NetworkSnapshot {
 
 fn controller_snapshot(app: AppSnapshot) -> ControllerSnapshot {
     ControllerSnapshot {
+        host_network: dji4g_application::HostNetworkSnapshot::default(),
         publication_revision: 7,
         app: Arc::new(app),
         diagnostics: DiagnosticSet::new(DeviceEpoch(1)),

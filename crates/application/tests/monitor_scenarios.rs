@@ -349,7 +349,7 @@ fn tun_route_is_explanation_only_and_does_not_replace_bound_source() {
     );
     assert_eq!(
         snapshot.app.availability,
-        dji4g_domain::Availability::Limited(dji4g_domain::LimitedReason::CompetingDefaultRoute)
+        dji4g_domain::Availability::Available
     );
 }
 

@@ -106,6 +106,7 @@ pub(crate) enum OnboardingAction {
     None,
     Enter,
     Refresh,
+    InspectHostNetwork,
     InstallBundledDriver,
     OpenWindowsUpdate,
 }
@@ -219,6 +220,14 @@ pub(crate) fn render(
                 }
                 ui.add_space(6.0);
                 super::wrapped_label(ui,super::meta_text(completion_detail));
+            });
+            ui.add_space(12.0);
+            super::section_frame(ui, |ui| {
+                ui.label(super::section_heading("电脑网络与代理"));
+                let (tone, summary) = super::network_assistance::brief(snapshot, now, crate::localization::Language::ZhCn);
+                super::wrapped_label(ui, egui::RichText::new(format!("{} {summary}", tone.marker())).color(tone.color()));
+                if ui.button("检查电脑网络").clicked() { action = OnboardingAction::InspectHostNetwork; }
+                super::wrapped_label(ui, super::meta_text("即使没插模块也能检查；代理配置问题不会当作驱动损坏。"));
             });
             ui.add_space(12.0);
             super::section_frame(ui, |ui| {

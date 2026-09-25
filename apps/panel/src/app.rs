@@ -1367,6 +1367,9 @@ impl PanelApp {
             ) {
                 crate::ui::onboarding::OnboardingAction::Enter => self.finish_onboarding(),
                 crate::ui::onboarding::OnboardingAction::Refresh => self.send(UiCommand::Refresh),
+                crate::ui::onboarding::OnboardingAction::InspectHostNetwork => {
+                    self.send(UiCommand::InspectHostNetwork)
+                }
                 crate::ui::onboarding::OnboardingAction::InstallBundledDriver => {
                     self.start_driver_install(ctx)
                 }
@@ -1507,6 +1510,14 @@ impl PanelApp {
                                     probe_view.as_ref(),
                                 ) {
                                     self.page = destination;
+                                }
+                                if crate::ui::network_assistance::render_brief(
+                                    ui,
+                                    &snapshot,
+                                    now,
+                                    self.language,
+                                ) {
+                                    self.page = Page::Diagnostics;
                                 }
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut self.wireless_view, false, "连接概况");

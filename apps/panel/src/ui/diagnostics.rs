@@ -115,7 +115,7 @@ fn detail_for(
                     LocalizedText::new(language, default_route_owner(network.system_default_route))
                         .text;
                 if matches!(network.system_default_route, DefaultRouteOwner::VpnOrTun) {
-                    text.push_str("；仅用于解释路由竞争，不否定模块绑定探测");
+                    text.push_str("；VPN 或代理可能正常使用此接口，模块通路另行验证");
                 }
                 Some(DisplayValue::new(text))
             },
@@ -192,6 +192,8 @@ pub(crate) fn render(
         }
     });
     ui.add_space(16.0);
+    super::network_assistance::render(ui, snapshot, std::time::SystemTime::now(), language, sink);
+    ui.add_space(12.0);
     super::section_frame(ui, |ui| {
         for row in &vm.rows {
             egui::CollapsingHeader::new(

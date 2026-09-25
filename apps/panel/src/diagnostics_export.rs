@@ -712,6 +712,7 @@ mod tests {
 
     fn fixture() -> ControllerSnapshot {
         ControllerSnapshot {
+            host_network: dji4g_application::HostNetworkSnapshot::default(),
             publication_revision: 7,
             app: Arc::new(AppSnapshot {
                 revision: 7,

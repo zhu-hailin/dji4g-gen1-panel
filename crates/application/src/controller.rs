@@ -87,6 +87,19 @@ pub enum CommandReceipt {
 #[derive(Clone, Debug)]
 pub enum UiCommand {
     Refresh,
+    InspectHostNetwork,
+    PrepareProxyRepair {
+        finding_id: u64,
+    },
+    CancelProxyRepair {
+        plan_id: u64,
+    },
+    ConfirmProxyRepair {
+        plan_id: u64,
+    },
+    RestoreProxyRepair {
+        backup_id: u64,
+    },
     PrepareAction {
         request: ActionRequest,
     },
@@ -266,6 +279,9 @@ impl ControllerHandle {
 
 /// Synchronous core used by the async runner and deterministic application tests.
 pub struct Controller {
+    host_network: crate::HostNetworkSnapshot,
+    host_requests: VecDeque<crate::host_network::HostNetworkRequest>,
+    next_host_finding_id: u64,
     state: ReducerState,
     prepared: Option<StoredActionPlan>,
     consumed_plans: HashSet<ActionPlanId>,
@@ -309,6 +325,9 @@ impl Controller {
         let executor = Arc::new(FakeActionExecutor::new());
         let clock = Arc::new(FakeClock::new(now));
         Self {
+            host_network: crate::HostNetworkSnapshot::default(),
+            host_requests: VecDeque::new(),
+            next_host_finding_id: 1,
             state: ReducerState::test_ready(now),
             prepared: None,
             consumed_plans: HashSet::new(),
@@ -345,6 +364,9 @@ impl Controller {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
+            host_network: crate::HostNetworkSnapshot::default(),
+            host_requests: VecDeque::new(),
+            next_host_finding_id: 1,
             state,
             prepared: None,
             consumed_plans: HashSet::new(),
@@ -381,6 +403,7 @@ impl Controller {
             self.operation.clone(),
             self.clock.system_now(),
         );
+        snapshot.host_network = self.host_network.clone();
         snapshot.feedback = self.feedback.clone();
         snapshot.sms_send = self.sms_send.clone();
         snapshot.sms_refresh_pending = self.sms_refresh_pending;
@@ -694,27 +717,120 @@ impl Controller {
     fn handle_command_inner(&mut self, command: UiCommand) -> Result<CommandReceipt, UiSendError> {
         match command {
             UiCommand::Refresh => Ok(CommandReceipt::Accepted),
-            UiCommand::PrepareAction { request } => self
-                .prepare_action(request)
-                .map(|_| CommandReceipt::Accepted)
-                .map_err(|error| {
-                    self.report_feedback(prepare_feedback(error));
-                    UiSendError::Closed
-                }),
-            UiCommand::PrepareRepair { request } => self
-                .prepare_repair(request)
-                .map(|_| CommandReceipt::Accepted)
-                .map_err(|error| {
-                    self.report_feedback(prepare_feedback(error));
-                    UiSendError::Closed
-                }),
-            UiCommand::ConfirmAction { id } => self
-                .begin_confirmation(id)
-                .map(|_| CommandReceipt::Accepted)
-                .map_err(|error| {
-                    self.report_feedback(confirm_feedback(error));
-                    UiSendError::Closed
-                }),
+            UiCommand::InspectHostNetwork => {
+                if self.host_work_busy() {
+                    return self.reject_host_busy();
+                }
+                self.host_network.phase = crate::HostNetworkPhase::Checking;
+                self.host_network.preview = None;
+                self.host_network.error_code = None;
+                self.host_requests
+                    .push_back(crate::host_network::HostNetworkRequest::Inspect);
+                Ok(CommandReceipt::Accepted)
+            }
+            UiCommand::PrepareProxyRepair { finding_id } => {
+                let valid = self.host_network.finding_id == Some(finding_id)
+                    && self.host_network.finding
+                        == Some(dji4g_domain::HostNetworkFinding::MissingBoundInterface)
+                    && self
+                        .host_network
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| {
+                            dji4g_domain::host_observation_is_fresh(
+                                observation.observed_at,
+                                self.now(),
+                            ) && observation
+                                .binding
+                                .as_ref()
+                                .is_some_and(|binding| binding.repairable)
+                        });
+                if !valid || self.host_work_busy() || self.operation_pending.is_some() {
+                    return self.reject_host_busy();
+                }
+                self.host_network.phase = crate::HostNetworkPhase::Preparing;
+                self.host_network.error_code = None;
+                self.host_requests
+                    .push_back(crate::host_network::HostNetworkRequest::Prepare(finding_id));
+                Ok(CommandReceipt::Accepted)
+            }
+            UiCommand::CancelProxyRepair { plan_id } => {
+                if self
+                    .host_network
+                    .preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.plan_id == plan_id)
+                    && self.host_network.phase == crate::HostNetworkPhase::AwaitingConfirmation
+                {
+                    self.host_network.preview = None;
+                    self.host_network.phase = crate::HostNetworkPhase::Ready;
+                }
+                Ok(CommandReceipt::Accepted)
+            }
+            UiCommand::ConfirmProxyRepair { plan_id } => {
+                if self.host_work_busy()
+                    || self.operation_pending.is_some()
+                    || self.host_network.preview.as_ref().is_none_or(|preview| {
+                        preview.plan_id != plan_id || self.now() > preview.expires_at
+                    })
+                {
+                    return self.reject_host_busy();
+                }
+                self.host_network.phase = crate::HostNetworkPhase::Applying;
+                self.host_network.preview = None;
+                self.host_requests
+                    .push_back(crate::host_network::HostNetworkRequest::Apply(plan_id));
+                Ok(CommandReceipt::Accepted)
+            }
+            UiCommand::RestoreProxyRepair { backup_id } => {
+                if self.host_work_busy()
+                    || self.operation_pending.is_some()
+                    || self
+                        .host_network
+                        .result
+                        .as_ref()
+                        .is_none_or(|result| result.backup_id != backup_id)
+                {
+                    return self.reject_host_busy();
+                }
+                self.host_network.phase = crate::HostNetworkPhase::Restoring;
+                self.host_requests
+                    .push_back(crate::host_network::HostNetworkRequest::Restore(backup_id));
+                Ok(CommandReceipt::Accepted)
+            }
+            UiCommand::PrepareAction { request } => {
+                if self.host_work_busy() {
+                    return self.reject_host_busy();
+                }
+                self.prepare_action(request)
+                    .map(|_| CommandReceipt::Accepted)
+                    .map_err(|error| {
+                        self.report_feedback(prepare_feedback(error));
+                        UiSendError::Closed
+                    })
+            }
+            UiCommand::PrepareRepair { request } => {
+                if self.host_work_busy() {
+                    return self.reject_host_busy();
+                }
+                self.prepare_repair(request)
+                    .map(|_| CommandReceipt::Accepted)
+                    .map_err(|error| {
+                        self.report_feedback(prepare_feedback(error));
+                        UiSendError::Closed
+                    })
+            }
+            UiCommand::ConfirmAction { id } => {
+                if self.host_work_busy() {
+                    return self.reject_host_busy();
+                }
+                self.begin_confirmation(id)
+                    .map(|_| CommandReceipt::Accepted)
+                    .map_err(|error| {
+                        self.report_feedback(confirm_feedback(error));
+                        UiSendError::Closed
+                    })
+            }
             UiCommand::CancelAction { id } => self
                 .cancel_action(id)
                 .map(|_| CommandReceipt::Accepted)
@@ -1482,6 +1598,64 @@ impl Controller {
 
     pub(crate) fn now(&self) -> SystemTime {
         self.clock.system_now()
+    }
+
+    fn host_work_busy(&self) -> bool {
+        matches!(
+            self.host_network.phase,
+            crate::HostNetworkPhase::Checking
+                | crate::HostNetworkPhase::Preparing
+                | crate::HostNetworkPhase::Applying
+                | crate::HostNetworkPhase::Restoring
+        ) || !self.host_requests.is_empty()
+    }
+
+    fn reject_host_busy(&mut self) -> Result<CommandReceipt, UiSendError> {
+        self.report_feedback(failure(ErrorCode::Internal, "host:unavailable_or_busy"));
+        Err(UiSendError::QueueFull)
+    }
+
+    pub(crate) fn take_host_request(&mut self) -> Option<crate::host_network::HostNetworkRequest> {
+        self.host_requests.pop_front()
+    }
+
+    pub(crate) fn complete_host_request(
+        &mut self,
+        outcome: crate::host_network::HostNetworkOutcome,
+    ) {
+        use crate::host_network::HostNetworkOutcome;
+        match outcome {
+            HostNetworkOutcome::Inspected(observation) => {
+                let finding = dji4g_domain::classify_host_network(&observation);
+                self.host_network.observation = Some(observation);
+                self.host_network.finding = Some(finding);
+                self.host_network.finding_id = Some(self.next_host_finding_id);
+                self.next_host_finding_id = self.next_host_finding_id.saturating_add(1);
+                self.host_network.phase = crate::HostNetworkPhase::Ready;
+            }
+            HostNetworkOutcome::Prepared(preview) => {
+                self.host_network.preview = Some(preview);
+                self.host_network.phase = crate::HostNetworkPhase::AwaitingConfirmation;
+            }
+            HostNetworkOutcome::Applied(result) => {
+                self.host_network.result = Some(result);
+                self.host_network.phase = crate::HostNetworkPhase::AwaitingRestart;
+            }
+            HostNetworkOutcome::Restored => {
+                self.host_network.result = None;
+                self.host_network.preview = None;
+                self.host_network.phase = crate::HostNetworkPhase::Ready;
+            }
+        }
+        self.host_network.error_code = None;
+        self.state.publish_only_change();
+    }
+
+    pub(crate) fn fail_host_request(&mut self, error: &PortError) {
+        self.host_network.error_code = Some(error.code.stable().as_str().to_owned());
+        self.host_network.phase = crate::HostNetworkPhase::Failed;
+        self.host_network.preview = None;
+        self.state.publish_only_change();
     }
 
     pub fn invalidate_epoch(&mut self, next: DeviceEpoch, reason: EpochInvalidationReason) {

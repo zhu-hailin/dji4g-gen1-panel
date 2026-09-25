@@ -34,6 +34,7 @@ fn snapshot(
     sim_identity: Option<SimIdentity>,
 ) -> ControllerSnapshot {
     ControllerSnapshot {
+        host_network: dji4g_application::HostNetworkSnapshot::default(),
         publication_revision: 7,
         app: Arc::new(AppSnapshot {
             revision: 7,

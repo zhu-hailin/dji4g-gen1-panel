@@ -80,6 +80,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "as-raw-xcb-connection"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-application"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dji4g-at-protocol",
  "dji4g-domain",
@@ -376,14 +382,14 @@ dependencies = [
 
 [[package]]
 name = "dji4g-at-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dji4g-domain",
 ]
 
 [[package]]
 name = "dji4g-domain"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -391,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-helper"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dji4g-ipc",
  "dji4g-windows-platform",
@@ -399,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-ipc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -409,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-panel"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dji4g-application",
  "dji4g-at-protocol",
@@ -427,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-windows-platform"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dji4g-at-protocol",
  "dji4g-domain",
@@ -438,6 +444,7 @@ dependencies = [
  "windows",
  "windows-future",
  "windows-sys 0.61.2",
+ "yaml-rust2",
 ]
 
 [[package]]
@@ -647,6 +654,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "foldhash"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -845,9 +858,27 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+dependencies = [
+ "foldhash",
+]
+
+[[package]]
+name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "hashlink"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -977,7 +1008,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
 dependencies = [
  "equivalent",
- "hashbrown",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3090,6 +3121,16 @@ name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "yaml-rust2"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2462ea039c445496d8793d052e13787f2b90e750b833afee748e601c17621ed9"
+dependencies = [
+ "arraydeque",
+ "hashlink",
+]
 
 [[package]]
 name = "yoke"

@@ -218,6 +218,7 @@ pub enum CheckResult<T> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControllerSnapshot {
+    pub host_network: crate::HostNetworkSnapshot,
     pub publication_revision: u64,
     pub app: Arc<AppSnapshot>,
     pub diagnostics: DiagnosticSet,
@@ -858,6 +859,7 @@ impl ReducerState {
         now: SystemTime,
     ) -> ControllerSnapshot {
         ControllerSnapshot {
+            host_network: crate::HostNetworkSnapshot::default(),
             publication_revision: self.publication_revision,
             app: Arc::new(self.app_snapshot(now)),
             diagnostics: self.diagnostics.clone(),

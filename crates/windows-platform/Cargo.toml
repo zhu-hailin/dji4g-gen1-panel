@@ -9,6 +9,7 @@ rust-version.workspace = true
 dji4g-at-protocol = { path = "../at-protocol" }
 dji4g-domain = { path = "../domain" }
 dji4g-ipc = { path = "../ipc" }
+yaml-rust2 = { version = "=0.10.4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 native-tls = "0.2.14"
@@ -33,6 +34,10 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock",
+  "Win32_Networking_WinHttp",
+  "Win32_System_Com",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Memory",
   "Win32_System_IO",
   "Win32_System_Pipes",
   "Win32_System_Registry",

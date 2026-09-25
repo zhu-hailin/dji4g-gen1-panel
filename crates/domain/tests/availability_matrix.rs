@@ -198,7 +198,7 @@ fn classification_table_covers_the_spec_rules() {
     cases.push((
         "VPN or TUN owns the global default route",
         competing_route,
-        Availability::Limited(LimitedReason::CompetingDefaultRoute),
+        Availability::Available,
     ));
 
     let mut at_unavailable = supported(now);

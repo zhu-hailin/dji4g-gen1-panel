@@ -197,17 +197,6 @@ fn classify_bound_success(
         None => return incomplete_evidence(input, now),
     }
 
-    if matches!(
-        input
-            .system_default_route
-            .as_ref()
-            .filter(|evidence| evidence.source == EvidenceSource::GlobalRoute)
-            .map(|evidence| evidence.value),
-        Some(DefaultRouteOwner::VpnOrTun)
-    ) {
-        return Availability::Limited(LimitedReason::CompetingDefaultRoute);
-    }
-
     match input
         .at_control
         .as_ref()

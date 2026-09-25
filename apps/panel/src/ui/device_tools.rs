@@ -183,7 +183,7 @@ pub fn tool_operation_text(kind: ToolOperationKind) -> String {
     match kind {
         ToolOperationKind::Read(id) => tool_read_text(id).to_owned(),
         ToolOperationKind::ProbeAll => "全部预设查询（批量）".to_owned(),
-        ToolOperationKind::Expert => "专家命令".to_owned(),
+        ToolOperationKind::Expert => "AT 命令（高级）".to_owned(),
     }
 }
 
@@ -403,7 +403,7 @@ fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceTools
     ui.horizontal_wrapped(|ui| {
         ui.heading("设备工具");
         ui.label(meta_text(
-            "预设查询、白名单查询与专家终端；写入操作仍需逐条确认",
+            "预设查询、只读查询与 AT 命令（高级）；写入操作需确认",
         ));
     });
     ui.add_space(8.0);
@@ -450,8 +450,8 @@ fn render_tabs(ui: &mut Ui, state: &mut DeviceToolsState) {
     ui.horizontal_wrapped(|ui| {
         for (tab, title) in [
             (ToolTab::Preset, "预设"),
-            (ToolTab::Query, "查询"),
-            (ToolTab::Expert, "专家"),
+            (ToolTab::Query, "只读查询"),
+            (ToolTab::Expert, "AT 命令（高级）"),
         ] {
             let active = state.tab == tab;
             let response = ui.add(
@@ -941,7 +941,7 @@ fn render_query(
 ) {
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("白名单查询"));
+            ui.label(section_heading("只读 AT 查询"));
             ui.label(meta_text("只读白名单内的查询不需要逐条确认"));
         });
         ui.horizontal_wrapped(|ui| {
@@ -978,9 +978,9 @@ fn render_query(
         if state.point_to_expert {
             ui.horizontal_wrapped(|ui| {
                 ui.label(meta_text(
-                    "专家终端可以执行其他命令，但每条都需要单独确认。",
+                    "这条命令不在只读查询列表内。若了解其作用，可到 AT 命令（高级）检查并逐条确认；不确定时请使用预设查询。",
                 ));
-                if ui.button("打开专家终端").clicked() {
+                if ui.button("打开 AT 命令（高级）").clicked() {
                     state.tab = ToolTab::Expert;
                     state.point_to_expert = false;
                 }
@@ -1048,12 +1048,12 @@ fn render_expert(
     let tools = &snapshot.device_tools;
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("专家终端"));
+            ui.label(section_heading("AT 命令（高级）"));
             if state.expert_unlocked {
                 badge(ui, "本次会话已解锁", StatusTone::Caution.color());
             } else {
                 if ui
-                    .add_enabled(can_act, egui::Button::new("解锁专家终端"))
+                    .add_enabled(can_act, egui::Button::new("启用 AT 命令输入"))
                     .clicked()
                 {
                     state.expert_unlocked = true;
@@ -1064,11 +1064,17 @@ fn render_expert(
                 );
             }
         });
+        wrapped_label(
+            ui,
+            meta_text(
+                "供了解 AT 命令的用户排查问题。每次只发送一条经校验的命令；确认前会显示完整内容。命令可能修改配置或中断连接。",
+            ),
+        );
         if state.expert_unlocked {
             ui.add_space(4.0);
             ui.add(
                 egui::TextEdit::singleline(&mut state.expert_input)
-                    .hint_text("例如 AT+QCFG=\"usbnet\"")
+                    .hint_text("输入一条 AT 命令，例如 AT+CSQ")
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace),
             );
@@ -1178,7 +1184,7 @@ fn render_pending_expert(
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(section_heading("专家命令待确认"));
+            ui.label(section_heading("AT 命令待确认"));
             wrapped_label(ui, meta_text("以下命令已冻结，确认后才会写入模块："));
             egui::Frame::none()
                 .fill(Color32::from_rgb(0xf5, 0xf7, 0xfb))
@@ -1243,7 +1249,7 @@ fn render_history(
 ) {
     section_frame(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading("终端输出"));
+            ui.label(section_heading("命令记录"));
             ui.label(meta_text("只保存在本机内存中的最近任务记录"));
         });
         ui.horizontal_wrapped(|ui| {

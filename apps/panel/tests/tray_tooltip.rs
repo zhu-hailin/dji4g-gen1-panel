@@ -21,6 +21,7 @@ impl UiCommandSink for NoopSink {
 
 fn snapshot(availability: Availability, freshness: Freshness) -> ControllerSnapshot {
     ControllerSnapshot {
+        host_network: dji4g_application::HostNetworkSnapshot::default(),
         publication_revision: 1,
         app: Arc::new(AppSnapshot {
             revision: 1,

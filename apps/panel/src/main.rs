@@ -20,6 +20,7 @@ use dji4g_panel::app::{
 use dji4g_panel::config::{ConfigLoadOutcome, ConfigPaths, ConfigStore, StartupOptions};
 use dji4g_panel::localization::{Language, LocalizedText, TextKey};
 use dji4g_panel::logging::{LoggingConfig, LoggingGuard, init_logging};
+use dji4g_panel::proxy_repair::ProductionHostNetwork;
 use dji4g_panel::runtime::ProductionComposition;
 use dji4g_panel::tray::{NativeTrayBackend, TrayController, TrayError, TrayLabels};
 use dji4g_windows_platform::{AcquireResult, ActivationRequest, AutostartControl, SingleInstance};
@@ -212,10 +213,14 @@ fn main() {
     let runner = if demo.is_some() {
         runner
     } else {
-        runner.with_ports(ports)
+        runner
+            .with_ports(ports)
+            .with_host_network_port(Arc::new(ProductionHostNetwork::default()))
     };
     #[cfg(not(debug_assertions))]
-    let runner = runner.with_ports(ports);
+    let runner = runner
+        .with_ports(ports)
+        .with_host_network_port(Arc::new(ProductionHostNetwork::default()));
     #[cfg(debug_assertions)]
     let demo_active = demo.is_some();
     #[cfg(debug_assertions)]

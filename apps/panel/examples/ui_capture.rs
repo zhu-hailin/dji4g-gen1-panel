@@ -201,6 +201,13 @@ mod capture {
             "single-query" | "single-query-detail" => vec![Screen::ToolsPreset],
             "wireless" => vec![Screen::Wireless],
             "overview" => vec![Screen::Overview],
+            "host-normal-tun"
+            | "host-missing-binding"
+            | "host-unsupported"
+            | "host-repair-preview"
+            | "host-awaiting-restart"
+            | "host-restore-conflict"
+            | "host-no-module" => vec![Screen::Diagnostics],
             "tools" => vec![
                 Screen::ToolsPreset,
                 Screen::ToolsQuery,
@@ -847,6 +854,77 @@ mod capture {
         }
         if mode == "onboarding-absent" {
             *snapshot = demo_snapshot(DemoScenario::Absent, now);
+            return;
+        }
+        if mode.starts_with("host-") {
+            if mode == "host-no-module" {
+                *snapshot = demo_snapshot(DemoScenario::Absent, now);
+            }
+            let mut observation = HostNetworkObservation {
+                adapters: vec![
+                    HostAdapter {
+                        guid: "{SIMULATED-WIFI}".into(),
+                        luid: 11,
+                        alias: "Wi-Fi".into(),
+                        up: true,
+                    },
+                    HostAdapter {
+                        guid: "{SIMULATED-TUN}".into(),
+                        luid: 12,
+                        alias: "Clash TUN".into(),
+                        up: true,
+                    },
+                ],
+                default_routes: vec![HostDefaultRoute {
+                    family: IpFamily::V4,
+                    luid: 12,
+                    metric: 5,
+                }],
+                system_proxy: HostProxyMode::Manual,
+                binding: None,
+                proxy_inspection_complete: true,
+                proxy_error_code: None,
+                observed_at: now,
+            };
+            if mode != "host-normal-tun" {
+                observation.binding = Some(ProxyBinding {
+                    client: ProxyClient::ClashVergeRev,
+                    version: Some(
+                        if mode == "host-unsupported" {
+                            "2.6.0"
+                        } else {
+                            "2.5.5"
+                        }
+                        .into(),
+                    ),
+                    interface_alias: "已移除的以太网".into(),
+                    repairable: mode == "host-repair-preview",
+                });
+            }
+            let finding = classify_host_network(&observation);
+            snapshot.host_network = HostNetworkSnapshot {
+                phase: match mode {
+                    "host-repair-preview" => HostNetworkPhase::AwaitingConfirmation,
+                    "host-awaiting-restart" => HostNetworkPhase::AwaitingRestart,
+                    "host-restore-conflict" => HostNetworkPhase::Failed,
+                    _ => HostNetworkPhase::Ready,
+                },
+                observation: Some(observation),
+                finding: Some(finding),
+                finding_id: Some(1),
+                preview: (mode == "host-repair-preview").then_some(ProxyRepairPreview {
+                    plan_id: 2,
+                    interface_alias: "已移除的以太网".into(),
+                    expires_at: now + Duration::from_secs(60),
+                }),
+                result: matches!(mode, "host-awaiting-restart" | "host-restore-conflict")
+                    .then_some(ProxyRepairResult {
+                        backup_id: 3,
+                        changed: true,
+                    }),
+                error_code: (mode == "host-restore-conflict")
+                    .then_some("proxy:restore_conflict".into()),
+            };
             return;
         }
         let mode = if mode == "onboarding-missing-port" {
