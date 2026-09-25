@@ -521,11 +521,39 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn probe_fixture_command(case: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "support_report::tests::bounded_probe_child",
+                "--nocapture",
+            ])
+            .env("DJI4G_BOUNDED_PROBE_TEST", case);
+        command
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_probe_child() {
+        match std::env::var("DJI4G_BOUNDED_PROBE_TEST").as_deref() {
+            Ok("failed") => {
+                println!("probe-started");
+                eprintln!("access-denied-detail");
+                std::io::stdout().flush().expect("flush stdout");
+                std::io::stderr().flush().expect("flush stderr");
+                std::process::exit(7);
+            }
+            Ok("hung") => std::thread::sleep(Duration::from_secs(30)),
+            Ok("next") => println!("next-probe"),
+            _ => {}
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn failed_probe_keeps_exit_code_and_both_streams() {
-        let shell = dji4g_windows_platform::driver_setup_powershell().unwrap();
-        let result = run_bounded(Command::new(shell).args(["-NoProfile", "-NonInteractive", "-Command",
-            "[Console]::Out.WriteLine('probe-started'); [Console]::Error.WriteLine('access-denied-detail'); exit 7"]), Duration::from_secs(8));
+        let result = run_bounded(&mut probe_fixture_command("failed"), Duration::from_secs(8));
         assert!(result.contains("status=FAILED"), "{result}");
         assert!(result.contains('7'), "{result}");
         assert!(result.contains("probe-started"), "{result}");
@@ -535,28 +563,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn hung_probe_times_out_and_next_probe_still_runs() {
-        let shell = dji4g_windows_platform::driver_setup_powershell().unwrap();
         let started = Instant::now();
         let result = run_bounded(
-            Command::new(&shell).args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 30",
-            ]),
+            &mut probe_fixture_command("hung"),
             Duration::from_millis(300),
         );
         assert!(result.contains("TIMED_OUT"), "{result}");
         assert!(started.elapsed() < Duration::from_secs(5));
-        let next = run_bounded(
-            Command::new(shell).args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Write-Output 'next-probe'; exit 0",
-            ]),
-            Duration::from_secs(8),
-        );
+        let next = run_bounded(&mut probe_fixture_command("next"), Duration::from_secs(8));
         assert!(next.contains("status=OK"), "{next}");
         assert!(next.contains("next-probe"));
     }
