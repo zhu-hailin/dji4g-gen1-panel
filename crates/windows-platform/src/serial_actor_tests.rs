@@ -935,7 +935,10 @@ mod tool_transactions {
     fn a_failed_tool_transaction_does_not_disturb_the_monitoring_path() {
         // A monitoring-style `Execute` after a failed tool run reports the retirement rather than
         // hanging, and never returns a stale success.
-        let (actor, _) = actor_with_reads([Ok(b"AT+VENDOR?\r\nERROR\r\n".to_vec())]);
+        let (actor, _) = actor_with_reads([
+            Ok(b"AT+VENDOR?\r\nERROR\r\n".to_vec()),
+            Ok(b"+CSQ: 20,99\r\nOK\r\n".to_vec()),
+        ]);
         let _ = receive(
             &actor,
             expert("AT+VENDOR?"),
@@ -946,8 +949,11 @@ mod tool_transactions {
         let follow_up = actor.try_execute(AtCommand::SignalQuality);
         match follow_up {
             Ok(receiver) => {
-                let result = receiver.recv_timeout(Duration::from_secs(2));
-                assert!(result.is_ok(), "the actor still answers");
+                let result = receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the actor still answers")
+                    .expect("the queued monitoring response is valid");
+                assert_eq!(result.lines, vec!["+CSQ: 20,99"]);
             }
             Err(error) => assert!(matches!(
                 error,
