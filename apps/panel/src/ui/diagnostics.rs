@@ -168,7 +168,6 @@ pub(crate) fn render(
     sink: &dyn UiCommandSink,
 ) {
     let vm = diagnostics_vm(snapshot, language);
-    ui.heading(vm.title.text.clone());
     wrapped_label(
         ui,
         RichText::new(vm.intro.text.clone())
@@ -176,7 +175,7 @@ pub(crate) fn render(
             .color(scale::SECONDARY),
     );
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         // Refresh is the primary action on this page, so it carries the bold weight.
         if ui
             .button(RichText::new(TextKey::ButtonRefresh.to_string(language)).strong())

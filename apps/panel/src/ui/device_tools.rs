@@ -385,8 +385,10 @@ pub(crate) fn render(
         state.point_to_expert = false;
     }
     ui.add_space(10.0);
-    render_task_strip(ui, tools, sink);
-    ui.add_space(14.0);
+    if tools.task.is_some() {
+        render_task_strip(ui, tools, sink);
+        ui.add_space(14.0);
+    }
     match state.tab {
         ToolTab::Preset => render_preset(ui, snapshot, sink, state, now, language, can_act),
         ToolTab::Query => render_query(ui, tools, sink, state, can_act),
@@ -400,13 +402,7 @@ pub(crate) fn render(
 /// Current target: identity, AT port and device/SIM epoch. Nothing here is rendered from a
 /// fabricated value — an absent device says so and every action stays disabled.
 fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceToolsSnapshot) {
-    ui.horizontal_wrapped(|ui| {
-        ui.heading("设备工具");
-        ui.label(meta_text(
-            "预设查询、只读查询与 AT 命令（高级）；写入操作需确认",
-        ));
-    });
-    ui.add_space(8.0);
+    super::components::page_heading(ui, "设备工具", "读取模块信息，按需执行经过确认的操作");
     let device = snapshot.app.device.as_ref();
     let identity = device.map(|device| &device.identity).or_else(|| {
         tools
@@ -447,35 +443,17 @@ fn render_header(ui: &mut Ui, snapshot: &ControllerSnapshot, tools: &DeviceTools
 }
 
 fn render_tabs(ui: &mut Ui, state: &mut DeviceToolsState) {
-    ui.horizontal_wrapped(|ui| {
-        for (tab, title) in [
-            (ToolTab::Preset, "预设"),
-            (ToolTab::Query, "只读查询"),
-            (ToolTab::Expert, "AT 命令（高级）"),
-        ] {
-            let active = state.tab == tab;
-            let response = ui.add(
-                egui::Button::new(RichText::new(title).color(if active {
-                    scale::DOWNLOAD
-                } else {
-                    scale::SECONDARY
-                }))
-                .fill(Color32::TRANSPARENT)
-                .stroke(egui::Stroke::NONE),
-            );
-            if active {
-                let rect = response.rect;
-                ui.painter().line_segment(
-                    [rect.left_bottom(), rect.right_bottom()],
-                    egui::Stroke::new(2.0_f32, scale::DOWNLOAD),
-                );
-            }
-            if response.clicked() {
-                state.tab = tab;
-            }
-        }
-        ui.label(meta_text("任务执行期间仍可切换标签页，但写入按钮会被禁用"));
-    });
+    super::components::page_tabs(
+        ui,
+        egui::Id::new("device-tools-tabs"),
+        &mut state.tab,
+        &[
+            super::components::TabItem::new(ToolTab::Preset, "预设"),
+            super::components::TabItem::new(ToolTab::Query, "只读查询"),
+            super::components::TabItem::new(ToolTab::Expert, "AT 命令（高级）"),
+        ],
+    );
+    ui.label(meta_text("任务执行期间仍可切换标签页，但写入按钮会被禁用"));
 }
 
 fn render_task_strip(

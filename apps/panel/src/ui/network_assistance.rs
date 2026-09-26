@@ -161,7 +161,7 @@ pub(crate) fn render_brief(
     ui.horizontal_wrapped(|ui| {
         ui.colored_label(tone.color(), format!("{} {message}", tone.marker()));
         if ui
-            .small_button(copy(language, "电脑网络详情", "Computer network details"))
+            .button(copy(language, "电脑网络详情", "Computer network details"))
             .clicked()
         {
             open = true;

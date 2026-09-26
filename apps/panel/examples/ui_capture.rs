@@ -1362,6 +1362,146 @@ mod capture {
         }
     }
 
+    // No window, GPU context, OS input, screenshot API or device access. Export the real
+    // egui draw meshes for the optional CPU rasterizer in packaging/scripts/render-ui-mesh.py.
+    fn capture_headless(
+        width: f32,
+        height: f32,
+        scale: f32,
+        mode: &str,
+        screens: &[Screen],
+        output: &std::path::Path,
+    ) {
+        for screen in screens {
+            let ctx = egui::Context::default();
+            dji4g_panel::ui::initialize_visuals(&ctx);
+            ctx.set_pixels_per_point(scale);
+            let mut snapshot = demo_snapshot(DemoScenario::Available, SystemTime::now());
+            let mut app = (*snapshot.app).clone();
+            app.cellular = Some(dji4g_domain::CellularSnapshot {
+                sim: dji4g_domain::SimState::Ready,
+                registration: dji4g_domain::RegistrationState::RegisteredHome,
+                attached: dji4g_domain::AttachState::Attached,
+                carrier: Some("CHN-UNICOM".to_owned()),
+                radio_access_technology: Some("LTE".to_owned()),
+                signal_rssi_dbm: Some(-63),
+                apn: Some("cmnet".to_owned()),
+                pdp_address: Some("10.1.2.3".to_owned()),
+                pdp_state: Some("active".to_owned()),
+                firmware: Some("QDC507GLEFM21".to_owned()),
+                serving_cell: None,
+                sim_identity: None,
+                numbers: None,
+                temperature_celsius: Some(51),
+                temperature_status: dji4g_domain::FeatureStatus::Supported,
+            });
+            let down = 47_500;
+            let up = 8_700;
+            app.network = Some(dji4g_domain::NetworkSnapshot {
+                adapter_id: "{adapter}".to_owned(),
+                addresses: vec!["192.168.225.30".to_owned()],
+                gateways: vec!["192.168.225.1".to_owned()],
+                dns_servers: vec!["192.168.225.1".to_owned()],
+                adapter_state: dji4g_domain::AdapterState::UsableAddressAndRoute,
+                bound_public: dji4g_domain::BoundPublicStatus::Succeeded,
+                bound_dns: dji4g_domain::BoundDnsStatus::Succeeded,
+                protocol_coverage: dji4g_domain::ProtocolCoverage::AllRequiredFamilies,
+                system_default_route: dji4g_domain::DefaultRouteOwner::TargetAdapter,
+                down_bytes_per_sec: Some(down),
+                up_bytes_per_sec: Some(up),
+            });
+            snapshot.app = Arc::new(app);
+            if let Some(kind) = screen.tools_fixture() {
+                snapshot.device_tools = tools_fixture(kind);
+            }
+
+            if screen.is_sms_fixture() {
+                let (messages, inbox) = sms_fixture();
+                snapshot.sms_messages = messages
+                    .into_iter()
+                    .map(|message| dji4g_domain::SmsDisplayMessage {
+                        fragments: if message.direction == dji4g_domain::SmsDirection::Incoming {
+                            vec![message.fragment_key()]
+                        } else {
+                            Vec::new()
+                        },
+                        delete_allowed: true,
+                        message,
+                    })
+                    .collect();
+                snapshot.sms_inbox = inbox;
+            }
+            apply_extra_fixture(&mut snapshot, mode);
+            let mut app = PanelApp::from_snapshot(Arc::new(snapshot), Arc::new(Noop));
+            screen.apply(&mut app);
+            if mode == "module-consent" {
+                ctx.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("module-network-probe-consent"), true)
+                });
+            }
+            if mode == "module-temperature" {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("overview-chart-tab"), 1_u8));
+            }
+            if mode == "draft-replace" {
+                app.set_review_reply_replace();
+            }
+            if mode.starts_with("onboarding-") {
+                app.review_onboarding();
+            }
+            if mode == "onboarding-driver" {
+                app.review_onboarding_with_driver(true);
+            }
+            if let Some(outcome) = driver_outcome(mode) {
+                app.configure_driver_setup_result(outcome);
+                app.review_onboarding_with_driver(true);
+            }
+            let mut textures = Vec::new();
+            for tick in 0..4 {
+                let frame = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        time: Some(tick as f64 * 0.5),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.render_ui(ctx);
+                    },
+                );
+                for (id, delta) in &frame.textures_delta.set {
+                    let pixels: Vec<[u8; 4]> = match &delta.image {
+                        egui::ImageData::Color(image) => {
+                            image.pixels.iter().map(|c| c.to_array()).collect()
+                        }
+                        egui::ImageData::Font(image) => {
+                            image.srgba_pixels(None).map(|c| c.to_array()).collect()
+                        }
+                    };
+                    textures.push(serde_json::json!({"id": format!("{id:?}"), "size": delta.image.size(), "pos": delta.pos, "pixels": pixels}));
+                }
+                if tick == 3 {
+                    let meshes: Vec<_> = ctx.tessellate(frame.shapes, scale).into_iter().filter_map(|primitive| {
+                        let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else { return None; };
+                        Some(serde_json::json!({
+                            "clip": [primitive.clip_rect.min.x, primitive.clip_rect.min.y, primitive.clip_rect.max.x, primitive.clip_rect.max.y],
+                            "texture": format!("{:?}", mesh.texture_id),
+                            "indices": mesh.indices,
+                            "vertices": mesh.vertices.iter().map(|v| serde_json::json!([v.pos.x, v.pos.y, v.uv.x, v.uv.y, v.color.to_array()])).collect::<Vec<_>>()
+                        }))
+                    }).collect();
+                    let data = serde_json::json!({"width": width, "height": height, "scale": scale, "textures": textures, "meshes": meshes, "simulated": true, "native_window": false});
+                    std::fs::write(
+                        output.join(format!("{}.mesh.json", screen.name())),
+                        serde_json::to_vec(&data).unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+
     pub fn main() -> eframe::Result {
         let args = std::env::args().collect::<Vec<_>>();
         let width = args
@@ -1393,6 +1533,10 @@ mod capture {
             ))
             .join(&mode);
         std::fs::create_dir_all(&output).unwrap();
+        if args.iter().any(|arg| arg == "--headless") {
+            capture_headless(width, height, scale, &mode, &screens, &output);
+            return Ok(());
+        }
 
         eframe::run_native(
             "DJI 面板 · 模拟界面验收",

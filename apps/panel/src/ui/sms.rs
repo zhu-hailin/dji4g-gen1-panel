@@ -297,10 +297,11 @@ pub(crate) fn render(
         .iter()
         .map(|message| display_row_vm(message, language))
         .collect();
+    ui.spacing_mut().item_spacing.y = 8.0;
     state.serial_busy = snapshot.serial_work_busy;
     ui.horizontal_wrapped(|ui| {
         ui.vertical(|ui| {
-            ui.heading("短信中心");
+            ui.label(RichText::new("短信").size(28.0).color(scale::INK));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add(super::theme::primary_button("新建短信")).clicked() {
@@ -463,7 +464,7 @@ fn empty_panel(ui: &mut Ui, title: &str, note: &str, height: f32) {
         ui.horizontal(|ui| {
             ui.add_space(((ui.available_width() - 68.0) / 2.0).max(0.0));
             egui::Frame::none()
-                .fill(egui::Color32::from_rgb(0xec, 0xef, 0xff))
+                .fill(egui::Color32::from_rgb(211, 227, 253))
                 .rounding(18.0)
                 .inner_margin(20.0)
                 .show(ui, |ui| {
@@ -520,20 +521,28 @@ fn render_inbox(
             wrapped_label(ui, RichText::new(error).color(StatusTone::Caution.color()));
         });
     }
-    if vm.has_incomplete {
-        wrapped_label(
-            ui,
-            RichText::new(&vm.incomplete_warning.text).color(StatusTone::Caution.color()),
-        );
-    }
-    if vm.evicted > 0 {
-        wrapped_label(
-            ui,
-            meta_text(format!(
-                "本地缓存已移出 {} 条较早短信；模块存储可能仍有记录。",
-                vm.evicted
-            )),
-        );
+    if vm.has_incomplete || vm.evicted > 0 {
+        egui::CollapsingHeader::new("同步提示与历史记录")
+            .id_salt("sms-sync-notes")
+            .default_open(false)
+            .show(ui, |ui| {
+                if vm.has_incomplete {
+                    wrapped_label(
+                        ui,
+                        RichText::new(&vm.incomplete_warning.text)
+                            .color(StatusTone::Caution.color()),
+                    );
+                }
+                if vm.evicted > 0 {
+                    wrapped_label(
+                        ui,
+                        meta_text(format!(
+                            "本地缓存已移出 {} 条较早短信；模块存储可能仍有记录。",
+                            vm.evicted
+                        )),
+                    );
+                }
+            });
     }
     ui.add_space(12.0);
     egui::Frame::none()
@@ -542,41 +551,24 @@ fn render_inbox(
         .inner_margin(18.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                for (outgoing, title) in [(false, "收件箱"), (true, "发送记录")] {
-                    let count = vm
-                        .rows
-                        .iter()
-                        .filter(|r| (r.direction == SmsDirection::Outgoing) == outgoing)
-                        .count();
-                    let active = state.outgoing == outgoing;
-                    let response = ui.add(
-                        egui::Button::new(RichText::new(format!("{title}  {count}")).color(
-                            if active {
-                                scale::DOWNLOAD
-                            } else {
-                                scale::SECONDARY
-                            },
-                        ))
-                        .fill(egui::Color32::TRANSPARENT)
-                        .stroke(egui::Stroke::NONE),
-                    );
-                    if active {
-                        let r = response.rect;
-                        ui.painter().line_segment(
-                            [r.left_bottom(), r.right_bottom()],
-                            egui::Stroke::new(2.0_f32, scale::DOWNLOAD),
-                        );
-                    }
-                    if response.clicked() {
-                        state.outgoing = outgoing;
-                        state.selected = None;
-                    }
-                }
-            });
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(10.0);
+            let incoming = vm
+                .rows
+                .iter()
+                .filter(|r| r.direction != SmsDirection::Outgoing)
+                .count();
+            let outgoing = vm.rows.len() - incoming;
+            if super::components::segmented_control(
+                ui,
+                egui::Id::new("sms-direction"),
+                &mut state.outgoing,
+                &[
+                    super::components::TabItem::new(false, format!("收件箱  {incoming}")),
+                    super::components::TabItem::new(true, format!("发送记录  {outgoing}")),
+                ],
+            ) {
+                state.selected = None;
+            }
+            ui.add_space(8.0);
             let query = state.search.trim().to_lowercase();
             let rows: Vec<_> = vm
                 .rows
@@ -745,15 +737,18 @@ fn render_list(
             .rounding(10.0)
             .inner_margin(12.0)
             .fill(if selected {
-                egui::Color32::from_rgb(0xed, 0xf0, 0xff)
+                egui::Color32::from_rgb(211, 227, 253)
             } else {
                 egui::Color32::from_rgb(0xf8, 0xf9, 0xfc)
             });
         let response = frame
             .show(ui, |ui| {
-                ui.spacing_mut().interact_size.y = 18.0;
+                // These are labels inside one >=72px clickable message row, not small controls.
+                ui.spacing_mut().interact_size.y = 20.0;
+                ui.spacing_mut().item_spacing.y = 4.0;
                 ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
+                ui.set_min_height(48.0);
+                ui.horizontal_wrapped(|ui| {
                     if row.unread == Some(true) && !outgoing {
                         ui.colored_label(scale::DOWNLOAD, "●");
                     }
@@ -763,25 +758,23 @@ fn render_list(
                             .strong()
                             .color(scale::INK),
                     );
+                    ui.label(meta_text(row.timestamp.as_deref().unwrap_or("时间未提供")));
                 });
                 ui.add(
                     egui::Label::new(
                         RichText::new(body_preview(&row.body))
-                            .size(13.0)
+                            .size(14.0)
                             .color(scale::SECONDARY),
                     )
                     .truncate(),
                 );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(meta_text(row.timestamp.as_deref().unwrap_or("时间未提供")));
-                    if outgoing {
-                        let (tone, label) = outgoing_state(row.status);
-                        ui.colored_label(
-                            tone.color(),
-                            format!("{} {}", tone.marker(), label.to_string(language)),
-                        );
-                    }
-                });
+                if outgoing {
+                    let (tone, label) = outgoing_state(row.status);
+                    ui.colored_label(
+                        tone.color(),
+                        format!("{} {}", tone.marker(), label.to_string(language)),
+                    );
+                }
             })
             .response
             .interact(egui::Sense::click())
@@ -858,9 +851,14 @@ fn render_detail(
                 .copy_text(format!("{}\n{}", row.sender_full, row.body));
         }
         if row.direction == SmsDirection::Incoming {
-            if ui
-                .add_enabled(!state.serial_busy, egui::Button::new("回复"))
-                .clicked()
+            if super::components::action_button(
+                ui,
+                "回复",
+                super::components::ButtonKind::Tonal,
+                !state.serial_busy,
+                Some("当前通信任务尚未结束"),
+            )
+            .clicked()
             {
                 state.begin_reply(&row.sender_full);
             }
@@ -900,16 +898,14 @@ fn render_delete_button(
     } else {
         format!("删除短信（{} 个分片）", row.fragments.len())
     };
-    if ui
-        .add_enabled(
-            enabled,
-            egui::Button::new(RichText::new(label).color(if armed {
-                StatusTone::Negative.color()
-            } else {
-                scale::SECONDARY
-            })),
-        )
-        .clicked()
+    if super::components::action_button(
+        ui,
+        &label,
+        super::components::ButtonKind::Destructive,
+        enabled,
+        Some("请等待通信任务结束，并重新核对短信分片"),
+    )
+    .clicked()
     {
         if armed {
             ui.data_mut(|data| data.remove::<Instant>(armed_id));

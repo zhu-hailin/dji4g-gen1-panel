@@ -1,7 +1,7 @@
-//! Native Windows MDL2 outline icons; UI text always remains independently readable.
+//! Bundled Google Material Symbols outline icons; UI text always remains independently readable.
 use eframe::egui::{self, RichText};
-pub(crate) const MAIL: &str = "\u{e715}";
-pub(crate) const EDIT: &str = "\u{e70f}";
+pub(crate) const MAIL: &str = "\u{e159}";
+pub(crate) const EDIT: &str = "\u{f097}";
 pub(crate) fn text(ctx: &egui::Context, glyph: &str, size: f32) -> RichText {
     if !ctx.data(|data| {
         data.get_temp::<bool>(egui::Id::new("panel-icons-installed"))

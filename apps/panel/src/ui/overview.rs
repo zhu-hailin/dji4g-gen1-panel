@@ -507,25 +507,19 @@ pub(crate) fn render_summary(
 ) -> Option<crate::app::Page> {
     let mut destination = None;
     let vm = overview_vm_with_probes(snapshot, language, probes);
-    ui.heading("概览");
     let availability = super::availability_vm(
         &snapshot.app,
         &snapshot.diagnostics,
         std::time::SystemTime::now(),
         language,
     );
-    section_frame(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(&availability.title.text)
-                    .strong()
-                    .color(availability.tone.color()),
-            );
-            if availability.is_loading {
-                ui.spinner();
-            }
-        });
-        wrapped_label(ui, &availability.reason.text);
+    super::components::status_banner(
+        ui,
+        &availability.title.text,
+        &availability.reason.text,
+        availability.tone,
+    );
+    ui.scope(|ui| {
         let next = super::driver_setup::next_step_vm(snapshot, std::time::SystemTime::now());
         if next.state != super::driver_setup::GuideState::Passed {
             wrapped_label(ui, meta_text(next.text));
@@ -544,24 +538,25 @@ pub(crate) fn render_summary(
         }
     });
     section_frame(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
         let values = [
             ("运营商", vm.carrier.text.clone()),
             ("信号", vm.signal.text.clone()),
             (
-                "下行",
-                vm.down_rate
-                    .map(super::format_rate_1dp)
-                    .unwrap_or_else(|| "--".into()),
-            ),
-            (
-                "上行",
-                vm.up_rate
-                    .map(super::format_rate_1dp)
-                    .unwrap_or_else(|| "--".into()),
+                "实时速率",
+                format!(
+                    "↓ {}   ↑ {}",
+                    vm.down_rate
+                        .map(super::format_rate_1dp)
+                        .unwrap_or_else(|| "--".into()),
+                    vm.up_rate
+                        .map(super::format_rate_1dp)
+                        .unwrap_or_else(|| "--".into())
+                ),
             ),
             ("温度", vm.temperature.text.clone()),
         ];
-        let count = if ui.available_width() >= 620.0 { 5 } else { 3 };
+        let count = if ui.available_width() >= 680.0 { 4 } else { 2 };
         for row in values.chunks(count) {
             ui.columns(count, |columns| {
                 for (column, (label, value)) in columns.iter_mut().zip(row) {
@@ -589,10 +584,15 @@ pub(crate) fn render(
     section_frame(ui, |ui| {
         let tab_id = egui::Id::new("overview-chart-tab");
         let mut tab = ui.data(|data| data.get_temp::<u8>(tab_id)).unwrap_or(0);
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut tab, 0, "收发速率");
-            ui.selectable_value(&mut tab, 1, "模块温度");
-        });
+        super::components::segmented_control(
+            ui,
+            tab_id.with("control"),
+            &mut tab,
+            &[
+                super::components::TabItem::new(0, "收发速率"),
+                super::components::TabItem::new(1, "模块温度"),
+            ],
+        );
         ui.data_mut(|data| data.insert_temp(tab_id, tab));
         if tab == 0 {
             render_rate_section(ui, rate_history, vm.down_rate, vm.up_rate, language);

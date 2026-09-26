@@ -151,7 +151,7 @@ pub(crate) fn render(
     sink: &dyn PanelCommandSink,
 ) -> bool {
     let vm = repairs_vm(snapshot, now, language);
-    ui.heading(vm.title.text.clone());
+    super::components::page_heading(ui, &vm.title.text, "先检查原因，再确认需要执行的操作");
     wrapped_label(
         ui,
         RichText::new(vm.notice.text.clone())
@@ -246,13 +246,25 @@ fn render_action_button(
     _language: Language,
     sink: &dyn PanelCommandSink,
 ) {
-    let button = ui.add_enabled(action.enabled, egui::Button::new(action.title.text.clone()));
-    if !action.enabled {
-        if let Some(reason) = action.disabled_reason {
-            button.clone().on_hover_text(reason.text.clone());
-            wrapped_label(ui, meta_text(reason.text));
-        }
-    }
+    let button = ui
+        .horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 140.0).max(160.0));
+                ui.label(RichText::new(&action.title.text).size(14.0).strong());
+                if let Some(reason) = &action.disabled_reason {
+                    wrapped_label(ui, meta_text(&reason.text));
+                }
+            });
+            super::components::action_button(
+                ui,
+                "查看方案",
+                super::components::ButtonKind::Outlined,
+                action.enabled,
+                action.disabled_reason.as_ref().map(|r| r.text.as_str()),
+            )
+        })
+        .inner;
+    ui.separator();
     if button.clicked() {
         if let Ok(request) = ControlledRepairRequest::try_from_action(action.action.clone()) {
             sink.prepare_repair_now(request);

@@ -337,12 +337,12 @@ pub(super) fn render(
             .show(ui.ctx(), |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 egui::ScrollArea::vertical()
-                    .max_height((ui.ctx().screen_rect().height() - 210.0).clamp(240.0, 420.0))
+                    .max_height((ui.ctx().screen_rect().height() - 240.0).clamp(100.0, 420.0))
                     .show(ui, |ui| {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(0xec, 0xef, 0xff))
+                                .fill(egui::Color32::from_rgb(211, 227, 253))
                                 .rounding(12.0)
                                 .inner_margin(12.0)
                                 .show(ui, |ui| {
@@ -442,7 +442,8 @@ pub(super) fn render(
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .default_width(460.0)
             .max_width((ui.ctx().screen_rect().width() - 48.0).min(460.0))
-            .default_height(260.0)
+            .max_height((ui.ctx().screen_rect().height() - 80.0).max(180.0))
+            .vscroll(true)
             .resizable(false)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
@@ -458,7 +459,15 @@ pub(super) fn render(
                     .wrap(),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("取消").clicked() {
+                    if crate::ui::components::action_button(
+                        ui,
+                        "取消",
+                        crate::ui::components::ButtonKind::Text,
+                        true,
+                        None,
+                    )
+                    .clicked()
+                    {
                         state.confirmation = None;
                     }
                     if ui

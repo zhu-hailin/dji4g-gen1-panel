@@ -127,7 +127,7 @@ pub(crate) fn render(
     sink: &dyn UiCommandSink,
 ) -> Vec<egui::Response> {
     let vm = settings_vm(snapshot, language);
-    ui.heading(vm.title.text.clone());
+    super::components::page_heading(ui, &vm.title.text, "让面板按你的习惯工作");
     ui.add_space(4.0);
     // Rows like the reference's `.setting-row`: label + description on the left, the control on
     // the right. Generous whitespace separates rows instead of hairlines so the page breathes.
@@ -149,7 +149,8 @@ pub(crate) fn render(
             Some(TextKey::SettingsActiveProbeDescription.to_string(language)),
             |ui| {
                 let mut active_probe = vm.active_probe;
-                let response = ui.checkbox(&mut active_probe, "开 / 关");
+                let response =
+                    super::components::switch(ui, &mut active_probe, "主动联网检查", true);
                 if response.changed() {
                     let _ = sink.try_send(UiCommand::SetActiveProbe(active_probe));
                 }
@@ -165,9 +166,11 @@ pub(crate) fn render(
             Some(TextKey::SettingsAutostartDescription.to_string(language)),
             |ui| {
                 let mut enabled = vm.autostart.enabled;
-                let response = ui.add_enabled(
+                let response = super::components::switch(
+                    ui,
+                    &mut enabled,
+                    "登录后自动启动",
                     vm.autostart.toggle_enabled,
-                    egui::Checkbox::new(&mut enabled, "开 / 关"),
                 );
                 if response.changed() {
                     let _ = sink.try_send(UiCommand::SetAutostart(enabled));
@@ -191,7 +194,8 @@ pub(crate) fn render(
             None,
             |ui| {
                 let mut start_minimized = vm.start_minimized;
-                let response = ui.checkbox(&mut start_minimized, "开 / 关");
+                let response =
+                    super::components::switch(ui, &mut start_minimized, "启动后隐藏到托盘", true);
                 if response.changed() {
                     let _ = sink.try_send(UiCommand::SetStartMinimized(start_minimized));
                 }
@@ -259,6 +263,21 @@ fn setting_row(
     control: impl FnOnce(&mut Ui) -> egui::Response,
 ) -> egui::Response {
     ui.add_space(8.0);
+    if ui.available_width() < 440.0 {
+        ui.label(RichText::new(label).strong().color(scale::INK));
+        if let Some(description) = description {
+            wrapped_label(
+                ui,
+                RichText::new(description)
+                    .size(scale::RATE_AUX)
+                    .color(scale::SECONDARY),
+            );
+        }
+        let response = control(ui);
+        ui.add_space(8.0);
+        ui.separator();
+        return response;
+    }
     let mut response = None;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {

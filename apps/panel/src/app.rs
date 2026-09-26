@@ -505,10 +505,15 @@ impl PanelApp {
     }
 
     fn render_sms_page(&mut self, ui: &mut egui::Ui, snapshot: &ControllerSnapshot) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.archive_view, false, "模块短信");
-            ui.selectable_value(&mut self.archive_view, true, "本地历史");
-        });
+        crate::ui::components::page_tabs(
+            ui,
+            egui::Id::new("sms-source-tabs"),
+            &mut self.archive_view,
+            &[
+                crate::ui::components::TabItem::new(false, "模块短信"),
+                crate::ui::components::TabItem::new(true, "本地历史"),
+            ],
+        );
         ui.add_space(6.0);
         if !self.archive_view {
             sms::render(
@@ -1338,6 +1343,11 @@ impl PanelApp {
     }
 
     pub fn render(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui(ctx);
+    }
+
+    /// Render the same UI without requiring a native window; callers supply their own input.
+    pub fn render_ui(&mut self, ctx: &egui::Context) {
         self.support_report.poll();
         if let Some(archive) = &mut self.archive {
             archive.poll();
@@ -1410,89 +1420,170 @@ impl PanelApp {
         let mut driver_install_requested = false;
 
         egui::TopBottomPanel::top("panel-top")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::WHITE)
-                    .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
+                    .fill(Color32::from_rgb(240, 244, 249))
+                    .inner_margin(egui::Margin::symmetric(20.0, 12.0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(PANEL_WINDOW_TITLE).size(20.0).strong());
+                ui.horizontal_wrapped(|ui| {
+                    crate::ui::shell::brand(ui);
                     ui.add_space(16.0);
-                    let detection_failed = availability.is_loading && snapshot.diagnostics.iter().any(|check| matches!(check.state, dji4g_application::DiagnosticCheckState::Failed { .. }));
-                    ui.colored_label(availability.tone.color(), if detection_failed { "检测遇到问题，请查看诊断" } else { &availability.title.text });
-                    if availability.is_loading && !detection_failed {
+                    ui.label(
+                        RichText::new(&availability.title.text)
+                            .size(14.0)
+                            .color(availability.tone.color()),
+                    );
+                    if availability.is_loading {
                         ui.spinner();
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("立即刷新").clicked() {
-                            self.send(UiCommand::Refresh);
-                        }
-                        if ui.add_enabled(!self.support_report.busy(), egui::Button::new("导出详细日志"))
-                            .on_hover_text("收集 USB、硬件 ID、驱动、串口、网络、检测阶段和安装日志；不包含短信正文。")
+                    if crate::ui::components::action_button(
+                        ui,
+                        "刷新",
+                        crate::ui::components::ButtonKind::Outlined,
+                        true,
+                        None,
+                    )
+                    .clicked()
+                    {
+                        self.send(UiCommand::Refresh);
+                    }
+                    ui.menu_button("更多", |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.support_report.busy(),
+                                egui::Button::new("导出详细日志"),
+                            )
+                            .on_hover_text("收集 USB、驱动、串口、网络与检测阶段，不包含短信正文。")
                             .clicked()
                         {
-                            self.support_report.request(self.exports_dir.clone(), Arc::clone(&snapshot));
+                            self.support_report
+                                .request(self.exports_dir.clone(), Arc::clone(&snapshot));
+                            ui.close_menu();
                         }
                     });
                 });
             });
-        egui::TopBottomPanel::bottom("panel-footer").show(ctx, |ui| {
-            if !self.support_report.status.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    if self.support_report.busy() {
-                        ui.spinner();
-                    }
-                    ui.label(&self.support_report.status);
-                    if let Some(path) = &self.support_report.path {
-                        if ui.button("打开所在文件夹").clicked() {
-                            if let Err(error) = crate::support_report::open_report_folder(path) {
-                                self.support_report.status =
-                                    format!("打开目录失败：{error}；日志已保存，可复制路径打开");
-                            }
-                        }
-                        if ui.button("复制日志路径").clicked() {
-                            ui.output_mut(|output| output.copied_text = path.display().to_string());
-                        }
-                    }
-                });
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(crate::ui::meta_text(availability.freshness.text.clone()));
-                if snapshot
-                    .sms_send
-                    .as_ref()
-                    .is_some_and(|send| send.phase != dji4g_application::SmsSendPhase::Finished)
-                {
-                    ui.label(crate::ui::meta_text("短信发送进行中"));
-                }
-                if let Some(operation) = &snapshot.operation {
-                    let text = match &operation.state {
-                        OperationState::Running { phase } => {
-                            crate::ui::operation_phase_text(*phase, None, self.language)
-                        }
-                        OperationState::Finished { outcome, .. } => {
-                            crate::ui::operation_outcome_text(outcome, self.language)
-                        }
-                    };
-                    ui.label(crate::ui::meta_text(text.text));
-                }
-            });
-        });
-        egui::SidePanel::left("panel-navigation")
-            .resizable(false)
-            .exact_width(crate::ui::shell::sidebar_width(ctx.screen_rect().width()))
+        egui::TopBottomPanel::bottom("panel-footer")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(0xf6, 0xf6, 0xf7))
-                    .inner_margin(12.0),
+                    .fill(Color32::from_rgb(240, 244, 249))
+                    .inner_margin(egui::Margin::symmetric(20.0, 8.0)),
             )
             .show(ctx, |ui| {
-                crate::ui::shell::navigation(ui, &mut self.page, self.language)
+                if !self.support_report.status.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        if self.support_report.busy() {
+                            ui.spinner();
+                        }
+                        ui.label(&self.support_report.status);
+                        if let Some(path) = &self.support_report.path {
+                            if ui.button("打开所在文件夹").clicked() {
+                                if let Err(error) = crate::support_report::open_report_folder(path)
+                                {
+                                    self.support_report.status = format!(
+                                        "打开目录失败：{error}；日志已保存，可复制路径打开"
+                                    );
+                                }
+                            }
+                            if ui.button("复制日志路径").clicked() {
+                                ui.output_mut(|output| {
+                                    output.copied_text = path.display().to_string()
+                                });
+                            }
+                        }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(crate::ui::meta_text(availability.freshness.text.clone()));
+                    if snapshot
+                        .sms_send
+                        .as_ref()
+                        .is_some_and(|send| send.phase != dji4g_application::SmsSendPhase::Finished)
+                    {
+                        ui.label(crate::ui::meta_text("短信发送进行中"));
+                    }
+                    if let Some(operation) = &snapshot.operation {
+                        let text = match &operation.state {
+                            OperationState::Running { phase } => {
+                                crate::ui::operation_phase_text(*phase, None, self.language)
+                            }
+                            OperationState::Finished { outcome, .. } => {
+                                crate::ui::operation_outcome_text(outcome, self.language)
+                            }
+                        };
+                        ui.label(crate::ui::meta_text(text.text));
+                    }
+                });
             });
+        let narrow = ctx.screen_rect().width() < 700.0;
+        let menu_id = egui::Id::new("navigation-drawer-open");
+        if narrow {
+            egui::TopBottomPanel::top("compact-navigation").show(ctx, |ui| {
+                if crate::ui::components::action_button(
+                    ui,
+                    "菜单",
+                    crate::ui::components::ButtonKind::Tonal,
+                    true,
+                    None,
+                )
+                .clicked()
+                {
+                    ctx.data_mut(|d| {
+                        let open = d.get_temp::<bool>(menu_id).unwrap_or(false);
+                        d.insert_temp(menu_id, !open);
+                    });
+                }
+            });
+            let open = ctx.data(|d| d.get_temp::<bool>(menu_id).unwrap_or(false));
+            if open {
+                let previous = self.page;
+                egui::Window::new("导航")
+                    .id(menu_id.with("window"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .fixed_pos(egui::pos2(12.0, 72.0))
+                    .default_width(220.0)
+                    .show(ctx, |ui| {
+                        crate::ui::shell::navigation(ui, &mut self.page, self.language);
+                        if ui.button("收起菜单").clicked() {
+                            ctx.data_mut(|d| d.insert_temp(menu_id, false));
+                        }
+                    });
+                if self.page != previous {
+                    ctx.data_mut(|d| d.insert_temp(menu_id, false));
+                }
+            }
+        } else {
+            egui::SidePanel::left("panel-navigation")
+                .show_separator_line(false)
+                .resizable(false)
+                .exact_width(crate::ui::shell::sidebar_width(ctx.screen_rect().width()))
+                .frame(
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(240, 244, 249))
+                        .inner_margin(12.0),
+                )
+                .show(ctx, |ui| {
+                    crate::ui::shell::navigation(ui, &mut self.page, self.language)
+                });
+        }
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::WHITE)
+                    .rounding(24.0)
+                    .outer_margin(egui::Margin::symmetric(12.0, 0.0))
+                    .inner_margin(if ctx.screen_rect().width() < 1000.0 {
+                        20.0
+                    } else {
+                        28.0
+                    }),
+            )
             .show(ctx, |ui| {
+                ui.set_max_width(ui.available_width().min(1200.0));
                 if let Some(warning) = &self.font_warning {
                     wrapped_label(
                         ui,
@@ -1515,7 +1606,7 @@ impl PanelApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.page {
                             Page::Overview => {
-                                if crate::ui::module_network_check::render(
+                                if crate::ui::module_network_check::render_compact(
                                     ui,
                                     &snapshot,
                                     now,
@@ -1540,10 +1631,15 @@ impl PanelApp {
                                 ) {
                                     self.page = Page::Diagnostics;
                                 }
-                                ui.horizontal(|ui| {
-                                    ui.selectable_value(&mut self.wireless_view, false, "连接概况");
-                                    ui.selectable_value(&mut self.wireless_view, true, "无线观测");
-                                });
+                                crate::ui::components::page_tabs(
+                                    ui,
+                                    egui::Id::new("overview-view-tabs"),
+                                    &mut self.wireless_view,
+                                    &[
+                                        crate::ui::components::TabItem::new(false, "连接概况"),
+                                        crate::ui::components::TabItem::new(true, "无线观测"),
+                                    ],
+                                );
                                 ui.add_space(10.0);
                                 if self.wireless_view {
                                     crate::ui::wireless::render(
@@ -1566,6 +1662,11 @@ impl PanelApp {
                                 }
                             }
                             Page::Diagnostics => {
+                                crate::ui::components::page_heading(
+                                    ui,
+                                    "网络诊断",
+                                    "分别检查模块通路与电脑网络，按证据定位问题",
+                                );
                                 if crate::ui::module_network_check::render(
                                     ui,
                                     &snapshot,

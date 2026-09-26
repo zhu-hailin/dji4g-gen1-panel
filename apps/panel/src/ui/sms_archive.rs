@@ -56,10 +56,16 @@ pub(crate) fn render(
                 .hint_text("搜索号码或正文")
                 .desired_width(200.0),
         );
-        for (days, label) in [(0, "全部历史"), (7, "近 7 天保存"), (30, "近 30 天保存")]
-        {
-            ui.selectable_value(&mut state.days, days, label);
-        }
+        super::components::segmented_control(
+            ui,
+            egui::Id::new("archive-date-filter"),
+            &mut state.days,
+            &[
+                super::components::TabItem::new(0, "全部历史"),
+                super::components::TabItem::new(7, "近 7 天保存"),
+                super::components::TabItem::new(30, "近 30 天保存"),
+            ],
+        );
         if ui
             .add_enabled(
                 !archive.busy() && !archive.rows().is_empty(),

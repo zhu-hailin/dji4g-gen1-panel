@@ -6,7 +6,7 @@ use dji4g_application::{
     UnexecutedReason,
 };
 use dji4g_domain::Freshness;
-use eframe::egui::{self, RichText};
+use eframe::egui;
 
 pub const OFFICIAL_DRIVER_GUIDANCE_URL: &str = "https://repair.dji.com/help/content?customId=01700008285&lang=en&paperDocType=ARTICLE&re=US&spaceId=17";
 pub const OFFICIAL_SUPPORT_URL: &str = "https://www.dji.com/cn/support";
@@ -139,14 +139,14 @@ fn completion_copy(
 ) -> (&'static str, &'static str, &'static str) {
     use dji4g_windows_platform::driver_setup::DriverSetupOutcome as O;
     if let Some(outcome @ (O::RestartRequired | O::RestartRequiredAfterFailure)) = result {
-        return ("2. 请先重启电脑", "查看面板（需先重启）", outcome.message());
+        return ("2. 请先重启电脑", "进入面板（需重启）", outcome.message());
     }
     (
         "2. 自动检查模块",
         if ready {
-            "检查完成，开始使用"
+            "开始使用"
         } else {
-            "进入面板查看详情"
+            "进入面板"
         },
         if ready {
             "模块绑定的公网与 DNS 检查通过；电脑实际出口仍可能由 Wi-Fi 或 VPN 决定。"
@@ -169,33 +169,23 @@ pub(crate) fn render(
     let (check_heading, enter_label, completion_detail) = completion_copy(ready, setup_result);
     let mut action = OnboardingAction::None;
     egui::TopBottomPanel::bottom("onboarding-actions")
+        .show_separator_line(false)
         .frame(
             egui::Frame::none()
-                .fill(egui::Color32::WHITE)
-                .stroke(egui::Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgb(226, 230, 236),
-                ))
+                .fill(egui::Color32::from_rgb(240, 244, 249))
                 .inner_margin(16.0),
         )
         .show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("跳过，直接进入面板").clicked() {
-                    action = OnboardingAction::Enter;
-                }
-                if ui.add(super::theme::primary_button(enter_label)).clicked() {
-                    action = OnboardingAction::Enter;
-                }
-            });
-            ui.label(super::meta_text(
-                "跳过或进入后不再自动显示；可在设置中重新打开。",
-            ));
+            if super::components::entry_footer(ui, enter_label).clicked() {
+                action = OnboardingAction::Enter;
+            }
         });
     egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0)).show(ctx, |ui| {
         egui::ScrollArea::vertical().id_salt("onboarding-scroll").auto_shrink([false,false]).show(ui, |ui| {
-            ui.label(RichText::new("欢迎使用 DJI 一代 4G 面板").size(24.0).strong());
-            super::wrapped_label(ui,"连接模块后，面板会在后台检查连接情况。可以随时跳过，进入后继续查看检查结果。");
-            if super::module_network_check::render(ui, snapshot, now, crate::localization::Language::ZhCn, sink) { action = OnboardingAction::OpenRepairs; }
+            ui.set_max_width(ui.available_width().min(960.0));
+            super::shell::brand(ui);
+            ui.add_space(16.0);
+            super::components::page_heading(ui, "连接你的 4G 模块", "连接、检查，然后开始使用。也可以随时进入面板。");
             if let Some(result) = setup_result {
                 ui.add_space(12.0);
                 super::section_frame(ui, |ui| {
@@ -204,10 +194,7 @@ pub(crate) fn render(
                 });
             }
             ui.add_space(16.0);
-            super::section_frame(ui, |ui| {
-                ui.label(super::section_heading("1. 连接模块"));
-                super::wrapped_label(ui,"插好 SIM 卡，使用支持数据传输的 USB 线连接模块与电脑。电脑原有驱动可能已经可用，无需先安装驱动。");
-            });
+            super::components::status_banner(ui, "1 · 连接模块", "插好 SIM 卡，使用支持数据传输的 USB 线连接电脑。已有驱动可直接使用。", super::StatusTone::Neutral);
             ui.add_space(12.0);
             super::section_frame(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -216,7 +203,7 @@ pub(crate) fn render(
                 });
                 for (label,state) in &rows {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(*label);
+                        ui.add_sized([160.0, 28.0], egui::Label::new(*label));
                         ui.colored_label(state.tone().color(),format!("{} {}",state.tone().marker(),state.label()));
                         if *state == CheckState::Running { ui.spinner(); }
                     });
@@ -224,17 +211,16 @@ pub(crate) fn render(
                 ui.add_space(6.0);
                 super::wrapped_label(ui,super::meta_text(completion_detail));
             });
+            if super::module_network_check::render(ui, snapshot, now, crate::localization::Language::ZhCn, sink) { action = OnboardingAction::OpenRepairs; }
             ui.add_space(12.0);
-            super::section_frame(ui, |ui| {
-                ui.label(super::section_heading("电脑网络与代理"));
+            egui::CollapsingHeader::new("电脑网络与代理（可选检查）").default_open(false).show(ui, |ui| {
                 let (tone, summary) = super::network_assistance::brief(snapshot, now, crate::localization::Language::ZhCn);
                 super::wrapped_label(ui, egui::RichText::new(format!("{} {summary}", tone.marker())).color(tone.color()));
                 if ui.button("检查电脑网络").clicked() { action = OnboardingAction::InspectHostNetwork; }
                 super::wrapped_label(ui, super::meta_text("即使没插模块也能检查；代理配置问题不会当作驱动损坏。"));
             });
             ui.add_space(12.0);
-            super::section_frame(ui, |ui| {
-                ui.label(super::section_heading("3. 需要驱动时再安装"));
+            egui::CollapsingHeader::new("3. 需要驱动时再安装").default_open(false).show(ui, |ui| {
                 if driver_fixture.unwrap_or_else(bundled_driver_available) {
                     super::wrapped_label(ui,"已找到本地驱动资源，安装前还会校验签名和文件。此包不能覆盖所有接口（包括未匹配的 MI_04）；如有缺驱动接口无法匹配，将在安装前停止。已有接口正常时无需重复安装。");
                     if ui.add_enabled(!super::driver_setup::installation_busy(snapshot),egui::Button::new("使用内置驱动")).clicked() { action = OnboardingAction::InstallBundledDriver; }

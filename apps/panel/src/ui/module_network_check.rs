@@ -71,6 +71,28 @@ pub fn render(
     language: Language,
     sink: &dyn PanelCommandSink,
 ) -> bool {
+    render_impl(ui, snapshot, now, language, sink, false)
+}
+
+/// Overview presentation of the same check, consent and repair state.
+pub(crate) fn render_compact(
+    ui: &mut egui::Ui,
+    snapshot: &ControllerSnapshot,
+    now: SystemTime,
+    language: Language,
+    sink: &dyn PanelCommandSink,
+) -> bool {
+    render_impl(ui, snapshot, now, language, sink, true)
+}
+
+fn render_impl(
+    ui: &mut egui::Ui,
+    snapshot: &ControllerSnapshot,
+    now: SystemTime,
+    language: Language,
+    sink: &dyn PanelCommandSink,
+    compact: bool,
+) -> bool {
     let mut guidance = false;
     let confirm_id = egui::Id::new("module-network-probe-consent");
     let error_id = egui::Id::new("module-network-submit-error");
@@ -84,15 +106,27 @@ pub fn render(
         .module_network_check
         .as_ref()
         .is_some_and(|c| c.active());
-    super::section_frame(ui, |ui| {
+    let frame = if compact {
+        egui::Frame::none()
+    } else {
+        egui::Frame::none()
+            .fill(egui::Color32::WHITE)
+            .rounding(12.0)
+            .inner_margin(16.0)
+    };
+    frame.show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 8.0;
         ui.horizontal_wrapped(|ui| {
-            ui.label(super::section_heading("模块网络检查"));
-            if ui
-                .add_enabled(
-                    !active,
-                    egui::Button::new("检查模块网络").min_size(egui::vec2(0.0, 32.0)),
-                )
-                .clicked()
+            if compact { ui.heading("概览"); } else { ui.label(super::section_heading("模块网络检查")); }
+            if super::components::action_button(
+                ui,
+                "检查模块网络",
+                super::components::ButtonKind::Filled,
+                !active,
+                Some("本轮检查尚未结束"),
+            )
+            .clicked()
             {
                 if snapshot.settings.active_probe {
                     error = sink
@@ -108,6 +142,7 @@ pub fn render(
                 ui.spinner();
             }
         });
+        let mut details = |ui: &mut egui::Ui| {
         if let Some(check) = snapshot.module_network_check.as_ref() {
             let (tone, text) = conclusion(check);
             super::wrapped_label(
@@ -152,7 +187,7 @@ pub fn render(
                 if ui
                     .add_enabled(
                         enabled,
-                        egui::Button::new(repair_label(repair)).min_size(egui::vec2(0.0, 32.0)),
+                        egui::Button::new(repair_label(repair)).min_size(egui::vec2(0.0, 40.0)),
                     )
                     .clicked()
                 {
@@ -180,7 +215,7 @@ pub fn render(
                 );
                 if ui
                     .add(
-                        egui::Button::new("查看驱动与接口检查步骤").min_size(egui::vec2(0.0, 32.0)),
+                        egui::Button::new("查看驱动与接口检查步骤").min_size(egui::vec2(0.0, 40.0)),
                     )
                     .clicked()
                 {
@@ -241,6 +276,14 @@ pub fn render(
                 "单独检查模块网卡能否上网，并说明电脑对测试目标选择的出口。",
             );
         }
+        };
+        if compact {
+            if let Some(check) = snapshot.module_network_check.as_ref() {
+                let (tone, text) = conclusion(check);
+                super::wrapped_label(ui, RichText::new(format!("{} {text}", tone.marker())).color(tone.color()));
+                egui::CollapsingHeader::new("本轮证据与处理步骤").id_salt("overview-check-details").default_open(false).show(ui, &mut details);
+            }
+        } else { details(ui); }
         if consent {
             super::wrapped_label(
                 ui,
@@ -248,13 +291,13 @@ pub fn render(
             );
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add(egui::Button::new("取消").min_size(egui::vec2(0.0, 32.0)))
+                    .add(egui::Button::new("取消").min_size(egui::vec2(0.0, 40.0)))
                     .clicked()
                 {
                     consent = false;
                 }
                 if ui
-                    .add(egui::Button::new("仅检查本地信息").min_size(egui::vec2(0.0, 32.0)))
+                    .add(egui::Button::new("仅检查本地信息").min_size(egui::vec2(0.0, 40.0)))
                     .clicked()
                 {
                     error = sink
@@ -267,7 +310,7 @@ pub fn render(
                     }
                 }
                 if ui
-                    .add(egui::Button::new("允许本次联网检查").min_size(egui::vec2(0.0, 32.0)))
+                    .add(egui::Button::new("允许本次联网检查").min_size(egui::vec2(0.0, 40.0)))
                     .clicked()
                 {
                     error = sink

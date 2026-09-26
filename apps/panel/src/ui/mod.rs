@@ -18,6 +18,7 @@ use crate::localization::{
 };
 
 pub mod action_availability;
+pub(crate) mod components;
 pub mod device_tools;
 pub mod diagnostics;
 pub(crate) mod driver_setup;
@@ -414,11 +415,16 @@ pub fn prepared_action_text(
 pub(crate) mod icons;
 pub(crate) mod shell;
 pub(crate) mod theme;
+/// Install the production font and visual styles without opening any native surfaces.
+pub fn initialize_visuals(ctx: &egui::Context) {
+    let _ = crate::font::install_chinese_font(ctx);
+    theme::style_root(ctx);
+}
+
 pub(crate) use theme::{scale, style_root};
 
 pub(crate) fn section_frame(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    // Uniform gap above every box so the sections of a page share one vertical rhythm.
-    ui.add_space(scale::SECTION_GAP);
+    // Outer spacing belongs to the page; section contents do not add a second gap.
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(
             scale::SECTION_MARGIN[0],
@@ -426,13 +432,14 @@ pub(crate) fn section_frame(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
         ))
         // Borderless cards: set the stroke on the frame itself so no global visuals state can
         // reintroduce an outline (and with it the line that collided with the scrollbar).
-        .fill(Color32::WHITE)
-        .rounding(12.0)
+        .fill(Color32::from_rgb(248, 250, 253))
+        .rounding(16.0)
         .stroke(Stroke::NONE)
         .show(ui, |ui| {
             // Stretch every section to the panel width so the grouped boxes align as even
             // columns instead of hugging their content and leaving ragged right edges.
             ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
             add_contents(ui);
         });
 }

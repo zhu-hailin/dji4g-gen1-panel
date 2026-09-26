@@ -2,7 +2,7 @@
 //!
 //! egui's bundled fonts intentionally stay small and do not contain CJK glyphs. The panel therefore
 //! uses an installed Windows system font as the first family entry, while retaining egui's bundled
-//! Latin and symbol fallbacks. No font is copied into the repository or shipped by this crate.
+//! Latin and symbol fallbacks. CJK fonts are not redistributed. A small licensed Material Symbols icon subset is bundled.
 
 use std::path::{Path, PathBuf};
 
@@ -128,18 +128,16 @@ pub fn install_chinese_font(ctx: &egui::Context) -> Result<PathBuf, FontInstallE
         names.retain(|name| name != CJK_FONT_NAME);
         names.insert(0, CJK_FONT_NAME.to_owned());
     }
-    // Windows' own outline icon font: separate family so PUA glyphs never replace text.
-    let icon_names = if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segmdl2.ttf") {
-        definitions
-            .font_data
-            .insert("windows-icons".into(), egui::FontData::from_owned(bytes));
-        vec!["windows-icons".into()]
-    } else {
-        definitions.families[&FontFamily::Proportional].clone()
-    };
-    definitions
-        .families
-        .insert(FontFamily::Name("panel-icons".into()), icon_names);
+    definitions.font_data.insert(
+        "material-symbols".into(),
+        egui::FontData::from_static(include_bytes!(
+            "../assets/material/MaterialSymbolsOutlined.ttf"
+        )),
+    );
+    definitions.families.insert(
+        FontFamily::Name("panel-icons".into()),
+        vec!["material-symbols".into()],
+    );
     ctx.set_fonts(definitions);
     ctx.data_mut(|data| data.insert_temp(egui::Id::new("panel-icons-installed"), true));
     Ok(loaded.path)

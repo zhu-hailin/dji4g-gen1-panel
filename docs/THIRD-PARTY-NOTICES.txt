@@ -2,7 +2,12 @@ THIRD-PARTY NOTICES
 
 Bundled egui 0.29.1 fallback fonts and clipboard components.
 Windows system fonts are loaded locally and are not redistributed.
-Font files are unmodified.
+Bundled egui fallback font files are unmodified.
+
+Google Material Symbols Outlined icon font: Apache License 2.0.
+Source: https://github.com/google/material-design-icons
+A modified static icon subset (FILL=0, GRAD=0, opsz=24, wght=400) is bundled.
+Full Apache License 2.0 text is provided in LICENSE-APACHE.
 
 
 FONT: emoji-icon-font.ttf
