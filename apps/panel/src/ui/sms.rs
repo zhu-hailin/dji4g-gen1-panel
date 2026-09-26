@@ -1055,6 +1055,7 @@ mod tests {
 
     fn snapshot(summary: SmsInboxSummary) -> ControllerSnapshot {
         ControllerSnapshot {
+            module_network_check: None,
             host_network: dji4g_application::HostNetworkSnapshot::default(),
             publication_revision: 7,
             app: Arc::new(AppSnapshot {

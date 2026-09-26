@@ -21,6 +21,7 @@ pub mod action_availability;
 pub mod device_tools;
 pub mod diagnostics;
 pub(crate) mod driver_setup;
+pub mod module_network_check;
 pub mod network_assistance;
 pub mod onboarding;
 pub mod overview;

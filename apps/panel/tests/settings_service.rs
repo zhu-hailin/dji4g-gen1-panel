@@ -17,6 +17,7 @@ use dji4g_windows_platform::{AutostartObservedState, PlatformError};
 
 fn initial_snapshot() -> Arc<ControllerSnapshot> {
     Arc::new(ControllerSnapshot {
+        module_network_check: None,
         host_network: dji4g_application::HostNetworkSnapshot::default(),
         publication_revision: 0,
         app: Arc::new(AppSnapshot {

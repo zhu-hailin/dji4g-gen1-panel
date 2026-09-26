@@ -147,6 +147,7 @@ fn wait_for_call_count(dialog: &FakeDialog, expected: usize) {
 
 fn base_snapshot() -> ControllerSnapshot {
     ControllerSnapshot {
+        module_network_check: None,
         host_network: dji4g_application::HostNetworkSnapshot::default(),
         publication_revision: 0,
         app: Arc::new(dji4g_application::AppSnapshot {

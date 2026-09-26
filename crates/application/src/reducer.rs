@@ -218,6 +218,7 @@ pub enum CheckResult<T> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControllerSnapshot {
+    pub module_network_check: Option<crate::ModuleNetworkCheckSnapshot>,
     pub host_network: crate::HostNetworkSnapshot,
     pub publication_revision: u64,
     pub app: Arc<AppSnapshot>,
@@ -416,6 +417,7 @@ pub struct ReducerState {
     evidence_revision: u64,
     publication_revision: u64,
     active_probe: bool,
+    probe_once_cycle: Option<RefreshCycleId>,
     settings: SettingsSnapshot,
     diagnostics: DiagnosticSet,
     device_presence: Option<Evidence<DevicePresenceDto>>,
@@ -475,6 +477,7 @@ impl ReducerState {
             evidence_revision: 0,
             publication_revision: 0,
             active_probe: true,
+            probe_once_cycle: None,
             settings: SettingsSnapshot::default(),
             diagnostics: DiagnosticSet::new(DeviceEpoch(0)),
             device_presence: None,
@@ -555,6 +558,10 @@ impl ReducerState {
     #[must_use]
     pub const fn active_probe(&self) -> bool {
         self.active_probe
+    }
+
+    pub(crate) fn authorize_probe_once(&mut self, cycle: RefreshCycleId) {
+        self.probe_once_cycle = Some(cycle);
     }
 
     pub fn set_active_probe(&mut self, enabled: bool) {
@@ -859,6 +866,7 @@ impl ReducerState {
         now: SystemTime,
     ) -> ControllerSnapshot {
         ControllerSnapshot {
+            module_network_check: None,
             host_network: crate::HostNetworkSnapshot::default(),
             publication_revision: self.publication_revision,
             app: Arc::new(self.app_snapshot(now)),
@@ -1427,6 +1435,7 @@ pub fn reduce_state(previous: &ReducerState, event: BackendEvent, now: SystemTim
             if !next.accept_epoch_event(epoch, now) || !next.accept_cycle(cycle) {
                 return next;
             }
+            next.probe_once_cycle = None;
             let mut changed = false;
             for check in &mut next.diagnostics.0 {
                 if matches!(check.state, DiagnosticCheckState::Running { cycle: active } if active == cycle)
@@ -2170,9 +2179,16 @@ impl ReducerState {
         epoch: DeviceEpoch,
         now: SystemTime,
     ) {
-        if !self.active_probe {
+        if !self.active_probe && self.probe_once_cycle != Some(self.current_cycle) {
             if let CheckResult::Unexecuted { reason } = result {
+                // A one-shot report lives in the controller. A later disabled cycle cannot
+                // reuse its positive reachability as this cycle's overall availability.
+                self.bound_public = None;
+                self.bound_dns = None;
+                self.protocol_coverage = None;
+                self.system_default_route = None;
                 for id in [
+                    DiagnosticCheckId::SystemRoute,
                     DiagnosticCheckId::BoundGateway,
                     DiagnosticCheckId::BoundPublic,
                     DiagnosticCheckId::BoundDns,

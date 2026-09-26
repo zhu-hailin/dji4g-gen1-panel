@@ -273,6 +273,7 @@ pub enum AdapterStateDto {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterObservationDto {
+    pub details: Option<AdapterNetworkDetails>,
     pub epoch: DeviceEpoch,
     pub binding: AdapterBinding,
     pub state: AdapterStateDto,
@@ -284,6 +285,13 @@ pub struct AdapterObservationDto {
     /// Monotonic interface byte counters sampled this cycle; `None` = unavailable.
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterNetworkDetails {
+    pub link_up: bool,
+    pub dhcp_v4: bool,
+    pub dns_automatic: Option<bool>,
 }
 
 impl AdapterObservationDto {
@@ -612,6 +620,7 @@ pub struct SystemRouteDto {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeObservationDto {
+    pub route_choices: Vec<NetworkRouteChoice>,
     pub epoch: DeviceEpoch,
     pub adapter_id: String,
     pub gateway: ProbeStageDto,
@@ -619,6 +628,13 @@ pub struct ProbeObservationDto {
     pub dns: ProbeStageDto,
     pub protocol_coverage: Option<ProtocolCoverage>,
     pub system_route: Option<SystemRouteDto>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkRouteChoice {
+    pub family: dji4g_domain::IpFamily,
+    pub luid: Option<u64>,
+    pub owner: Option<DefaultRouteDto>,
 }
 
 pub trait NetworkProbePort: Send + Sync {

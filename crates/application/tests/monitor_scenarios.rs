@@ -23,6 +23,187 @@ use dji4g_domain::{
 
 const NOW: SystemTime = SystemTime::UNIX_EPOCH;
 
+#[test]
+fn manual_network_check_authorizes_only_one_cycle_and_keeps_setting_off() {
+    let epoch = DeviceEpoch(1);
+    let probe = Arc::new(StaticProbe {
+        result: Ok(full_probe(epoch)),
+        calls: AtomicUsize::new(0),
+    });
+    let mut controller = Controller::new(
+        ReducerState::new(NOW),
+        Arc::new(FakeActionExecutor::new()),
+        Arc::new(FakeClock::new(NOW)),
+    );
+    controller.set_active_probe(false);
+    controller
+        .handle_command(dji4g_application::UiCommand::CheckModuleNetwork {
+            allow_probe_once: true,
+        })
+        .unwrap();
+    let id = controller
+        .snapshot()
+        .module_network_check
+        .as_ref()
+        .unwrap()
+        .request_id;
+    controller
+        .handle_command(dji4g_application::UiCommand::CheckModuleNetwork {
+            allow_probe_once: true,
+        })
+        .unwrap();
+    assert_eq!(
+        controller
+            .snapshot()
+            .module_network_check
+            .as_ref()
+            .unwrap()
+            .request_id,
+        id
+    );
+    let (_, runner) = ControllerRunner::new(controller);
+    let mut runner = runner.with_ports(MonitorPorts {
+        inventory: Arc::new(StaticInventory {
+            result: Ok(full_inventory(epoch)),
+        }),
+        at: Arc::new(StaticAt {
+            result: Ok(AtObservation {
+                availability: AtControlAvailability::Available,
+                cellular: None,
+            }),
+        }),
+        adapter: Arc::new(StaticAdapter {
+            result: Ok(full_adapter(epoch)),
+        }),
+        probe: probe.clone(),
+        hotspot: None,
+        sms: None,
+        device_tools: None,
+    });
+    runner.run_one_refresh();
+    let snapshot = runner.controller().snapshot();
+    assert!(!snapshot.settings.active_probe);
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        snapshot.module_network_check.as_ref().unwrap().verdict,
+        dji4g_domain::ModuleNetworkVerdict::Usable
+    );
+    runner.run_one_refresh();
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert_ne!(
+        runner.controller().snapshot().app.availability,
+        Availability::Available,
+        "a later disabled cycle must not reuse one-shot connectivity"
+    );
+    assert_eq!(
+        runner
+            .controller()
+            .snapshot()
+            .module_network_check
+            .as_ref()
+            .unwrap()
+            .request_id,
+        id
+    );
+    runner
+        .controller_mut()
+        .invalidate_epoch(DeviceEpoch(2), EpochInvalidationReason::PhysicalRemoval);
+    assert_eq!(
+        runner
+            .controller()
+            .snapshot()
+            .module_network_check
+            .as_ref()
+            .unwrap()
+            .phase,
+        dji4g_application::ModuleNetworkCheckPhase::Stale
+    );
+}
+
+#[test]
+fn network_repair_runs_once_and_schedules_one_read_only_recheck() {
+    use dji4g_application::{ModuleNetworkCheckPhase, NetworkRepairKind, UiCommand};
+    let epoch = DeviceEpoch(1);
+    let mut adapter = full_adapter(epoch);
+    adapter.state = AdapterStateDto::NoUsableAddressOrRoute;
+    adapter.details = Some(dji4g_application::AdapterNetworkDetails {
+        link_up: true,
+        dhcp_v4: true,
+        dns_automatic: Some(true),
+    });
+    let controller = Controller::for_test(NOW);
+    let (_, runner) = ControllerRunner::new(controller);
+    let mut runner = runner.with_ports(MonitorPorts {
+        inventory: Arc::new(StaticInventory {
+            result: Ok(full_inventory(epoch)),
+        }),
+        at: Arc::new(StaticAt {
+            result: Ok(AtObservation {
+                availability: AtControlAvailability::Available,
+                cellular: None,
+            }),
+        }),
+        adapter: Arc::new(StaticAdapter {
+            result: Ok(adapter),
+        }),
+        probe: Arc::new(StaticProbe {
+            result: Ok(full_probe(epoch)),
+            calls: AtomicUsize::new(0),
+        }),
+        hotspot: None,
+        sms: None,
+        device_tools: None,
+    });
+    runner
+        .controller_mut()
+        .handle_command(UiCommand::CheckModuleNetwork {
+            allow_probe_once: true,
+        })
+        .unwrap();
+    runner.run_one_refresh();
+    let check = runner.controller().snapshot().module_network_check.unwrap();
+    assert_eq!(
+        check.recommended_repairs(),
+        vec![NetworkRepairKind::RenewDhcp]
+    );
+    runner
+        .controller_mut()
+        .handle_command(UiCommand::PrepareNetworkRepair {
+            request_id: check.request_id,
+            repair: NetworkRepairKind::RenewDhcp,
+        })
+        .unwrap();
+    let plan = runner.controller().snapshot().prepared_action.unwrap().id;
+    runner.controller_mut().confirm_action(plan).unwrap();
+    assert!(runner.controller_mut().confirm_action(plan).is_err());
+    assert_eq!(runner.controller().executor_call_count(), 1);
+    let recheck = runner.controller().snapshot().module_network_check.unwrap();
+    assert_eq!(recheck.phase, ModuleNetworkCheckPhase::Queued);
+    assert!(recheck.after_operation.is_some());
+    assert!(recheck.dhcp_attempted);
+    runner.run_one_refresh();
+    assert_eq!(
+        runner
+            .controller()
+            .snapshot()
+            .module_network_check
+            .unwrap()
+            .recommended_repairs(),
+        vec![NetworkRepairKind::RestartAdapter]
+    );
+    runner.run_one_refresh();
+    assert_eq!(
+        runner
+            .controller()
+            .snapshot()
+            .module_network_check
+            .unwrap()
+            .request_id,
+        recheck.request_id
+    );
+    assert_eq!(runner.controller().executor_call_count(), 1);
+}
+
 fn target() -> StableDeviceIdentity {
     StableDeviceIdentity {
         container_id: "{container}".into(),
@@ -63,6 +244,7 @@ fn full_adapter(epoch: DeviceEpoch) -> AdapterObservationDto {
 
 fn counted_adapter(epoch: DeviceEpoch, rx: Option<u64>, tx: Option<u64>) -> AdapterObservationDto {
     AdapterObservationDto {
+        details: None,
         epoch,
         binding: binding(),
         state: AdapterStateDto::UsableAddressAndRoute,
@@ -95,6 +277,7 @@ fn adapter_finished(
 
 fn full_probe(epoch: DeviceEpoch) -> ProbeObservationDto {
     ProbeObservationDto {
+        route_choices: Vec::new(),
         epoch,
         adapter_id: "{adapter}".into(),
         gateway: ProbeStageDto::Passed,
@@ -1621,4 +1804,262 @@ fn rate_tick_updates_rates_without_touching_observed_at_or_freshness() {
         1,
         "exactly one read-only counter fetch per due tick"
     );
+}
+
+fn network_runner(
+    adapter: AdapterObservationDto,
+    probe: Arc<StaticProbe>,
+    inventory: InventoryObservation,
+) -> ControllerRunner {
+    let controller = Controller::for_test(NOW);
+    let (_, runner) = ControllerRunner::new(controller);
+    runner.with_ports(MonitorPorts {
+        inventory: Arc::new(StaticInventory {
+            result: Ok(inventory),
+        }),
+        at: Arc::new(StaticAt {
+            result: Ok(AtObservation {
+                availability: AtControlAvailability::Available,
+                cellular: None,
+            }),
+        }),
+        adapter: Arc::new(StaticAdapter {
+            result: Ok(adapter),
+        }),
+        probe,
+        hotspot: None,
+        sms: None,
+        device_tools: None,
+    })
+}
+#[test]
+fn manual_check_without_probe_permission_cannot_claim_connectivity() {
+    let epoch = DeviceEpoch(1);
+    let probe = Arc::new(StaticProbe {
+        result: Ok(full_probe(epoch)),
+        calls: AtomicUsize::new(0),
+    });
+    let mut runner = network_runner(full_adapter(epoch), probe.clone(), full_inventory(epoch));
+    runner.controller_mut().set_active_probe(false);
+    runner
+        .controller_mut()
+        .handle_command(dji4g_application::UiCommand::CheckModuleNetwork {
+            allow_probe_once: false,
+        })
+        .unwrap();
+    runner.run_one_refresh();
+    let report = runner.controller().snapshot().module_network_check.unwrap();
+    assert_eq!(
+        report.evidence.public,
+        dji4g_domain::NetworkEvidenceState::NotRun
+    );
+    assert_eq!(
+        report.verdict,
+        dji4g_domain::ModuleNetworkVerdict::Inconclusive
+    );
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+}
+#[test]
+fn manual_check_waits_for_confirmation_then_resumes_without_preempting() {
+    let epoch = DeviceEpoch(1);
+    let probe = Arc::new(StaticProbe {
+        result: Ok(full_probe(epoch)),
+        calls: AtomicUsize::new(0),
+    });
+    let mut runner = network_runner(full_adapter(epoch), probe.clone(), full_inventory(epoch));
+    let plan = runner
+        .controller_mut()
+        .prepare_action(dji4g_application::ActionRequest::RestartModule)
+        .unwrap();
+    runner
+        .controller_mut()
+        .handle_command(dji4g_application::UiCommand::CheckModuleNetwork {
+            allow_probe_once: true,
+        })
+        .unwrap();
+    runner.run_one_refresh();
+    assert_eq!(
+        runner
+            .controller()
+            .snapshot()
+            .module_network_check
+            .unwrap()
+            .phase,
+        dji4g_application::ModuleNetworkCheckPhase::Queued
+    );
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+    runner.controller_mut().cancel_action(plan).unwrap();
+    runner.run_one_refresh();
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+}
+#[test]
+fn host_vpn_and_split_family_routes_do_not_change_module_verdict() {
+    let epoch = DeviceEpoch(1);
+    let mut value = full_probe(epoch);
+    value.system_route.as_mut().unwrap().owner = DefaultRouteDto::VpnOrTun;
+    value.route_choices = vec![
+        dji4g_application::NetworkRouteChoice {
+            family: dji4g_domain::IpFamily::V4,
+            luid: Some(1),
+            owner: Some(DefaultRouteDto::VpnOrTun),
+        },
+        dji4g_application::NetworkRouteChoice {
+            family: dji4g_domain::IpFamily::V6,
+            luid: Some(2),
+            owner: Some(DefaultRouteDto::TargetAdapter),
+        },
+    ];
+    let probe = Arc::new(StaticProbe {
+        result: Ok(value.clone()),
+        calls: AtomicUsize::new(0),
+    });
+    let mut runner = network_runner(full_adapter(epoch), probe, full_inventory(epoch));
+    runner
+        .controller_mut()
+        .handle_command(dji4g_application::UiCommand::CheckModuleNetwork {
+            allow_probe_once: true,
+        })
+        .unwrap();
+    runner.run_one_refresh();
+    let check = runner.controller().snapshot().module_network_check.unwrap();
+    assert_eq!(check.verdict, dji4g_domain::ModuleNetworkVerdict::Usable);
+    assert_eq!(check.probe.unwrap().route_choices, value.route_choices);
+}
+#[test]
+fn repair_unknown_result_is_retained_and_never_retried() {
+    use dji4g_application::{NetworkRepairKind, UiCommand};
+    let epoch = DeviceEpoch(1);
+    let mut adapter = full_adapter(epoch);
+    adapter.state = AdapterStateDto::NoUsableAddressOrRoute;
+    adapter.details = Some(dji4g_application::AdapterNetworkDetails {
+        link_up: true,
+        dhcp_v4: true,
+        dns_automatic: Some(true),
+    });
+    let probe = Arc::new(StaticProbe {
+        result: Ok(full_probe(epoch)),
+        calls: AtomicUsize::new(0),
+    });
+    let mut runner = network_runner(adapter, probe, full_inventory(epoch));
+    runner
+        .controller_mut()
+        .handle_command(UiCommand::CheckModuleNetwork {
+            allow_probe_once: true,
+        })
+        .unwrap();
+    runner.run_one_refresh();
+    let id = runner
+        .controller()
+        .snapshot()
+        .module_network_check
+        .unwrap()
+        .request_id;
+    runner
+        .controller_mut()
+        .handle_command(UiCommand::PrepareNetworkRepair {
+            request_id: id,
+            repair: NetworkRepairKind::RenewDhcp,
+        })
+        .unwrap();
+    let plan = runner.controller().snapshot().prepared_action.unwrap().id;
+    runner
+        .controller_mut()
+        .executor_returns(Err(PortError::new(ErrorCode::Timeout, "repair:unknown")));
+    runner.controller_mut().confirm_action(plan).unwrap();
+    let report = runner.controller().snapshot().module_network_check.unwrap();
+    assert!(matches!(
+        report.operation_outcome,
+        Some(dji4g_domain::OperationOutcome::OutcomeUnknown { .. })
+    ));
+    runner.run_one_refresh();
+    runner.run_one_refresh();
+    assert_eq!(runner.controller().executor_call_count(), 1);
+}
+
+#[test]
+fn manual_check_queues_behind_sms_and_device_tools() {
+    use dji4g_application::{ModuleNetworkCheckPhase, UiCommand};
+    for command in [
+        UiCommand::SmsRefresh,
+        UiCommand::RunToolRead {
+            id: dji4g_at_protocol::ToolReadId::SignalQuality,
+        },
+    ] {
+        let epoch = DeviceEpoch(1);
+        let probe = Arc::new(StaticProbe {
+            result: Ok(full_probe(epoch)),
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = network_runner(full_adapter(epoch), probe.clone(), full_inventory(epoch));
+        runner.controller_mut().handle_command(command).unwrap();
+        runner
+            .controller_mut()
+            .handle_command(UiCommand::CheckModuleNetwork {
+                allow_probe_once: true,
+            })
+            .unwrap();
+        runner.run_one_refresh();
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runner
+                .controller()
+                .snapshot()
+                .module_network_check
+                .unwrap()
+                .phase,
+            ModuleNetworkCheckPhase::Queued
+        );
+    }
+}
+#[test]
+fn stale_wrong_id_and_device_changed_reports_cannot_prepare_repair() {
+    use dji4g_application::{NetworkRepairKind, UiCommand};
+    for change in [0, 1, 2] {
+        let epoch = DeviceEpoch(1);
+        let mut adapter = full_adapter(epoch);
+        adapter.state = AdapterStateDto::NoUsableAddressOrRoute;
+        adapter.details = Some(dji4g_application::AdapterNetworkDetails {
+            link_up: true,
+            dhcp_v4: true,
+            dns_automatic: None,
+        });
+        let probe = Arc::new(StaticProbe {
+            result: Ok(full_probe(epoch)),
+            calls: AtomicUsize::new(0),
+        });
+        let mut runner = network_runner(adapter, probe, full_inventory(epoch));
+        runner
+            .controller_mut()
+            .handle_command(UiCommand::CheckModuleNetwork {
+                allow_probe_once: true,
+            })
+            .unwrap();
+        runner.run_one_refresh();
+        let mut request_id = runner
+            .controller()
+            .snapshot()
+            .module_network_check
+            .unwrap()
+            .request_id;
+        match change {
+            0 => request_id += 1,
+            1 => runner
+                .controller_mut()
+                .advance_time(Duration::from_secs(31)),
+            _ => runner
+                .controller_mut()
+                .invalidate_epoch(DeviceEpoch(2), EpochInvalidationReason::PhysicalRemoval),
+        }
+        assert!(
+            runner
+                .controller_mut()
+                .handle_command(UiCommand::PrepareNetworkRepair {
+                    request_id,
+                    repair: NetworkRepairKind::RenewDhcp
+                })
+                .is_err()
+        );
+        assert!(runner.controller().snapshot().prepared_action.is_none());
+        assert_eq!(runner.controller().executor_call_count(), 0);
+    }
 }

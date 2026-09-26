@@ -151,6 +151,7 @@ fn adapter_finished(cycle: u64, epoch: DeviceEpoch, state: AdapterStateDto) -> B
         epoch,
         result: CheckResult::Passed {
             value: AdapterObservationDto {
+                details: None,
                 epoch,
                 binding: AdapterBinding {
                     target: identity(),
@@ -176,6 +177,7 @@ fn probe_finished(cycle: u64, epoch: DeviceEpoch, dns: ProbeStageDto) -> Backend
         epoch,
         result: CheckResult::Passed {
             value: ProbeObservationDto {
+                route_choices: Vec::new(),
                 epoch,
                 adapter_id: "{adapter}".to_owned(),
                 gateway: ProbeStageDto::Passed,
@@ -1112,6 +1114,7 @@ impl AdapterPort for MetricsAdapter {
         _target: &TargetContext,
     ) -> PortFuture<'_, Result<AdapterObservationDto, PortError>> {
         let adapter = AdapterObservationDto {
+            details: None,
             epoch: DeviceEpoch(1),
             binding: AdapterBinding {
                 target: identity(),
@@ -1159,6 +1162,7 @@ impl NetworkProbePort for QuietProbe {
     ) -> PortFuture<'_, Result<ProbeObservationDto, PortError>> {
         Box::pin(async {
             Ok(ProbeObservationDto {
+                route_choices: Vec::new(),
                 epoch: DeviceEpoch(1),
                 adapter_id: "{adapter}".to_owned(),
                 gateway: ProbeStageDto::Passed,

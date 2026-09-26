@@ -107,6 +107,7 @@ pub(crate) enum OnboardingAction {
     Enter,
     Refresh,
     InspectHostNetwork,
+    OpenRepairs,
     InstallBundledDriver,
     OpenWindowsUpdate,
 }
@@ -161,6 +162,7 @@ pub(crate) fn render(
     now: SystemTime,
     driver_fixture: Option<bool>,
     setup_result: Option<dji4g_windows_platform::driver_setup::DriverSetupOutcome>,
+    sink: &dyn crate::app::PanelCommandSink,
 ) -> OnboardingAction {
     let rows = checks(snapshot, now);
     let ready = rows.iter().all(|(_, state)| *state == CheckState::Passed);
@@ -193,6 +195,7 @@ pub(crate) fn render(
         egui::ScrollArea::vertical().id_salt("onboarding-scroll").auto_shrink([false,false]).show(ui, |ui| {
             ui.label(RichText::new("欢迎使用 DJI 一代 4G 面板").size(24.0).strong());
             super::wrapped_label(ui,"连接模块后，面板会在后台检查连接情况。可以随时跳过，进入后继续查看检查结果。");
+            if super::module_network_check::render(ui, snapshot, now, crate::localization::Language::ZhCn, sink) { action = OnboardingAction::OpenRepairs; }
             if let Some(result) = setup_result {
                 ui.add_space(12.0);
                 super::section_frame(ui, |ui| {

@@ -24,6 +24,7 @@ fn settings_event_disables_probe_and_late_success_cannot_restore_green() {
             result: CheckResult::Passed {
                 observed_at: NOW,
                 value: dji4g_application::ProbeObservationDto {
+                    route_choices: Vec::new(),
                     epoch: DeviceEpoch(1),
                     adapter_id: "{adapter}".into(),
                     gateway: dji4g_application::ProbeStageDto::Passed,

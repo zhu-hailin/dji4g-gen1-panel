@@ -201,6 +201,7 @@ mod capture {
             "single-query" | "single-query-detail" => vec![Screen::ToolsPreset],
             "wireless" => vec![Screen::Wireless],
             "overview" => vec![Screen::Overview],
+            mode if mode.starts_with("module-") => vec![Screen::Overview],
             "host-normal-tun"
             | "host-missing-binding"
             | "host-unsupported"
@@ -843,6 +844,128 @@ mod capture {
         use dji4g_application::*;
         use dji4g_domain::*;
         let now = SystemTime::now();
+        if mode.starts_with("module-") {
+            use dji4g_application::{
+                AdapterNetworkDetails, AdapterObservationDto, AdapterStateDto, DefaultRouteDto,
+                ModuleNetworkCheckPhase, ModuleNetworkCheckSnapshot, NetworkRouteChoice,
+            };
+            use dji4g_domain::{
+                AdapterBinding, IpFamily, ModuleNetworkEvidence, NetworkEvidenceState as E,
+                classify_module_network,
+            };
+            let device = snapshot.app.device.as_ref().unwrap();
+            let mut check = ModuleNetworkCheckSnapshot::queued(1, device.epoch, true);
+            check.phase = ModuleNetworkCheckPhase::Finished;
+            check.started_at = Some(SystemTime::now());
+            check.finished_at = Some(SystemTime::now());
+            check.diagnostics = snapshot.diagnostics.clone();
+            check.evidence = ModuleNetworkEvidence {
+                device: E::Passed,
+                link: E::Passed,
+                gateway: E::Passed,
+                adapter: E::Passed,
+                address_route: E::Passed,
+                public: E::Passed,
+                dns: E::Passed,
+            };
+            check.adapter = Some(AdapterObservationDto {
+                details: Some(AdapterNetworkDetails {
+                    link_up: true,
+                    dhcp_v4: true,
+                    dns_automatic: Some(false),
+                }),
+                epoch: device.epoch,
+                binding: AdapterBinding {
+                    target: device.identity.clone(),
+                    adapter_id: device
+                        .adapter_id
+                        .clone()
+                        .unwrap_or_else(|| "{fixture}".into()),
+                },
+                state: AdapterStateDto::UsableAddressAndRoute,
+                addresses: vec!["192.0.2.10".into()],
+                gateways: vec!["192.0.2.1".into()],
+                dns_servers: vec!["192.0.2.1".into()],
+                ipv4: true,
+                ipv6: false,
+                rx_bytes: None,
+                tx_bytes: None,
+            });
+            if mode == "module-dhcp" || mode == "module-recheck" {
+                check.evidence.address_route = E::Failed;
+                check.adapter.as_mut().unwrap().state = AdapterStateDto::NoUsableAddressOrRoute;
+            }
+            if mode == "module-dns" {
+                check.evidence.dns = E::Failed;
+            }
+            if mode == "module-probe-off" {
+                snapshot.settings.active_probe = false;
+                check.evidence.public = E::NotRun;
+                check.evidence.dns = E::NotRun;
+            }
+            if mode == "module-missing" {
+                check.evidence.device = E::Failed;
+                check.adapter = None;
+            }
+            if mode == "module-no-adapter" {
+                check.evidence.adapter = E::Unavailable;
+                check.adapter = None;
+            }
+            if mode == "module-vpn" {
+                check.probe = Some(dji4g_application::ProbeObservationDto {
+                    epoch: device.epoch,
+                    adapter_id: device.adapter_id.clone().unwrap_or_default(),
+                    gateway: dji4g_application::ProbeStageDto::Passed,
+                    public: dji4g_application::ProbeStageDto::Passed,
+                    dns: dji4g_application::ProbeStageDto::Passed,
+                    protocol_coverage: None,
+                    system_route: None,
+                    route_choices: vec![
+                        NetworkRouteChoice {
+                            family: IpFamily::V4,
+                            luid: Some(21),
+                            owner: Some(DefaultRouteDto::VpnOrTun),
+                        },
+                        NetworkRouteChoice {
+                            family: IpFamily::V6,
+                            luid: Some(22),
+                            owner: Some(DefaultRouteDto::TargetAdapter),
+                        },
+                    ],
+                });
+            }
+            if mode == "module-recheck" {
+                check.after_operation = Some(1);
+                check.dhcp_attempted = true;
+                check.operation_outcome = Some(dji4g_domain::OperationOutcome::OutcomeUnknown {
+                    code: dji4g_domain::ErrorCode::Timeout,
+                });
+            }
+            check.verdict = classify_module_network(&check.evidence);
+            if mode == "module-queued" {
+                check.phase = ModuleNetworkCheckPhase::Queued;
+            }
+            let app = std::sync::Arc::make_mut(&mut snapshot.app);
+            app.availability = match check.verdict {
+                dji4g_domain::ModuleNetworkVerdict::AddressRouteIssue => {
+                    dji4g_domain::Availability::Unavailable(
+                        dji4g_domain::UnavailableReason::NoUsableAddressOrRoute,
+                    )
+                }
+                dji4g_domain::ModuleNetworkVerdict::DnsIssue => {
+                    dji4g_domain::Availability::Limited(dji4g_domain::LimitedReason::DnsFailure)
+                }
+                dji4g_domain::ModuleNetworkVerdict::DeviceMissing => {
+                    dji4g_domain::Availability::NotDetected
+                }
+                dji4g_domain::ModuleNetworkVerdict::Inconclusive => {
+                    dji4g_domain::Availability::Detecting
+                }
+                _ => app.availability,
+            };
+            snapshot.module_network_check = Some(check);
+            return;
+        }
         if mode.starts_with("history-") {
             apply_history_fixture(snapshot, mode);
             return;
@@ -977,6 +1100,7 @@ mod capture {
                     epoch,
                     result: CheckResult::Passed {
                         value: ProbeObservationDto {
+                            route_choices: Vec::new(),
                             epoch,
                             adapter_id: "{adapter}".into(),
                             gateway: ProbeStageDto::Passed,

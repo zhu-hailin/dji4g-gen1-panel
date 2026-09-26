@@ -7,6 +7,7 @@ mod controller;
 mod device_tools;
 mod features;
 mod host_network;
+mod module_network_check;
 mod monitor;
 mod ports;
 mod reducer;
@@ -37,21 +38,24 @@ pub use features::{FeatureCapability, FeatureKey};
 pub use host_network::{
     HostNetworkPhase, HostNetworkPort, HostNetworkSnapshot, ProxyRepairPreview, ProxyRepairResult,
 };
+pub use module_network_check::{
+    ModuleNetworkCheckPhase, ModuleNetworkCheckSnapshot, NetworkRepairKind, step_state,
+};
 pub use monitor::{
     ControllerRunner, MonitorPorts, RATE_READ_TIMEOUT, RATE_TICK_INTERVAL, REFRESH_INTERVAL,
     STAGE_TIMEOUT, periodic_refresh_due, rate_tick_due,
 };
 pub use ports::{
-    ActionExecutor, ActionPreconditions, AdapterContext, AdapterMetrics, AdapterObservationDto,
-    AdapterPort, AdapterStateDto, AtObservation, AtPort, AutostartApplyOutcome, AutostartControl,
-    AutostartKnownState, AutostartStatus, Clock, CommandState, CommandStateSnapshot,
-    DefaultRouteDto, DevicePresenceDto, DeviceToolsPort, ExecutionReceipt, ExecutionReceiptOutcome,
-    FailureCode, FakeActionExecutor, FakeClock, HotspotControl, HotspotObservation,
-    InventoryObservation, InventoryPort, LanguageCode, LogLevel, MonoTime, NetworkProbePort,
-    NormalizedNetworkEvidence, PortError, PortFuture, PrivilegedExecutor, ProbeObservationDto,
-    ProbeStageDto, SettingsPersistenceState, SettingsSaveOutcome, SettingsSnapshot, SmsListing,
-    SmsPort, SmsReadResult, SmsSendReceipt, SmsSendResult, StableCode, StableCodeError,
-    SystemRouteDto, TargetContext, mask_recipient,
+    ActionExecutor, ActionPreconditions, AdapterContext, AdapterMetrics, AdapterNetworkDetails,
+    AdapterObservationDto, AdapterPort, AdapterStateDto, AtObservation, AtPort,
+    AutostartApplyOutcome, AutostartControl, AutostartKnownState, AutostartStatus, Clock,
+    CommandState, CommandStateSnapshot, DefaultRouteDto, DevicePresenceDto, DeviceToolsPort,
+    ExecutionReceipt, ExecutionReceiptOutcome, FailureCode, FakeActionExecutor, FakeClock,
+    HotspotControl, HotspotObservation, InventoryObservation, InventoryPort, LanguageCode,
+    LogLevel, MonoTime, NetworkProbePort, NetworkRouteChoice, NormalizedNetworkEvidence, PortError,
+    PortFuture, PrivilegedExecutor, ProbeObservationDto, ProbeStageDto, SettingsPersistenceState,
+    SettingsSaveOutcome, SettingsSnapshot, SmsListing, SmsPort, SmsReadResult, SmsSendReceipt,
+    SmsSendResult, StableCode, StableCodeError, SystemRouteDto, TargetContext, mask_recipient,
 };
 pub use reducer::{
     ActionReadiness, ActionReadinessKey, BackendEvent, CheckMask, CheckResult, ControllerSnapshot,

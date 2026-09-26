@@ -786,6 +786,7 @@ impl NetworkProbePort for ProductionProbe {
             if !active {
                 let code = probe_failure(ErrorCode::ProbeFailed, "probe:disabled_by_setting");
                 return Ok(ProbeObservationDto {
+                    route_choices: Vec::new(),
                     epoch: adapter.epoch(),
                     adapter_id: adapter.binding().adapter_id.clone(),
                     gateway: ProbeStageDto::Unexecuted { code: code.clone() },
@@ -2014,6 +2015,8 @@ fn current_device(
 }
 
 fn adapter_dto(observation: AdapterObservation, target: &TargetContext) -> AdapterObservationDto {
+    let dns_automatic =
+        dji4g_windows_platform::repair::observe_dns_automatic(&observation.identity);
     let identity = observation.identity;
     let binding = AdapterBinding {
         target: target.identity().clone(),
@@ -2025,6 +2028,11 @@ fn adapter_dto(observation: AdapterObservation, target: &TargetContext) -> Adapt
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     AdapterObservationDto {
+        details: Some(dji4g_application::AdapterNetworkDetails {
+            link_up: observation.oper_up,
+            dhcp_v4: observation.dhcp_v4,
+            dns_automatic,
+        }),
         epoch: identity.epoch(),
         binding,
         state: if observation.usable_families.is_empty() {
@@ -2137,7 +2145,30 @@ fn probe_dto(result: BoundProbeResult) -> ProbeObservationDto {
     );
     let protocol_coverage = protocol_coverage(&result);
     let system_route = system_route(&result);
+    let route_choices = result
+        .global_routes
+        .iter()
+        .map(|comparison| {
+            let evidence = match &comparison.route.outcome {
+                ProbeStage::Succeeded(e) => Some(e),
+                _ => None,
+            };
+            dji4g_application::NetworkRouteChoice {
+                family: match comparison.family {
+                    AddressFamily::Ipv4 => dji4g_domain::IpFamily::V4,
+                    AddressFamily::Ipv6 => dji4g_domain::IpFamily::V6,
+                },
+                luid: evidence.and_then(|e| e.global_luid),
+                owner: evidence.map(|e| match e.owner {
+                    DefaultRouteOwner::TargetAdapter => DefaultRouteDto::TargetAdapter,
+                    DefaultRouteOwner::VpnOrTun => DefaultRouteDto::VpnOrTun,
+                    DefaultRouteOwner::Other => DefaultRouteDto::Other,
+                }),
+            }
+        })
+        .collect();
     ProbeObservationDto {
+        route_choices,
         epoch: result.epoch,
         adapter_id: result.adapter_guid,
         gateway,
@@ -2541,6 +2572,17 @@ mod tests {
         assert_eq!(
             dto.protocol_coverage,
             Some(ProtocolCoverage::SingleFamilyOnly)
+        );
+        assert_eq!(dto.route_choices.len(), 2);
+        assert_eq!(dto.route_choices[0].family, dji4g_domain::IpFamily::V4);
+        assert_eq!(
+            dto.route_choices[0].owner,
+            Some(dji4g_application::DefaultRouteDto::TargetAdapter)
+        );
+        assert_eq!(dto.route_choices[1].family, dji4g_domain::IpFamily::V6);
+        assert_eq!(
+            dto.route_choices[1].owner,
+            Some(dji4g_application::DefaultRouteDto::VpnOrTun)
         );
         // The chosen family's route is reported and is explanation-only.
         let route = dto.system_route.expect("route present");

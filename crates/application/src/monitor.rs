@@ -441,7 +441,9 @@ impl ControllerRunner {
             self.refresh_deferred |= signaled;
             if !self.sms_pending()
                 && !self.tool_pending()
-                && (self.refresh_deferred || self.monitoring_cadence_due())
+                && (self.refresh_deferred
+                    || self.controller.network_check_queued()
+                    || self.monitoring_cadence_due())
             {
                 self.refresh_deferred = false;
                 self.run_refresh();
@@ -1639,9 +1641,8 @@ impl ControllerRunner {
     }
 
     fn run_refresh(&mut self) {
-        if self.controller.sms_active()
-            || self.controller.sms_delete_active()
-            || self.pending_sms_read.is_some()
+        if self.controller.interaction_in_flight(self.controller.now())
+            || self.controller.host_work_busy()
         {
             self.refresh_deferred = true;
             return;
@@ -1653,11 +1654,16 @@ impl ControllerRunner {
             self.refresh_deferred = true;
             return;
         }
+        if self.controller.serial_work_busy() || self.pending_sms_read.is_some() {
+            self.refresh_deferred = true;
+            return;
+        }
         // Owned clones of the port handles so stage workers can be `'static`. The runner keeps
         // `self.ports` untouched; an `Arc` clone per stage is all a worker ever sees.
         let Some(ports) = self.ports.clone() else {
             // No ports means a deterministic test/demo backend. Still expose a bounded refresh
             // cycle so a burst cannot create an unbounded queue.
+            self.controller.network_check_unavailable();
             return;
         };
         let MonitorPorts {
@@ -1680,6 +1686,7 @@ impl ControllerRunner {
         // never sample at the same instant (which the baseline logic would reject as non-advancing).
         self.last_rate_tick_at = Some(self.controller.now());
         let cycle = self.controller.next_cycle();
+        let allow_probe_once = self.controller.begin_network_check(cycle);
         let epoch = self.controller.state().epoch();
         self.controller
             .apply_backend_event(BackendEvent::RefreshStarted {
@@ -1688,6 +1695,7 @@ impl ControllerRunner {
                 scheduled: crate::CheckMask::all(),
             });
 
+        self.publish();
         // Stage 1 — inventory. Sequential by design: it produces the epoch and the target the
         // rest of the cycle depends on, and a missing device ends the cycle early.
         let inventory = stage_check(
@@ -1711,6 +1719,7 @@ impl ControllerRunner {
                 epoch: inventory_epoch,
                 result: inventory,
             });
+        self.publish();
         let epoch = self.controller.state().epoch();
         let snapshot = self.controller.snapshot();
         let Some(device) = snapshot.app.device.as_ref() else {
@@ -1787,6 +1796,7 @@ impl ControllerRunner {
                 result: adapter,
             });
 
+        self.publish();
         // Stages 4 and 5 — probe and hotspot run concurrently. Both need the adapter context,
         // which is derived from the reducer state after the adapter event above has been
         // applied, exactly as the sequential version did. Each stage either runs on a worker or
@@ -1794,7 +1804,7 @@ impl ControllerRunner {
         // started before either outcome is joined, and the events are applied in the fixed
         // order probe then hotspot.
         let adapter_context = self.controller.state().adapter_context();
-        let probe_plan = if self.controller.state().active_probe() {
+        let probe_plan = if self.controller.state().active_probe() || allow_probe_once {
             match adapter_context.clone() {
                 Some(context) => StagePlan::Running(spawn_stage(move || {
                     poll_ready(probe_port.observe(&context, true), stage_timeout, || {

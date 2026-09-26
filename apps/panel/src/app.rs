@@ -68,6 +68,13 @@ pub trait PanelCommandSink {
 
     /// Present the native confirm box for a controlled repair request and prepare it.
     fn prepare_repair_now(&self, request: ControlledRepairRequest);
+    fn prepare_network_repair_now(
+        &self,
+        request_id: u64,
+        repair: dji4g_application::NetworkRepairKind,
+    ) {
+        let _ = self.try_send(UiCommand::PrepareNetworkRepair { request_id, repair });
+    }
 
     /// Present the native confirm box for a plain action request and prepare it.
     fn prepare_action_now(&self, request: ActionRequest);
@@ -1364,7 +1371,12 @@ impl PanelApp {
                 SystemTime::now(),
                 self.onboarding.driver_fixture,
                 self.driver_setup_outcome,
+                self,
             ) {
+                crate::ui::onboarding::OnboardingAction::OpenRepairs => {
+                    self.finish_onboarding();
+                    self.page = Page::Repairs;
+                }
                 crate::ui::onboarding::OnboardingAction::Enter => self.finish_onboarding(),
                 crate::ui::onboarding::OnboardingAction::Refresh => self.send(UiCommand::Refresh),
                 crate::ui::onboarding::OnboardingAction::InspectHostNetwork => {
@@ -1503,6 +1515,15 @@ impl PanelApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.page {
                             Page::Overview => {
+                                if crate::ui::module_network_check::render(
+                                    ui,
+                                    &snapshot,
+                                    now,
+                                    self.language,
+                                    self,
+                                ) {
+                                    self.page = Page::Repairs;
+                                }
                                 if let Some(destination) = overview::render_summary(
                                     ui,
                                     &snapshot,
@@ -1545,6 +1566,15 @@ impl PanelApp {
                                 }
                             }
                             Page::Diagnostics => {
+                                if crate::ui::module_network_check::render(
+                                    ui,
+                                    &snapshot,
+                                    now,
+                                    self.language,
+                                    self,
+                                ) {
+                                    self.page = Page::Repairs;
+                                }
                                 let ui_side = UiSideCommands {
                                     inner: Arc::clone(&self.commands),
                                     export_requested: Arc::clone(&export_requested),
@@ -1829,7 +1859,7 @@ impl PanelApp {
             let _ = self.commands.try_send(command);
             return;
         };
-        let Some((title, message)) = confirm_message_for_action(
+        let Some((title, mut message)) = confirm_message_for_action(
             &action,
             dji4g_application::action_requires_elevation(&action),
             Some(disruption),
@@ -1841,6 +1871,9 @@ impl PanelApp {
             let _ = self.commands.try_send(command);
             return;
         };
+        if matches!(command, UiCommand::PrepareNetworkRepair { .. }) {
+            message.push_str("\n\n完成后将只读复检一次，向固定端点发送少量公网与 DNS 请求；长期探测设置不变。失败或结果未知不会自动再次修复。");
+        }
         // Send the prepare first: the controller handles it within one poll interval (~20 ms),
         // typically while the user is still reading the box that opens below.
         if self.commands.try_send(command).is_err() {
@@ -1888,6 +1921,16 @@ impl PanelCommandSink for PanelApp {
         self.confirm_and_prepare(action, UiCommand::PrepareRepair { request });
     }
 
+    fn prepare_network_repair_now(
+        &self,
+        request_id: u64,
+        repair: dji4g_application::NetworkRepairKind,
+    ) {
+        self.confirm_and_prepare(
+            repair.request().into_action(),
+            UiCommand::PrepareNetworkRepair { request_id, repair },
+        );
+    }
     fn prepare_action_now(&self, request: ActionRequest) {
         let action = request.clone();
         self.confirm_and_prepare(action, UiCommand::PrepareAction { request });

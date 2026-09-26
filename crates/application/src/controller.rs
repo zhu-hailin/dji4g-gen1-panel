@@ -86,6 +86,13 @@ pub enum CommandReceipt {
 
 #[derive(Clone, Debug)]
 pub enum UiCommand {
+    CheckModuleNetwork {
+        allow_probe_once: bool,
+    },
+    PrepareNetworkRepair {
+        request_id: u64,
+        repair: crate::NetworkRepairKind,
+    },
     Refresh,
     InspectHostNetwork,
     PrepareProxyRepair {
@@ -279,6 +286,10 @@ impl ControllerHandle {
 
 /// Synchronous core used by the async runner and deterministic application tests.
 pub struct Controller {
+    module_network_check: Option<crate::ModuleNetworkCheckSnapshot>,
+    next_network_check_id: u64,
+    network_repair_plan: Option<(ActionPlanId, DeviceEpoch, bool)>,
+    network_recheck_operation: Option<(u64, DeviceEpoch, bool)>,
     host_network: crate::HostNetworkSnapshot,
     host_requests: VecDeque<crate::host_network::HostNetworkRequest>,
     next_host_finding_id: u64,
@@ -325,6 +336,10 @@ impl Controller {
         let executor = Arc::new(FakeActionExecutor::new());
         let clock = Arc::new(FakeClock::new(now));
         Self {
+            module_network_check: None,
+            next_network_check_id: 1,
+            network_repair_plan: None,
+            network_recheck_operation: None,
             host_network: crate::HostNetworkSnapshot::default(),
             host_requests: VecDeque::new(),
             next_host_finding_id: 1,
@@ -364,6 +379,10 @@ impl Controller {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
+            module_network_check: None,
+            next_network_check_id: 1,
+            network_repair_plan: None,
+            network_recheck_operation: None,
             host_network: crate::HostNetworkSnapshot::default(),
             host_requests: VecDeque::new(),
             next_host_finding_id: 1,
@@ -403,6 +422,12 @@ impl Controller {
             self.operation.clone(),
             self.clock.system_now(),
         );
+        snapshot.module_network_check = self.module_network_check.clone();
+        if let Some(check) = snapshot.module_network_check.as_mut() {
+            if !check.active() && !check.fresh(self.state.epoch(), self.now()) {
+                check.invalidate();
+            }
+        }
         snapshot.host_network = self.host_network.clone();
         snapshot.feedback = self.feedback.clone();
         snapshot.sms_send = self.sms_send.clone();
@@ -489,6 +514,41 @@ impl Controller {
         request: ControlledRepairRequest,
     ) -> Result<ActionPlanId, PrepareError> {
         self.prepare_action(request.into_action())
+    }
+
+    fn prepare_network_repair(
+        &mut self,
+        request_id: u64,
+        repair: crate::NetworkRepairKind,
+    ) -> Result<ActionPlanId, PrepareError> {
+        let check = self
+            .module_network_check
+            .as_ref()
+            .filter(|c| {
+                c.request_id == request_id
+                    && c.fresh(self.state.epoch(), self.clock.system_now())
+                    && c.recommended_repairs().contains(&repair)
+            })
+            .ok_or_else(|| {
+                PrepareError::Prerequisite(failure(
+                    ErrorCode::EvidenceExpired,
+                    "app:missing_before_state",
+                ))
+            })?;
+        if check.adapter.as_ref().is_none_or(|a| {
+            Some(a.binding.adapter_id.clone()) != self.state.adapter_id()
+                || Some(a.binding.target.clone()) != self.state.target_identity()
+        }) {
+            return Err(PrepareError::Prerequisite(failure(
+                ErrorCode::EvidenceExpired,
+                "app:missing_before_state",
+            )));
+        }
+        let epoch = check.epoch;
+        let dhcp_attempted = check.dhcp_attempted || repair == crate::NetworkRepairKind::RenewDhcp;
+        let id = self.prepare_repair(repair.request())?;
+        self.network_repair_plan = Some((id, epoch, dhcp_attempted));
+        Ok(id)
     }
 
     /// Synchronous confirmation: consume the plan, execute on the calling thread, finish.
@@ -638,6 +698,11 @@ impl Controller {
             ActionKindTag::from_action(&consumed.plan.kind).ok_or(ConfirmError::UnknownPlan)?;
         let operation_id = self.next_operation_id;
         self.next_operation_id = self.next_operation_id.saturating_add(1);
+        if let Some((plan_id, epoch, dhcp)) = self.network_repair_plan.take() {
+            if plan_id == id {
+                self.network_recheck_operation = Some((operation_id, epoch, dhcp));
+            }
+        }
         self.operation = Some(OperationUiSnapshot {
             operation_id,
             action: tag,
@@ -716,6 +781,22 @@ impl Controller {
 
     fn handle_command_inner(&mut self, command: UiCommand) -> Result<CommandReceipt, UiSendError> {
         match command {
+            UiCommand::CheckModuleNetwork { allow_probe_once } => {
+                if self
+                    .module_network_check
+                    .as_ref()
+                    .is_some_and(|check| check.active())
+                {
+                    return Ok(CommandReceipt::Coalesced);
+                }
+                self.module_network_check = Some(crate::ModuleNetworkCheckSnapshot::queued(
+                    self.next_network_check_id,
+                    self.state.epoch(),
+                    allow_probe_once,
+                ));
+                self.next_network_check_id = self.next_network_check_id.saturating_add(1);
+                Ok(CommandReceipt::Accepted)
+            }
             UiCommand::Refresh => Ok(CommandReceipt::Accepted),
             UiCommand::InspectHostNetwork => {
                 if self.host_work_busy() {
@@ -803,6 +884,17 @@ impl Controller {
                     return self.reject_host_busy();
                 }
                 self.prepare_action(request)
+                    .map(|_| CommandReceipt::Accepted)
+                    .map_err(|error| {
+                        self.report_feedback(prepare_feedback(error));
+                        UiSendError::Closed
+                    })
+            }
+            UiCommand::PrepareNetworkRepair { request_id, repair } => {
+                if self.host_work_busy() {
+                    return self.reject_host_busy();
+                }
+                self.prepare_network_repair(request_id, repair)
                     .map(|_| CommandReceipt::Accepted)
                     .map_err(|error| {
                         self.report_feedback(prepare_feedback(error));
@@ -1032,7 +1124,10 @@ impl Controller {
     /// Whether any serial work is in flight: the one predicate every entry point uses.
     #[must_use]
     pub fn serial_work_busy(&self) -> bool {
-        self.sms_active()
+        self.module_network_check
+            .as_ref()
+            .is_some_and(|c| c.phase == crate::ModuleNetworkCheckPhase::Running)
+            || self.sms_active()
             || self.sms_delete_active()
             || self.sms_read_in_flight
             || self.sms_refresh_pending
@@ -1470,7 +1565,19 @@ impl Controller {
                 ..
             }
         );
+        let check_event = event.clone();
         self.state = crate::reduce_state(&self.state, event, now);
+        if let Some(check) = self.module_network_check.as_mut() {
+            check.observe(
+                &check_event,
+                &self.state.snapshot().diagnostics,
+                self.state.epoch(),
+                now,
+            );
+            if check.epoch != self.state.epoch() && check.epoch != DeviceEpoch(0) {
+                check.invalidate();
+            }
+        }
         let evidence_changed = self.state.evidence_revision() != before;
         let sim_changed = self.state.sim_epoch() != sim_epoch_before;
         if evidence_changed || sim_changed {
@@ -1592,6 +1699,35 @@ impl Controller {
         }
     }
 
+    pub(crate) fn network_check_unavailable(&mut self) {
+        if let Some(check) = self.module_network_check.as_mut().filter(|c| c.active()) {
+            check.phase = crate::ModuleNetworkCheckPhase::Finished;
+            check.finished_at = Some(self.clock.system_now());
+            check.evidence.device = dji4g_domain::NetworkEvidenceState::Unavailable;
+        }
+    }
+    pub(crate) fn network_check_queued(&self) -> bool {
+        self.module_network_check
+            .as_ref()
+            .is_some_and(|c| c.phase == crate::ModuleNetworkCheckPhase::Queued)
+    }
+    pub(crate) fn begin_network_check(&mut self, cycle: crate::RefreshCycleId) -> bool {
+        let Some(check) = self
+            .module_network_check
+            .as_mut()
+            .filter(|c| c.phase == crate::ModuleNetworkCheckPhase::Queued)
+        else {
+            return false;
+        };
+        check.phase = crate::ModuleNetworkCheckPhase::Running;
+        check.started_at = Some(self.clock.system_now());
+        check.cycle = Some(cycle);
+        if check.allow_probe_once {
+            self.state.authorize_probe_once(cycle);
+        }
+        check.allow_probe_once
+    }
+
     pub(crate) fn next_cycle(&self) -> crate::RefreshCycleId {
         crate::RefreshCycleId(self.state.current_cycle().0.saturating_add(1))
     }
@@ -1600,7 +1736,7 @@ impl Controller {
         self.clock.system_now()
     }
 
-    fn host_work_busy(&self) -> bool {
+    pub(crate) fn host_work_busy(&self) -> bool {
         matches!(
             self.host_network.phase,
             crate::HostNetworkPhase::Checking
@@ -1669,6 +1805,9 @@ impl Controller {
             self.clock.system_now(),
         );
         if self.state.epoch() != before_epoch {
+            if let Some(check) = self.module_network_check.as_mut() {
+                check.invalidate();
+            }
             self.invalidate_prepared(
                 if matches!(reason, EpochInvalidationReason::PhysicalRemoval) {
                     ConfirmationInvalidationReason::DeviceRemoved
@@ -1760,6 +1899,25 @@ impl Controller {
     }
 
     fn finish_operation(&mut self, outcome: OperationOutcome, finished_at: SystemTime) {
+        if let Some((id, epoch, dhcp)) = self.network_recheck_operation.take() {
+            if epoch == self.state.epoch()
+                && self
+                    .operation
+                    .as_ref()
+                    .is_some_and(|op| op.operation_id == id)
+            {
+                let mut check = crate::ModuleNetworkCheckSnapshot::queued(
+                    self.next_network_check_id,
+                    epoch,
+                    true,
+                );
+                self.next_network_check_id = self.next_network_check_id.saturating_add(1);
+                check.after_operation = Some(id);
+                check.operation_outcome = Some(outcome.clone());
+                check.dhcp_attempted = dhcp;
+                self.module_network_check = Some(check);
+            }
+        }
         if let Some(operation) = self.operation.as_mut() {
             operation.state = OperationState::Finished {
                 outcome,

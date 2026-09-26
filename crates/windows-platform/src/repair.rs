@@ -1486,6 +1486,20 @@ impl RepairBackend for WindowsNativeRepairBackend {
 
 pub type NativeRepairBackend = WindowsNativeRepairBackend;
 
+pub fn observe_dns_automatic(identity: &crate::AdapterIdentity) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        native::read_dns_profile(identity)
+            .ok()
+            .map(|profile| matches!(profile, dji4g_domain::DnsProfile::Automatic))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = identity;
+        None
+    }
+}
+
 #[cfg(windows)]
 mod native {
     use super::*;
@@ -2146,7 +2160,7 @@ mod native {
         }
     }
 
-    fn read_dns_profile(identity: &AdapterIdentity) -> Result<DnsProfile, RepairError> {
+    pub(super) fn read_dns_profile(identity: &AdapterIdentity) -> Result<DnsProfile, RepairError> {
         let guid = windows_guid(&identity.guid_string())?;
         let mut settings = DNS_INTERFACE_SETTINGS {
             Version: DNS_INTERFACE_SETTINGS_VERSION1,
