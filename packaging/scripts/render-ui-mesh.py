@@ -13,7 +13,9 @@ def render(path):
     data = json.loads(path.read_text(encoding="utf-8"))
     scale = data["scale"]
     width, height = round(data["width"] * scale), round(data["height"] * scale)
-    canvas = np.full((height, width, 4), 255.0, dtype=np.float32)
+    # Match the real App::clear_color; a hard-coded white preview hid unpainted margins.
+    clear = np.array(data["clear_color"], dtype=np.float32) * 255.0
+    canvas = np.broadcast_to(clear, (height, width, 4)).copy()
     textures = {}
     for delta in data["textures"]:
         w, h = delta["size"]

@@ -2039,6 +2039,12 @@ impl PanelCommandSink for PanelApp {
 }
 
 impl eframe::App for PanelApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Rounded central panels do not paint their outer margins or corner cut-outs.
+        // Use an opaque app surface rather than eframe's translucent dark default.
+        Color32::from_rgb(240, 244, 249).to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.poll_shell_events(ctx);
         self.receive_latest_nonblocking(ctx);
@@ -2311,6 +2317,17 @@ mod tests {
         fn try_send(&self, command: UiCommand) -> Result<(), ApplicationUiSendError> {
             self.sent.lock().expect("healthy lock").push(command);
             Ok(())
+        }
+    }
+
+    #[test]
+    fn native_canvas_is_opaque_material_surface() {
+        let app = panel();
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            assert_eq!(
+                eframe::App::clear_color(&app, &visuals),
+                Color32::from_rgb(240, 244, 249).to_normalized_gamma_f32()
+            );
         }
     }
 

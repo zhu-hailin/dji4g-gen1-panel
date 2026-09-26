@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-application"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dji4g-at-protocol",
  "dji4g-domain",
@@ -382,14 +382,14 @@ dependencies = [
 
 [[package]]
 name = "dji4g-at-protocol"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dji4g-domain",
 ]
 
 [[package]]
 name = "dji4g-domain"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-helper"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dji4g-ipc",
  "dji4g-windows-platform",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-ipc"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-panel"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dji4g-application",
  "dji4g-at-protocol",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "dji4g-windows-platform"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dji4g-at-protocol",
  "dji4g-domain",

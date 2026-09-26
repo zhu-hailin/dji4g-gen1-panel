@@ -401,6 +401,10 @@ mod capture {
     }
 
     impl eframe::App for Capture {
+        fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+            eframe::App::clear_color(&self.app, visuals)
+        }
+
         fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
             if self.mode == "single-query-detail"
                 && !self.detail_clicked
@@ -1491,7 +1495,7 @@ mod capture {
                             "vertices": mesh.vertices.iter().map(|v| serde_json::json!([v.pos.x, v.pos.y, v.uv.x, v.uv.y, v.color.to_array()])).collect::<Vec<_>>()
                         }))
                     }).collect();
-                    let data = serde_json::json!({"width": width, "height": height, "scale": scale, "textures": textures, "meshes": meshes, "simulated": true, "native_window": false});
+                    let data = serde_json::json!({"width": width, "height": height, "scale": scale, "textures": textures, "meshes": meshes, "clear_color": eframe::App::clear_color(&app, &ctx.style().visuals), "simulated": true, "native_window": false});
                     std::fs::write(
                         output.join(format!("{}.mesh.json", screen.name())),
                         serde_json::to_vec(&data).unwrap(),
