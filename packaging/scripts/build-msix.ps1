@@ -90,7 +90,12 @@ $helperExe = Join-Path $repoRoot 'target\x86_64-pc-windows-msvc\release\dji4g-he
 $makeAppx = Find-KitTool 'makeappx.exe'
 $signTool = Find-KitTool 'signtool.exe'
 $target = 'x86_64-pc-windows-msvc'
-$artifactName = 'Dji4GPanel-0.1.6.0-unsigned-development-only.msix'
+$versionMatch = Select-String -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"$'
+if ($versionMatch.Matches.Count -ne 1) { throw 'packaging:workspace_version_invalid' }
+$msixVersion = $versionMatch.Matches[0].Groups[1].Value + '.0'
+[xml]$packageXml = Get-Content -LiteralPath $manifest -Raw
+if ($packageXml.Package.Identity.Version -ne $msixVersion) { throw 'packaging:manifest_version_mismatch' }
+$artifactName = "Dji4GPanel-$msixVersion-unsigned-development-only.msix"
 $assetRoot = Join-Path $repoRoot 'packaging\msix\Assets'
 
 if ($Sign -and [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
@@ -208,7 +213,7 @@ try {
         package_identity = [ordered]@{
             name = 'Dji4GPanel'
             publisher = 'CN=Dji4GPanel Development'
-            version = '0.1.6.0'
+            version = $msixVersion
             processor_architecture = 'x64'
         }
         files = [ordered]@{

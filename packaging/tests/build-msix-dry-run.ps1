@@ -14,6 +14,12 @@ if ($plan.artifact -notlike '*unsigned-development-only.msix') {
     throw 'packaging:test_unsigned_artifact_name'
 }
 
+$workspaceVersion = (Select-String -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"$').Matches[0].Groups[1].Value
+$expectedMsixVersion = "$workspaceVersion.0"
+if ($plan.artifact -ne "Dji4GPanel-$expectedMsixVersion-unsigned-development-only.msix") { throw 'packaging:test_artifact_version_mismatch' }
+[xml]$packageXml = Get-Content -LiteralPath $plan.manifest -Raw
+if ($packageXml.Package.Identity.Version -ne $expectedMsixVersion) { throw 'packaging:test_manifest_version_mismatch' }
+
 function Get-PngDimension([string] $path) {
     $bytes = [IO.File]::ReadAllBytes($path)
     if ($bytes.Length -lt 24) { throw 'packaging:test_asset_too_short' }

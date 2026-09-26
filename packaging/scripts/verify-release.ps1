@@ -56,10 +56,13 @@ function Get-Sha256Hex([byte[]]$bytes) {
     finally { $sha.Dispose() }
 }
 
+$versionMatch = Select-String -LiteralPath (Join-Path (Get-RepositoryRoot) 'Cargo.toml') -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"$'
+if ($versionMatch.Matches.Count -ne 1) { throw 'verify:workspace_version_invalid' }
+$msixVersion = $versionMatch.Matches[0].Groups[1].Value + '.0'
 $expectedIdentity = [ordered]@{
     name = 'Dji4GPanel'
     publisher = 'CN=Dji4GPanel Development'
-    version = '0.1.6.0'
+    version = $msixVersion
     processor_architecture = 'x64'
 }
 

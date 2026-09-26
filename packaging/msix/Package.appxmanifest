@@ -9,7 +9,7 @@
   <Identity
     Name="Dji4GPanel"
     Publisher="CN=Dji4GPanel Development"
-    Version="0.1.6.0"
+    Version="0.1.7.0"
     ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>DJI 一代 4G 面板</DisplayName>

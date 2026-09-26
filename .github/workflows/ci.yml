@@ -149,5 +149,30 @@ jobs:
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
           $tag = "v$version"
           $assets = Get-ChildItem dist -File | Where-Object { $_.Extension -in '.zip', '.msix', '.sha256', '.json' } | ForEach-Object { $_.FullName }
-          gh release create $tag @assets --repo '${{ github.repository }}' --target '${{ github.sha }}' --latest --title "DJI 4G Panel $version" --notes-file "docs/RELEASE_NOTES_$version.md"
+          gh release view $tag --repo '${{ github.repository }}' --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # Permit packaging-only corrections without rewriting a published source tag.
+            # Runtime or dependency changes must increment the product version instead.
+            $compareEndpoint = "repos/${{ github.repository }}/compare/$tag...${{ github.sha }}"
+            $changed = @(gh api $compareEndpoint --jq '.files[].filename')
+            if ($LASTEXITCODE -ne 0 -or $changed.Count -ge 300 -or ($changed | Where-Object { $_ -notmatch '^(packaging/|docs/|\.github/workflows/ci\.yml$)' })) {
+              throw 'Existing release permits only packaging/documentation corrections; bump version for runtime changes'
+            }
+            gh release upload $tag @assets --repo '${{ github.repository }}' --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Corrected attachment upload failed' }
+            $oldAssets = @(gh release view $tag --repo '${{ github.repository }}' --json assets --jq '.assets[].name')
+            if ($LASTEXITCODE -ne 0) { throw 'Attachment inventory failed' }
+            foreach ($name in $oldAssets) {
+              if ($name -match '^Dji4GPanel-[0-9.]+-unsigned-development-only\.msix(\.sha256)?$' -and $name -notlike "Dji4GPanel-$version.0-*") {
+                gh release delete-asset $tag $name --repo '${{ github.repository }}' --yes
+                if ($LASTEXITCODE -ne 0) { throw 'Obsolete package attachment removal failed' }
+              }
+            }
+            $notes = (Get-Content -LiteralPath "docs/RELEASE_NOTES_$version.md" -Raw) + "`n`nPackaging correction source: ${{ github.sha }}. The published source tag is unchanged."
+            $notesPath = Join-Path $env:RUNNER_TEMP 'corrected-release-notes.md'
+            [IO.File]::WriteAllText($notesPath, $notes)
+            gh release edit $tag --repo '${{ github.repository }}' --latest --notes-file $notesPath
+          } else {
+            gh release create $tag @assets --repo '${{ github.repository }}' --target '${{ github.sha }}' --latest --title "DJI 4G Panel $version" --notes-file "docs/RELEASE_NOTES_$version.md"
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
