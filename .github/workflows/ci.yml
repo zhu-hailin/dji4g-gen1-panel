@@ -139,6 +139,9 @@ jobs:
             dist/release-manifest.json
           if-no-files-found: error
 
+      - name: build portable updater
+        run: cargo build --locked --release --target ${{ env.TARGET }} -p dji4g-updater
+
       - name: build and verify portable ZIP
         shell: pwsh
         run: ./packaging/scripts/build-portable.ps1
