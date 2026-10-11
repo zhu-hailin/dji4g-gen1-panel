@@ -10,16 +10,21 @@ const BODY: &str = "Send regression fixture";
 #[derive(Default)]
 struct SendSink {
     attempts: Mutex<Vec<(String, String)>>,
+    refreshes: Mutex<usize>,
     failure: Option<UiSendError>,
 }
 
 impl UiCommandSink for SendSink {
     fn try_send(&self, command: UiCommand) -> Result<(), UiSendError> {
-        if let UiCommand::SmsSend { recipient, body } = command {
-            self.attempts.lock().unwrap().push((recipient, body));
-            if let Some(error) = &self.failure {
-                return Err(error.clone());
+        match command {
+            UiCommand::SmsSend { recipient, body } => {
+                self.attempts.lock().unwrap().push((recipient, body));
+                if let Some(error) = &self.failure {
+                    return Err(error.clone());
+                }
             }
+            UiCommand::SmsRefresh => *self.refreshes.lock().unwrap() += 1,
+            _ => {}
         }
         Ok(())
     }
@@ -201,6 +206,144 @@ fn send_snapshot(phase: SmsSendPhase, result: Option<SmsSendResult>) -> SmsSendS
         phase,
         result,
         failure: None,
+    }
+}
+
+fn refresh_frame(
+    context: &egui::Context,
+    ui: &mut SendUi,
+    label: &str,
+    events: Vec<egui::Event>,
+) -> egui::Response {
+    let mut response = None;
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |panel| {
+                response = Some(crate::ui::sms::refresh_button(
+                    panel,
+                    ui.language,
+                    &ui.snapshot,
+                    &ui.sink,
+                    &mut ui.state,
+                    label,
+                ));
+            });
+        },
+    );
+    response.expect("the refresh control must be drawn")
+}
+
+#[test]
+fn actual_refresh_buttons_respect_local_send_and_decision_gates_before_snapshot_acknowledgment() {
+    for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+        for key in [TextKey::SmsRefreshList, TextKey::SmsRefreshMessages] {
+            for gate in [
+                "idle",
+                "editor",
+                "confirmation",
+                "replacement",
+                "storage",
+                "pending",
+            ] {
+                let mut ui = SendUi::new(language, None);
+                match gate {
+                    "idle" => {
+                        ui.state.open = false;
+                        ui.state.confirmation = None;
+                    }
+                    "editor" => ui.state.confirmation = None,
+                    "confirmation" => {}
+                    "replacement" => {
+                        ui.state.open = false;
+                        ui.state.confirmation = None;
+                        ui.state.replacement_draft = Some(Draft {
+                            recipient: "10010".into(),
+                            body: "CXYE".into(),
+                        });
+                    }
+                    "storage" => {
+                        ui.state.open = false;
+                        ui.state.confirmation = None;
+                        ui.state.storage_confirmation = Some((
+                            None,
+                            ui.snapshot.sim_epoch,
+                            dji4g_domain::SmsStorageId("SM".into()),
+                        ));
+                    }
+                    "pending" => {
+                        ui.confirm_by_click();
+                        assert!(ui.state.pending.is_some());
+                        ui.assert_single_attempt();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(!ui.snapshot.serial_work_busy);
+                assert!(!ui.snapshot.sms_refresh_pending);
+                assert!(ui.snapshot.sms_send.is_none());
+                let draft = ui.state.draft.clone();
+                // Render the actual control without a modal scrim, so a blocked pointer cannot
+                // make an enabled refresh button look safe. The controller snapshot stays idle.
+                let context = egui::Context::default();
+                crate::ui::initialize_visuals(&context);
+                let label = t(language, key);
+                let mut response = refresh_frame(&context, &mut ui, &label, vec![]);
+                for _ in 0..2 {
+                    response = refresh_frame(&context, &mut ui, &label, vec![]);
+                }
+                assert_eq!(
+                    response.enabled(),
+                    gate == "idle",
+                    "{language:?}/{key:?}/{gate}"
+                );
+                let point = response.rect.center();
+                refresh_frame(&context, &mut ui, &label, pointer(point, true));
+                let clicked = refresh_frame(&context, &mut ui, &label, pointer(point, false));
+                assert_eq!(
+                    clicked.clicked(),
+                    gate == "idle",
+                    "{language:?}/{key:?}/{gate}"
+                );
+                assert_eq!(
+                    *ui.sink.refreshes.lock().unwrap(),
+                    usize::from(gate == "idle"),
+                    "{language:?}/{key:?}/{gate}"
+                );
+                assert!(ui.state.draft == draft);
+                assert_eq!(ui.state.pending.is_some(), gate == "pending");
+            }
+        }
+    }
+}
+
+#[test]
+fn full_page_refresh_click_cannot_queue_a_read_before_the_send_snapshot_arrives() {
+    for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+        let mut ui = SendUi::new(language, None);
+        ui.confirm_by_click();
+        assert!(ui.state.pending.is_some());
+        assert!(!ui.snapshot.serial_work_busy);
+        assert!(ui.snapshot.sms_send.is_none());
+        let output = ui.settle(true);
+        let label = t(language, TextKey::SmsRefreshList);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, &label, None))
+            .expect("the refresh entry remains visible during a pending send")
+            .center();
+        ui.click(point, true);
+        ui.assert_single_attempt();
+        assert_eq!(*ui.sink.refreshes.lock().unwrap(), 0);
+        assert!(ui.state.pending.is_some());
+        assert!(!ui.state.open);
     }
 }
 

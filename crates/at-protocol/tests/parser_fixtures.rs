@@ -206,6 +206,132 @@ fn recognizes_registration_and_exact_known_urcs_for_other_commands() {
 }
 
 #[test]
+fn location_registration_urcs_remain_separate_from_handshake_replies_when_fragmented() {
+    let urcs = [
+        "+CREG: 1,\"00C3\",\"1234\",0",
+        "+CGREG: 5,\"00c3\",\"1A2B3C4\",7,\"a1\"",
+        "+CEREG: 1,\"00C3\",\"12345678\",7",
+        "+CEREG: 2,,,",
+        "+CREG: 2,\"\",\"\"",
+        "+CEREG: 1,\"00C3\"",
+    ];
+    for command in [AtCommand::Attention, AtCommand::Identity] {
+        let identity = if command == AtCommand::Identity {
+            "Quectel EC200A\r\n"
+        } else {
+            ""
+        };
+        let wire = format!("{}\r\n{identity}OK\r\n", urcs.join("\r\n"));
+        let mut parser = StreamingParser::new(EPOCH, command.clone());
+        let expected = parser
+            .push(wire.as_bytes())
+            .expect("location URCs are valid");
+        let actual_urcs = expected
+            .iter()
+            .filter_map(|event| match event {
+                AtEvent::Urc(urc) => Some(urc.line.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_urcs, urcs);
+        let response = one_response(expected.clone());
+        assert_eq!(response.command, command);
+        assert_eq!(response.final_code, AtFinalCode::Ok);
+        assert_eq!(
+            response.lines,
+            if identity.is_empty() {
+                vec![]
+            } else {
+                vec!["Quectel EC200A"]
+            }
+        );
+        for chunk_size in 1..=wire.len() {
+            let mut parser = StreamingParser::new(EPOCH, command.clone());
+            let mut actual = Vec::new();
+            for chunk in wire.as_bytes().chunks(chunk_size) {
+                actual.extend(
+                    parser
+                        .push(chunk)
+                        .expect("fragmented location URCs are valid"),
+                );
+            }
+            assert_eq!(actual, expected, "chunk size {chunk_size}");
+        }
+    }
+}
+
+#[test]
+fn location_urcs_never_substitute_for_the_cereg_query_response() {
+    let urc = "+CEREG: 1,\"00C3\",\"12345678\",7";
+    let query = "+CEREG: 2,1,\"00C3\",\"12345678\",7";
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::EpsRegistration);
+    let events = parser
+        .push(format!("{urc}\r\n{query}\r\nOK\r\n").as_bytes())
+        .expect("query and location URC have distinct layouts");
+    assert!(matches!(&events[0], AtEvent::Urc(value) if value.line == urc));
+    assert_eq!(one_response(events).lines, [query]);
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::EpsRegistration);
+    assert_eq!(
+        parser
+            .push(format!("{urc}\r\nOK\r\n").as_bytes())
+            .unwrap_err()
+            .kind,
+        ProtocolErrorKind::WrongPortData,
+        "an unsolicited location alone cannot complete a query"
+    );
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Attention);
+    assert_eq!(
+        parser
+            .push(format!("{query}\r\nOK\r\n").as_bytes())
+            .unwrap_err()
+            .kind,
+        ProtocolErrorKind::WrongPortData,
+        "an unrelated query reply cannot verify AT"
+    );
+    let mut parser = StreamingParser::new(EPOCH, AtCommand::Attention);
+    assert_eq!(
+        parser.push(b"+CMGS: 7\r\nOK\r\n").unwrap_err().kind,
+        ProtocolErrorKind::WrongPortData,
+        "a late SMS acknowledgement cannot verify the next AT"
+    );
+}
+
+#[test]
+fn malformed_location_registration_urcs_still_fail_closed() {
+    for line in [
+        "+CEREG: x,\"00C3\",\"12345678\",7",
+        "+CEREG: 255,\"00C3\",\"12345678\",7",
+        "+CEREG: +1,\"00C3\",\"12345678\",7",
+        "+CEREG: 1,00C3,\"12345678\",7",
+        "+CEREG: 1,\"00X3\",\"12345678\",7",
+        "+CEREG: 1,\"10000\",\"12345678\",7",
+        "+CEREG: 1,\"00C3\",\"100000000\",7",
+        "+CEREG: 1,\"00C3\",\"12345678\",99",
+        "+CEREG: 1,\"00C3\",\"12345678\",\"7\"",
+        "+CEREG: 1,\"00C3\",\"12345678\",7,\"01\"",
+        "+CREG: 1,\"00C3\",\"1234\",7,\"01\"",
+        "+CGREG: 1,\"00C3\",\"1234\",7,01",
+        "+CGREG: 1,\"00C3\",\"1234\",7,\"100\"",
+    ] {
+        for command in [
+            AtCommand::Attention,
+            AtCommand::Identity,
+            AtCommand::EpsRegistration,
+        ] {
+            let mut parser = StreamingParser::new(EPOCH, command);
+            assert_eq!(
+                parser
+                    .push(format!("{line}\r\nOK\r\n").as_bytes())
+                    .unwrap_err()
+                    .kind,
+                ProtocolErrorKind::WrongPortData,
+                "unmodeled location field: {line}"
+            );
+        }
+    }
+}
+
+#[test]
 fn rejects_sustained_unrecognized_printable_wrong_port_data() {
     let mut parser = StreamingParser::new(EPOCH, AtCommand::Attention);
     let noise = "unrecognized printable stream\r\n".repeat(33);

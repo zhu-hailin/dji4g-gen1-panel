@@ -482,7 +482,8 @@ fn refresh_button(
         .add_enabled(
             !read_only_module(snapshot)
                 && !snapshot.sms_refresh_pending
-                && !snapshot.serial_work_busy,
+                && !snapshot.serial_work_busy
+                && state.search_shortcuts_allowed(),
             egui::Button::new(label),
         )
         .on_disabled_hover_text(t(

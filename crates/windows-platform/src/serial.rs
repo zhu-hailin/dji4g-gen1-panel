@@ -1556,6 +1556,19 @@ fn is_quiet(error: &io::Error) -> bool {
     )
 }
 
+#[cfg(any(windows, test))]
+fn read_serial_chunk(reader: &mut (impl io::Read + ?Sized)) -> io::Result<Vec<u8>> {
+    let mut buffer = vec![0_u8; 4096];
+    let count = reader.read(&mut buffer)?;
+    if count == 0 {
+        // A synchronous Win32 serial read can succeed with no bytes when COMMTIMEOUTS expires.
+        // Keep waiting under the transaction deadline; actual I/O failures remain unchanged.
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "serial read quiet"));
+    }
+    buffer.truncate(count);
+    Ok(buffer)
+}
+
 #[cfg(windows)]
 struct WindowsSerialPort {
     file: std::fs::File,
@@ -1658,16 +1671,7 @@ impl SerialIo for WindowsSerialPort {
     }
 
     fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0_u8; 4096];
-        let count = io::Read::read(&mut &self.file, &mut buffer)?;
-        if count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "serial handle closed",
-            ));
-        }
-        buffer.truncate(count);
-        Ok(buffer)
+        read_serial_chunk(&mut &self.file)
     }
 }
 

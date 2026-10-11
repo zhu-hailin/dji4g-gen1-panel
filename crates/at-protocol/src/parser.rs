@@ -740,7 +740,46 @@ fn is_registration_urc(line: &str, prefix: &str) -> bool {
     let Some(payload) = nonempty_payload(line, prefix) else {
         return false;
     };
-    !payload.contains(',') && parse_u8(payload).is_some_and(|status| status <= 10)
+    let Some(fields) = split_csv(payload) else {
+        return false;
+    };
+    let status = fields[0];
+    if !status.bytes().all(|byte| byte.is_ascii_digit())
+        || !parse_u8(status).is_some_and(|value| value <= 10)
+    {
+        return false;
+    }
+    // TS 27.007 §§7.2, 10.1.20, 10.1.22: location URCs start with <stat>, while
+    // query replies start with <n>,<stat>. A quoted LAC/TAC distinguishes the two.
+    // Only the basic location layout is modeled here; cause/timer extensions stay invalid.
+    fields
+        .iter()
+        .enumerate()
+        .skip(1)
+        .all(|(index, field)| match index {
+            1 => is_optional_registration_hex(field, 4),
+            2 => is_optional_registration_hex(field, 8),
+            3 => {
+                field.is_empty()
+                    || (field.bytes().all(|byte| byte.is_ascii_digit())
+                        && parse_u8(field).is_some_and(|value| value <= 9))
+            }
+            4 if prefix == "+CGREG:" => is_optional_registration_hex(field, 2),
+            _ => false,
+        })
+}
+
+fn is_optional_registration_hex(field: &str, max_digits: usize) -> bool {
+    if field.is_empty() {
+        return true;
+    }
+    let Some(hex) = field
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return false;
+    };
+    hex.len() <= max_digits && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn is_packet_attach_response(line: &str) -> bool {

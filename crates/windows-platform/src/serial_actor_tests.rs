@@ -144,6 +144,173 @@ fn actor_with_reads(
     })
 }
 
+#[derive(Default)]
+struct RawReadState {
+    reads: VecDeque<io::Result<Vec<u8>>>,
+    writes: Vec<Vec<u8>>,
+    zero_reads: usize,
+}
+
+/// Exercises the same Read-to-SerialIo adapter as the production Windows serial handle.
+struct ReadAdapterSerial(Arc<Mutex<RawReadState>>);
+
+impl io::Read for ReadAdapterSerial {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes = {
+            let mut state = self.0.lock().unwrap();
+            let bytes = state.reads.pop_front().unwrap_or_else(|| Ok(Vec::new()))?;
+            if bytes.is_empty() {
+                state.zero_reads += 1;
+            }
+            bytes
+        };
+        assert!(bytes.len() <= buffer.len());
+        if bytes.is_empty() {
+            // Model a completed native timeout without spinning while testing the deadline.
+            thread::sleep(Duration::from_millis(1));
+        }
+        buffer[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+}
+
+impl SerialIo for ReadAdapterSerial {
+    fn cancellation_handle(&self) -> io::Result<Arc<dyn SerialIoCancellation>> {
+        Ok(Arc::new(PassiveCancellation))
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0.lock().unwrap().writes.push(bytes.to_vec());
+        Ok(())
+    }
+
+    fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
+        super::read_serial_chunk(self)
+    }
+}
+
+fn actor_with_raw_reads(
+    reads: impl IntoIterator<Item = io::Result<Vec<u8>>>,
+) -> (AtSessionActor, Arc<Mutex<RawReadState>>) {
+    let state = Arc::new(Mutex::new(RawReadState {
+        reads: reads.into_iter().collect(),
+        ..RawReadState::default()
+    }));
+    let actor = AtSessionActor::spawn(DeviceEpoch(7), Box::new(ReadAdapterSerial(state.clone())));
+    (actor, state)
+}
+
+fn assert_raw_submission_once(state: &Arc<Mutex<RawReadState>>, body: &[u8]) {
+    let mut submitted = body.to_vec();
+    submitted.push(0x1A);
+    assert_eq!(
+        state.lock().unwrap().writes,
+        vec![b"AT+CMGS=9\r".to_vec(), submitted]
+    );
+}
+
+#[test]
+fn native_zero_byte_reads_before_and_after_prompt_wait_for_cmgs_without_resending() {
+    let body = b"0011000B916800000000FF";
+    let (actor, state) = actor_with_raw_reads([
+        Ok(Vec::new()),
+        Ok(Vec::new()),
+        Ok(b"\r\n>".to_vec()),
+        Ok(Vec::new()),
+        Ok(Vec::new()),
+        Ok(b"\r\n+CMGS: 42\r\nOK\r\n".to_vec()),
+    ]);
+    let control = dji4g_domain::SmsTransactionControl::new(Duration::from_secs(1));
+
+    let response = actor
+        .execute_prompt_controlled(
+            AtCommand::SmsSend { tpdu_octets: 9 },
+            body.to_vec(),
+            control.clone(),
+        )
+        .unwrap();
+
+    assert_eq!(response.final_code, AtFinalCode::Ok);
+    assert_eq!(response.lines, vec!["+CMGS: 42"]);
+    assert!(control.submission_possible());
+    assert_eq!(state.lock().unwrap().zero_reads, 4);
+    assert_raw_submission_once(&state, body);
+}
+
+#[test]
+fn native_zero_byte_reads_after_submission_obey_result_deadline_without_resending() {
+    let body = b"0011000B916800000000FF";
+    let (actor, state) = actor_with_raw_reads([Ok(b"\r\n>".to_vec())]);
+    let control = dji4g_domain::SmsTransactionControl::new(Duration::from_secs(1));
+    let started = std::time::Instant::now();
+
+    let error = actor
+        .execute_prompt_controlled(
+            AtCommand::SmsSend { tpdu_octets: 9 },
+            body.to_vec(),
+            control.clone(),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.protocol_kind(), Some(ProtocolErrorKind::Timeout));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(control.submission_possible());
+    assert_eq!(
+        control.phase(),
+        dji4g_domain::SmsSendPhase::WaitingForResult
+    );
+    assert!(state.lock().unwrap().zero_reads > 0);
+    assert_raw_submission_once(&state, body);
+}
+
+#[test]
+fn native_read_disconnect_errors_remain_terminal_after_submission() {
+    let body = b"0011000B916800000000FF";
+    for kind in [
+        io::ErrorKind::NotConnected,
+        io::ErrorKind::BrokenPipe,
+        io::ErrorKind::UnexpectedEof,
+    ] {
+        let (actor, state) =
+            actor_with_raw_reads([Ok(b"\r\n>".to_vec()), Err(io::Error::new(kind, "removed"))]);
+        let control = dji4g_domain::SmsTransactionControl::new(Duration::from_secs(1));
+
+        let error = actor
+            .execute_prompt_controlled(
+                AtCommand::SmsSend { tpdu_octets: 9 },
+                body.to_vec(),
+                control.clone(),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.protocol_kind(),
+            Some(ProtocolErrorKind::DeviceRemoved)
+        );
+        assert_eq!(
+            actor
+                .try_execute(AtCommand::Attention)
+                .unwrap_err()
+                .protocol_kind(),
+            Some(ProtocolErrorKind::DeviceRemoved)
+        );
+        assert!(control.submission_possible());
+        assert_raw_submission_once(&state, body);
+    }
+}
+
+#[test]
+fn native_read_adapter_preserves_actual_io_error_details() {
+    let state = Arc::new(Mutex::new(RawReadState {
+        reads: [Err(io::Error::from_raw_os_error(5))].into(),
+        ..RawReadState::default()
+    }));
+    let mut reader = ReadAdapterSerial(state);
+    let error = super::read_serial_chunk(&mut reader).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(5));
+    assert_eq!(error.kind(), io::Error::from_raw_os_error(5).kind());
+}
+
 #[test]
 fn idempotent_read_retries_exactly_once() {
     let (actor, state) = actor_with_reads([
