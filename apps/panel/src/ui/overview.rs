@@ -585,6 +585,7 @@ pub(crate) fn render_summary(
     );
 }
 
+#[cfg(test)]
 pub(crate) fn render(
     ui: &mut Ui,
     snapshot: &ControllerSnapshot,
@@ -592,6 +593,27 @@ pub(crate) fn render(
     rate_history: &crate::ui::RateHistory,
     temperature_history: &crate::ui::TemperatureHistory,
     probes: Option<&FeatureProbeView>,
+) {
+    render_with_sim_action(
+        ui,
+        snapshot,
+        language,
+        rate_history,
+        temperature_history,
+        probes,
+        |_| {},
+    );
+}
+
+/// The caller owns actions and navigation; the overview only places the SIM entry.
+pub(crate) fn render_with_sim_action(
+    ui: &mut Ui,
+    snapshot: &ControllerSnapshot,
+    language: Language,
+    rate_history: &crate::ui::RateHistory,
+    temperature_history: &crate::ui::TemperatureHistory,
+    probes: Option<&FeatureProbeView>,
+    mut sim_action: impl FnMut(&mut Ui),
 ) {
     let mut vm = overview_vm_with_probes(snapshot, language, probes);
     if !snapshot.rates_sampled_at.is_some_and(|time| {
@@ -605,22 +627,30 @@ pub(crate) fn render(
     render_cards(
         ui,
         &vm,
-        snapshot.app.cellular.as_ref(),
         language,
         rate_history,
         temperature_history,
         snapshot.app.observed_at,
+        |ui| {
+            render_device_card(
+                ui,
+                &vm,
+                snapshot.app.cellular.as_ref(),
+                language,
+                &mut sim_action,
+            )
+        },
     );
 }
 
 fn render_cards(
     ui: &mut Ui,
     vm: &OverviewVm,
-    cellular: Option<&dji4g_domain::CellularSnapshot>,
     language: Language,
     rate_history: &crate::ui::RateHistory,
     temperature_history: &crate::ui::TemperatureHistory,
     observed_at: std::time::SystemTime,
+    render_device: impl FnOnce(&mut Ui),
 ) {
     if ui.available_width() >= super::TWO_COLUMN_MIN_WIDTH {
         two_columns(
@@ -637,7 +667,7 @@ fn render_cards(
                 render_network_card(ui, vm, language);
             },
             |ui| {
-                render_device_card(ui, vm, cellular, language);
+                render_device(ui);
             },
         );
     } else {
@@ -649,7 +679,7 @@ fn render_cards(
             temperature_history,
             observed_at,
         );
-        render_device_card(ui, vm, cellular, language);
+        render_device(ui);
         render_network_card(ui, vm, language);
     }
     render_timeline_card(ui, vm, language);
@@ -705,6 +735,7 @@ fn render_device_card(
     vm: &OverviewVm,
     cellular: Option<&dji4g_domain::CellularSnapshot>,
     language: Language,
+    sim_action: &mut dyn FnMut(&mut Ui),
 ) {
     let response = ui
         .scope(|ui| {
@@ -733,7 +764,18 @@ fn render_device_card(
                             ),
                             &vm.registration.text,
                         ),
-                        ("SIM".to_owned(), &vm.sim.text),
+                    ] {
+                        ui.label(field_label(label));
+                        wrapped_label(ui, value);
+                        ui.end_row();
+                    }
+                    ui.label(field_label("SIM"));
+                    ui.horizontal_wrapped(|ui| {
+                        wrapped_label(ui, &vm.sim.text);
+                        sim_action(ui);
+                    });
+                    ui.end_row();
+                    for (label, value) in [
                         (
                             t(language, crate::localization::TextKey::FieldModelShort),
                             &vm.device.text,
@@ -1961,11 +2003,19 @@ mod address_layout_regressions {
                                             render_cards(
                                                 ui,
                                                 &vm,
-                                                None,
                                                 language,
                                                 &crate::ui::RateHistory::default(),
                                                 &crate::ui::TemperatureHistory::default(),
                                                 std::time::SystemTime::now(),
+                                                |ui| {
+                                                    render_device_card(
+                                                        ui,
+                                                        &vm,
+                                                        None,
+                                                        language,
+                                                        &mut |_| {},
+                                                    )
+                                                },
                                             );
                                         });
                                 },

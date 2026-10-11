@@ -2001,6 +2001,19 @@ impl ReducerState {
         }
     }
 
+    pub fn reconcile_sms_complete_listing(
+        &mut self,
+        listed: &[SmsMessage],
+        report: &dji4g_domain::SmsReadReport,
+    ) {
+        if self
+            .sms_store
+            .reconcile_complete_listing(listed, report, self.epoch.0, self.sim_epoch)
+        {
+            self.publish_only_change();
+        }
+    }
+
     pub fn ingest_sms(&mut self, message: SmsMessage) -> bool {
         if self.sms_store.ingest(message) {
             self.publish_only_change();

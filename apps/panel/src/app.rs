@@ -1066,6 +1066,11 @@ impl PanelApp {
     pub fn set_review_sms_editor(&mut self) {
         self.sms_compose.review_editor();
     }
+    /// A UI-only balance-query draft. Capture sinks never dispatch device commands.
+    #[cfg(debug_assertions)]
+    pub fn set_review_sms_balance_query(&mut self) {
+        self.sms_compose.begin_balance_query("10010", "CXYE");
+    }
     #[cfg(debug_assertions)]
     pub fn set_review_sms_queue_error(&mut self) {
         self.sms_compose.review_queue_error();
@@ -1794,7 +1799,6 @@ impl PanelApp {
                                 .is_some_and(|response| response.clicked())
                             {
                                 self.update_window_open = true;
-                                self.updates.request_download(ctx);
                             }
                         });
                     });
@@ -1830,10 +1834,6 @@ impl PanelApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.page {
                             Page::Overview => {
-                                // The overview only reports. Every check, retry, switch and repair
-                                // it used to offer now lives on the page that owns the subject —
-                                // 诊断 for the checks, 修复 for the setup guide, 无线 for the
-                                // hotspot — so nothing here can change the machine's state.
                                 overview::render_summary(
                                     ui,
                                     &snapshot,
@@ -1841,14 +1841,30 @@ impl PanelApp {
                                     probe_view.as_ref(),
                                 );
                                 ui.add_space(scale::SECTION_GAP);
-                                overview::render(
+                                let language = self.language;
+                                let mut balance_draft_prepared = false;
+                                let sms_compose = &mut self.sms_compose;
+                                overview::render_with_sim_action(
                                     ui,
                                     &snapshot,
                                     self.language,
                                     &self.rate_history,
                                     &self.temperature_history,
                                     probe_view.as_ref(),
+                                    |ui| {
+                                        balance_draft_prepared |=
+                                            crate::ui::sms_balance::render_entry(
+                                                ui,
+                                                language,
+                                                sms_compose,
+                                            );
+                                    },
                                 );
+                                if balance_draft_prepared {
+                                    self.archive_view = false;
+                                    self.page = Page::Sms;
+                                    ctx.request_repaint();
+                                }
                             }
                             Page::Wireless => {
                                 crate::ui::wireless::render_page(
@@ -1913,6 +1929,23 @@ impl PanelApp {
                                 for command in output.commands {
                                     self.send(command);
                                     ctx.request_repaint_after(Duration::from_millis(20));
+                                }
+                                match crate::ui::update::settings_entry(
+                                    ui,
+                                    self.updates.state(),
+                                    self.updates.check_status(),
+                                    self.updates.can_check(),
+                                    self.language,
+                                ) {
+                                    crate::ui::update::Action::Check => {
+                                        if self.updates.request_check(ctx) {
+                                            self.update_window_open = false;
+                                        }
+                                    }
+                                    crate::ui::update::Action::Open => {
+                                        self.update_window_open = true
+                                    }
+                                    _ => {}
                                 }
                                 ui.separator();
                                 ui.horizontal_wrapped(|ui| {
@@ -2678,6 +2711,160 @@ mod tests {
     fn panel() -> PanelApp {
         let snapshot = Arc::new(ReducerState::new(SystemTime::UNIX_EPOCH).snapshot());
         PanelApp::from_snapshot(snapshot, Arc::new(NoopSink))
+    }
+
+    fn balance_overview_frame(
+        app: &mut PanelApp,
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 1800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render_ui(ctx),
+        )
+    }
+
+    fn click_balance_overview(
+        app: &mut PanelApp,
+        ctx: &egui::Context,
+        width: f32,
+        point: egui::Pos2,
+    ) {
+        for pressed in [true, false] {
+            balance_overview_frame(
+                app,
+                ctx,
+                width,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    fn balance_control_rect(ctx: &egui::Context, id: egui::Id) -> egui::Rect {
+        ctx.data(|data| data.get_temp::<egui::Rect>(id))
+            .expect("rendered balance control")
+    }
+
+    #[test]
+    fn overview_balance_template_opens_the_module_draft_or_replacement_confirmation() {
+        fn text_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains(needle),
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| text_contains(shape, needle)),
+                _ => false,
+            }
+        }
+        for width in [620.0, 1100.0] {
+            for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+                for keep_original in [false, true] {
+                    let ctx = egui::Context::default();
+                    crate::ui::apply_style(&ctx);
+                    let sink = Arc::new(RecordingSink::default());
+                    let snapshot = Arc::new(ReducerState::new(SystemTime::UNIX_EPOCH).snapshot());
+                    let mut app = PanelApp::from_snapshot(snapshot, sink.clone());
+                    app.language = language;
+                    app.page = Page::Overview;
+                    app.archive_view = true;
+                    if keep_original {
+                        app.sms_compose.review_editor();
+                    }
+                    for _ in 0..4 {
+                        balance_overview_frame(&mut app, &ctx, width, vec![]);
+                    }
+                    let entry = balance_control_rect(&ctx, egui::Id::new("balance-entry-rect"));
+                    let device = balance_control_rect(&ctx, egui::Id::new("overview-device-rect"));
+                    assert!(
+                        device.expand(1.0).contains_rect(entry),
+                        "SIM entry overflows its card: {width} {language:?}"
+                    );
+                    assert!(entry.right() <= width, "SIM entry must be reachable");
+                    click_balance_overview(&mut app, &ctx, width, entry.center());
+                    assert_eq!(
+                        app.page,
+                        Page::Overview,
+                        "opening the menu does not navigate"
+                    );
+                    for _ in 0..3 {
+                        balance_overview_frame(&mut app, &ctx, width, vec![]);
+                    }
+                    let choice = balance_control_rect(
+                        &ctx,
+                        egui::Id::new(("balance-template-rect", "10010")),
+                    );
+                    click_balance_overview(&mut app, &ctx, width, choice.center());
+                    assert_eq!(app.page, Page::Sms);
+                    assert!(
+                        !app.archive_view,
+                        "module compose must be visible even after an archive visit"
+                    );
+                    assert!(app.sms_compose.open);
+                    let mut output = balance_overview_frame(&mut app, &ctx, width, vec![]);
+                    for _ in 0..3 {
+                        output = balance_overview_frame(&mut app, &ctx, width, vec![]);
+                    }
+                    let title = t(
+                        language,
+                        if keep_original {
+                            TextKey::ComposeKeepDraftTitle
+                        } else {
+                            TextKey::ComposeTitle
+                        },
+                    );
+                    assert!(
+                        output
+                            .shapes
+                            .iter()
+                            .any(|shape| text_contains(&shape.shape, &title)),
+                        "the review dialog must be visible"
+                    );
+                    assert!(
+                        sink.sent.lock().unwrap().is_empty(),
+                        "preparing a draft does not dispatch device commands"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_balance_entry_observes_serial_busy_before_its_first_render() {
+        let ctx = egui::Context::default();
+        crate::ui::apply_style(&ctx);
+        let sink = Arc::new(RecordingSink::default());
+        let mut snapshot = ReducerState::new(SystemTime::UNIX_EPOCH).snapshot();
+        snapshot.serial_work_busy = true;
+        let mut app = PanelApp::from_snapshot(Arc::new(snapshot), sink.clone());
+        app.page = Page::Overview;
+        for _ in 0..4 {
+            balance_overview_frame(&mut app, &ctx, 1100.0, vec![]);
+        }
+        assert!(app.sms_compose.serial_busy);
+        let entry = balance_control_rect(&ctx, egui::Id::new("balance-entry-rect"));
+        click_balance_overview(&mut app, &ctx, 1100.0, entry.center());
+        for _ in 0..3 {
+            balance_overview_frame(&mut app, &ctx, 1100.0, vec![]);
+        }
+        let choice = balance_control_rect(&ctx, egui::Id::new(("balance-template-rect", "10010")));
+        click_balance_overview(&mut app, &ctx, 1100.0, choice.center());
+        assert_eq!(app.page, Page::Overview);
+        assert!(!app.sms_compose.open);
+        assert!(sink.sent.lock().unwrap().is_empty());
     }
 
     #[test]

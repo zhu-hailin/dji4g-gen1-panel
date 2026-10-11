@@ -994,6 +994,7 @@ mod tests {
             status: dji4g_domain::FeatureStatus::Supported,
             has_incomplete: true,
             evicted: 0,
+            ..Default::default()
         };
         let export = build(&snapshot, now());
         assert!(export.human.contains("消息数：2"));

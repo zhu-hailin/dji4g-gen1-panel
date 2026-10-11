@@ -57,13 +57,13 @@ pub fn settings_vm_from(settings: &SettingsSnapshot, language: Language) -> Sett
     };
     let autostart = match &settings.autostart {
         AutostartStatus::Loading => AutostartVm {
-            status: LocalizedText::new(language, TextKey::StatusLoading),
+            status: LocalizedText::new(language, TextKey::SettingsAutostartLoading),
             enabled: false,
             toggle_enabled: false,
             drift: false,
         },
         AutostartStatus::Ready(AutostartKnownState::Disabled) => AutostartVm {
-            status: LocalizedText::new(language, TextKey::ValueNotAvailable),
+            status: LocalizedText::new(language, TextKey::SettingsAutostartDisabled),
             enabled: false,
             toggle_enabled: true,
             drift: false,
@@ -157,6 +157,7 @@ pub(crate) fn render(
                 language,
                 crate::localization::TextKey::SettingsInterfaceTheme,
             ),
+            None,
             |ui| {
                 let current = super::theme::theme_preference(snapshot.settings.theme);
                 let mut selected = current;
@@ -184,6 +185,7 @@ pub(crate) fn render(
         controls.push(setting_row(
             ui,
             TextKey::SettingsLanguage.to_string(language),
+            None,
             |ui| {
                 // Same control as the theme row above, and the same shape: pick a value, and only a
                 // real change emits a command. Each option is labelled with its own endonym, so
@@ -212,6 +214,7 @@ pub(crate) fn render(
         controls.push(setting_row(
             ui,
             TextKey::SettingsActiveProbe.to_string(language),
+            Some(TextKey::SettingsActiveProbeDescription.to_string(language)),
             |ui| {
                 let mut active_probe = vm.active_probe;
                 let response = super::components::switch(
@@ -235,6 +238,7 @@ pub(crate) fn render(
         controls.push(setting_row(
             ui,
             TextKey::SettingsAutostart.to_string(language),
+            Some(TextKey::SettingsAutostartDescription.to_string(language)),
             |ui| {
                 let mut enabled = vm.autostart.enabled;
                 let response = super::components::switch(
@@ -246,22 +250,22 @@ pub(crate) fn render(
                 if response.changed() {
                     commands.push(UiCommand::SetAutostart(enabled));
                 }
-                if !vm.autostart.status.text.is_empty() {
-                    wrapped_label(ui, meta_text(vm.autostart.status.text.clone()));
-                }
-                if vm.autostart.drift {
-                    wrapped_label(
-                        ui,
-                        RichText::new(TextKey::SettingsConfigDrift.to_string(language))
-                            .color(super::StatusTone::Caution.color()),
-                    );
-                }
                 response
             },
         ));
+        let status = meta_text(vm.autostart.status.text.clone());
+        wrapped_label(
+            ui,
+            if vm.autostart.drift {
+                status.color(super::StatusTone::Caution.color())
+            } else {
+                status
+            },
+        );
         controls.push(setting_row(
             ui,
             TextKey::SettingsStartMinimized.to_string(language),
+            None,
             |ui| {
                 let mut start_minimized = vm.start_minimized;
                 let response = super::components::switch(
@@ -284,6 +288,7 @@ pub(crate) fn render(
         controls.push(setting_row(
             ui,
             TextKey::SettingsLogLevel.to_string(language),
+            Some(TextKey::SettingsLogLevelRestart.to_string(language)),
             |ui| {
                 let mut selected = vm.log_level;
                 let combo = egui::ComboBox::from_id_salt("settings-log-level")
@@ -325,7 +330,11 @@ pub(crate) fn render(
                 &[env!("CARGO_PKG_VERSION")],
             ),
         );
-        setting_block(ui, TextKey::SettingsPrivacy.to_string(language));
+        setting_block(
+            ui,
+            TextKey::SettingsPrivacy.to_string(language),
+            TextKey::SettingsPrivacyDescription.to_string(language),
+        );
         ui.add_space(12.0);
         wrapped_label(ui, meta_text(vm.persistence.status.text));
     });
@@ -342,11 +351,15 @@ pub(crate) fn render(
 fn setting_row(
     ui: &mut Ui,
     label: String,
+    description: Option<String>,
     control: impl FnOnce(&mut Ui) -> egui::Response,
 ) -> egui::Response {
     ui.add_space(8.0);
     if ui.available_width() < 440.0 {
         ui.label(RichText::new(label).strong().color(scale::ink()));
+        if let Some(description) = description {
+            wrapped_label(ui, meta_text(description));
+        }
         let response = control(ui);
         ui.add_space(8.0);
         ui.separator();
@@ -362,6 +375,9 @@ fn setting_row(
                     .strong()
                     .color(scale::ink()),
             );
+            if let Some(description) = description {
+                wrapped_label(ui, meta_text(description));
+            }
         });
         let inner = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             response = Some(control(ui));
@@ -375,7 +391,7 @@ fn setting_row(
 }
 
 /// A full-width block without a control (privacy notice).
-fn setting_block(ui: &mut Ui, label: String) {
+fn setting_block(ui: &mut Ui, label: String, description: String) {
     ui.add_space(8.0);
     ui.vertical(|ui| {
         ui.label(
@@ -384,6 +400,7 @@ fn setting_block(ui: &mut Ui, label: String) {
                 .strong()
                 .color(scale::ink()),
         );
+        wrapped_label(ui, meta_text(description));
     });
     ui.add_space(8.0);
 }
@@ -465,39 +482,104 @@ mod tests {
     /// inside the viewport and actually be hoverable.
     #[test]
     fn every_setting_control_lands_inside_the_visible_page() {
-        let context = egui::Context::default();
-        let snapshot = snapshot();
-        let mut controls = Vec::new();
-        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(552.0, 900.0));
-        let _ = context.run(
-            egui::RawInput {
-                screen_rect: Some(viewport),
-                ..Default::default()
-            },
-            |context| {
-                egui::CentralPanel::default().show(context, |ui| {
-                    let output = render(ui, &snapshot, Language::ZhCn);
-                    assert!(output.commands.is_empty());
-                    controls = output.controls;
-                });
-            },
-        );
-        assert_eq!(
-            controls.len(),
-            6,
-            "every setting row must render a control (theme, language, probe, autostart, \
-             start-minimized, log level)"
-        );
-        for response in &controls {
-            let rect = response.rect;
-            assert!(
-                rect.width() > 0.0 && rect.height() > 0.0,
-                "control has no usable area: {rect:?}"
-            );
-            assert!(
-                rect.left() >= viewport.left() && rect.right() <= viewport.right() + 0.5,
-                "control is outside the visible page: {rect:?}"
-            );
+        for width in [320.0, 552.0] {
+            for language in available_languages() {
+                for autostart in [
+                    AutostartStatus::Ready(AutostartKnownState::Disabled),
+                    AutostartStatus::Ready(AutostartKnownState::Drift),
+                    failed_autostart(Some(AutostartKnownState::Enabled)),
+                ] {
+                    let context = egui::Context::default();
+                    super::super::apply_style(&context);
+                    let mut snapshot = snapshot();
+                    snapshot.settings.autostart = autostart;
+                    let mut controls = Vec::new();
+                    let viewport =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1400.0));
+                    let _ = context.run(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            ..Default::default()
+                        },
+                        |context| {
+                            egui::CentralPanel::default().show(context, |ui| {
+                                let output = render(ui, &snapshot, *language);
+                                assert!(output.commands.is_empty());
+                                controls = output.controls;
+                            });
+                        },
+                    );
+                    assert_eq!(
+                        controls.len(),
+                        6,
+                        "every setting row must render a control (theme, language, probe, \
+                         autostart, start-minimized, log level)"
+                    );
+                    for response in &controls {
+                        let rect = response.rect;
+                        assert!(
+                            rect.width() > 0.0 && rect.height() > 0.0,
+                            "control has no usable area: {rect:?}"
+                        );
+                        assert!(
+                            rect.left() >= viewport.left()
+                                && rect.right() <= viewport.right() + 0.5,
+                            "{language:?} control exceeds {width}px page: {rect:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_explanations_and_confirmed_off_state_are_rendered() {
+        for width in [320.0, 552.0] {
+            for (language, disabled_text) in [
+                (Language::ZhCn, "已关闭"),
+                (Language::ZhTw, "已關閉"),
+                (Language::EnUs, "Off"),
+            ] {
+                let context = egui::Context::default();
+                super::super::apply_style(&context);
+                let mut snapshot = snapshot();
+                snapshot.settings.autostart = AutostartStatus::Ready(AutostartKnownState::Disabled);
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 1400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default().show(context, |ui| {
+                            let _ = render(ui, &snapshot, language);
+                        });
+                    },
+                );
+                let texts: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(texts.contains(&disabled_text));
+                for key in [
+                    TextKey::SettingsActiveProbeDescription,
+                    TextKey::SettingsAutostartDescription,
+                    TextKey::SettingsLogLevelRestart,
+                    TextKey::SettingsPrivacyDescription,
+                ] {
+                    let expected = t(language, key);
+                    assert!(
+                        texts.contains(&expected.as_str()),
+                        "{key:?} explanation must be visible in {language:?} at {width}px"
+                    );
+                }
+            }
         }
     }
 

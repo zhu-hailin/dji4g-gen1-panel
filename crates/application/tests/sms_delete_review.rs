@@ -301,6 +301,7 @@ impl SmsPort for ControlledReadPort {
                     capacity: Some((1, 50)),
                 },
                 report: dji4g_domain::SmsReadReport {
+                    complete: true, // Ports cannot make an incomplete listing authoritative.
                     storage: Some(SmsStorageId("SM".into())),
                     raw_records: 1,
                     decoded_records: 1,
@@ -361,7 +362,13 @@ fn timely_history_completion_survives_runner_poll_after_deadline() {
         "timely completion was incorrectly reported as timeout"
     );
     assert_eq!(snapshot.sms_messages.len(), 2);
-    assert_eq!(snapshot.sms_read_report.unwrap().decoded_records, 1);
+    let report = snapshot.sms_read_report.unwrap();
+    assert_eq!(report.decoded_records, 1);
+    assert!(
+        !report.complete,
+        "runner must overwrite the port's claimed proof"
+    );
+    assert!(snapshot.sms_inbox.last_synced_at.is_none());
     assert!(!snapshot.serial_work_busy);
 }
 
@@ -407,6 +414,8 @@ fn cancelled_history_keeps_serial_busy_until_real_cleanup_and_discards_result() 
         "cancelled result must not be ingested"
     );
     assert!(snapshot.sms_read_report.is_none());
+    assert!(snapshot.sms_inbox.last_synced_at.is_none());
+    assert!(snapshot.sms_inbox.last_synced_storage.is_none());
     assert_eq!(
         snapshot.sms_inbox_failure.unwrap().code.stable.as_str(),
         "sms:read_cancelled"

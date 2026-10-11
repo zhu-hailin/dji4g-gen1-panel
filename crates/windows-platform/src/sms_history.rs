@@ -235,6 +235,7 @@ pub(crate) fn list_in_session(
         let records = crate::sms::pair_cmgl_records(&response.lines, &target);
         control.set_progress(raw_records);
         let report = SmsReadReport {
+            complete: false,
             storage: Some(SmsStorageId(target.clone())),
             capacity: Some(current.capacity),
             raw_records,

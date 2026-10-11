@@ -156,7 +156,7 @@ pub fn sms_delete(device: &DjiDevice, epoch: DeviceEpoch, index: u32) -> Result<
     with_session(device, epoch, |actor| delete(actor, index))
 }
 
-/// Send one UCS-2 SMS to an explicit international recipient.
+/// Send one UCS-2 SMS to an explicit international number or an allowlisted service short code.
 ///
 /// The UI owns the single per-send confirmation and only calls this for an exact confirmed
 /// recipient and body. Preconditions fail closed: a module that is not confirmed in PDU mode

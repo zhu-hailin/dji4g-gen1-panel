@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 #[path = "sms_compose.rs"]
 mod compose;
-pub(crate) use compose::SmsComposeState;
+pub(crate) use compose::{ReplyStartResult, SmsComposeState};
 
 use dji4g_application::{ControllerSnapshot, UiCommand};
 use dji4g_domain::{
@@ -31,6 +31,54 @@ use crate::localization::{
 /// One catalog string in the language this page was rendered with.
 fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
     crate::localization::LocalizedText::new(language, key).text
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum InboxFilter {
+    #[default]
+    All,
+    Unread,
+    Incomplete,
+}
+
+impl InboxFilter {
+    fn label(self) -> TextKey {
+        match self {
+            Self::All => TextKey::SmsFilterAll,
+            Self::Unread => TextKey::SmsUnread,
+            Self::Incomplete => TextKey::SmsFilterIncomplete,
+        }
+    }
+
+    fn matches(self, row: &SmsRowVm) -> bool {
+        match self {
+            Self::All => true,
+            Self::Unread => row.unread == Some(true),
+            Self::Incomplete => row.status == SmsStatus::Incomplete,
+        }
+    }
+}
+
+fn filtered_rows<'a>(rows: &'a [SmsRowVm], state: &SmsComposeState) -> Vec<&'a SmsRowVm> {
+    let query = state.search.trim().to_lowercase();
+    rows.iter()
+        .filter(|row| {
+            (row.direction == SmsDirection::Outgoing) == state.outgoing
+                && (state.outgoing || state.inbox_filter.matches(row))
+                && (query.is_empty()
+                    || row.sender_full.to_lowercase().contains(&query)
+                    || row.body.to_lowercase().contains(&query))
+        })
+        .collect()
+}
+
+fn clear_hidden_selection(rows: &[&SmsRowVm], state: &mut SmsComposeState) {
+    if state
+        .selected
+        .is_some_and(|key| !rows.iter().any(|row| row.stable_id == key))
+    {
+        state.selected = None;
+    }
 }
 
 /// One projected stored message. Sender and body are carried verbatim only inside this UI-local
@@ -360,6 +408,7 @@ pub(crate) fn render(
                 render_history_controls(ui, language, snapshot, sink, state);
                 render_inbox_notes(ui, language, &vm, snapshot, state);
             });
+            super::sms_balance::render_entry(ui, language, state);
             if ui
                 .add_enabled(
                     !state.module_read_only,
@@ -382,6 +431,7 @@ pub(crate) fn render(
             );
         });
     });
+    super::sms_freshness::render(ui, snapshot, language, state);
     if snapshot.sms_refresh_pending {
         render_history_controls(ui, language, snapshot, sink, state);
     }
@@ -794,6 +844,86 @@ fn render_inbox_notes(
     }
 }
 
+fn search_id() -> egui::Id {
+    egui::Id::new("sms-message-search")
+}
+
+fn render_search(ui: &mut Ui, language: Language, state: &mut SmsComposeState) {
+    let delete_armed = state.selected.is_some_and(|key| {
+        ui.data(|data| data.get_temp::<Instant>(egui::Id::new(("sms-row-delete-armed", key))))
+            .is_some_and(|at| at.elapsed() < CONFIRM_ARM_WINDOW)
+    });
+    // Decisions and the editor own their keys. Do not use wants_keyboard_input here: that would
+    // also block Esc while the search box itself is focused.
+    if state.search_shortcuts_allowed() && !delete_armed {
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+            ui.memory_mut(|memory| memory.request_focus(search_id()));
+        }
+        // egui surrenders focus at the start of an Esc frame, before this widget renders.
+        if ui.memory(|memory| {
+            memory.has_focus(search_id()) || memory.had_focus_last_frame(search_id())
+        }) && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            state.search.clear();
+            ui.memory_mut(|memory| memory.request_focus(search_id()));
+        }
+    }
+    let clear_label = t(language, TextKey::SmsClearSearch);
+    let clear_width = (ui
+        .painter()
+        .layout_no_wrap(
+            clear_label.clone(),
+            egui::TextStyle::Button.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+        .size()
+        .x
+        + 2.0 * ui.spacing().button_padding.x)
+        .max(scale::BUTTON_MIN_W);
+    ui.horizontal(|ui| {
+        let search_width =
+            (ui.available_width() - clear_width - ui.spacing().item_spacing.x).max(40.0);
+        let search = ui.add_sized(
+            egui::vec2(search_width, scale::CONTROL_H),
+            egui::TextEdit::singleline(&mut state.search)
+                .id(search_id())
+                .hint_text(t(language, TextKey::SmsSearchHint))
+                .desired_width(f32::INFINITY)
+                .margin(egui::vec2(12.0, 5.0)),
+        );
+        let clear = super::components::action_button(
+            ui,
+            &clear_label,
+            super::components::ButtonKind::Outlined,
+            !state.search.is_empty(),
+            None,
+        );
+        if clear.clicked() {
+            state.search.clear();
+            ui.memory_mut(|memory| memory.request_focus(search_id()));
+        }
+        #[cfg(test)]
+        let clear_interaction = (
+            clear.id,
+            clear.interact_rect,
+            ui.clip_rect(),
+            clear.hovered(),
+            clear.is_pointer_button_down_on(),
+            clear.clicked(),
+        );
+        #[cfg(test)]
+        ui.data_mut(|data| {
+            data.insert_temp(egui::Id::new("sms-search-rect"), search.rect);
+            data.insert_temp(egui::Id::new("sms-clear-search-rect"), clear.rect);
+            data.insert_temp(
+                egui::Id::new("sms-clear-search-interaction"),
+                clear_interaction,
+            );
+        });
+        let _ = search;
+    });
+}
+
 fn render_inbox(
     ui: &mut Ui,
     vm: &SmsVm,
@@ -818,49 +948,77 @@ fn render_inbox(
                 .filter(|r| r.direction != SmsDirection::Outgoing)
                 .count();
             let outgoing = vm.rows.len() - incoming;
-            if super::components::segmented_control(
-                ui,
-                egui::Id::new("sms-direction"),
-                &mut state.outgoing,
-                &[
-                    super::components::TabItem::new(
-                        false,
-                        crate::localization::format_positional(
-                            language,
-                            crate::localization::TextKey::SmsTabInbox,
-                            &[&incoming.to_string()],
+            let narrow_controls = ui.available_width() < 400.0;
+            ui.horizontal_wrapped(|ui| {
+                if super::components::segmented_control(
+                    ui,
+                    egui::Id::new("sms-direction"),
+                    &mut state.outgoing,
+                    &[
+                        super::components::TabItem::new(
+                            false,
+                            crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::SmsTabInbox,
+                                &[&incoming.to_string()],
+                            ),
                         ),
-                    ),
-                    super::components::TabItem::new(
-                        true,
-                        crate::localization::format_positional(
-                            language,
-                            crate::localization::TextKey::SmsTabOutgoing,
-                            &[&outgoing.to_string()],
+                        super::components::TabItem::new(
+                            true,
+                            crate::localization::format_positional(
+                                language,
+                                crate::localization::TextKey::SmsTabOutgoing,
+                                &[&outgoing.to_string()],
+                            ),
                         ),
-                    ),
-                ],
-            ) {
-                state.selected = None;
-            }
+                    ],
+                ) {
+                    state.selected = None;
+                }
+                if !state.outgoing {
+                    if narrow_controls {
+                        ui.end_row();
+                    }
+                    let response = egui::ComboBox::from_id_salt("sms-inbox-filter")
+                        .width(148.0)
+                        .selected_text(t(language, state.inbox_filter.label()))
+                        .show_ui(ui, |ui| {
+                            for choice in [
+                                InboxFilter::All,
+                                InboxFilter::Unread,
+                                InboxFilter::Incomplete,
+                            ] {
+                                let response = ui.selectable_value(
+                                    &mut state.inbox_filter,
+                                    choice,
+                                    t(language, choice.label()),
+                                );
+                                #[cfg(test)]
+                                ui.data_mut(|data| {
+                                    data.insert_temp(
+                                        egui::Id::new(("sms-filter-choice", choice as u8)),
+                                        response.rect,
+                                    );
+                                });
+                                let _ = response;
+                            }
+                        })
+                        .response;
+                    #[cfg(test)]
+                    ui.data_mut(|data| {
+                        data.insert_temp(egui::Id::new("sms-filter-rect"), response.rect)
+                    });
+                    let _ = response;
+                } else {
+                    #[cfg(test)]
+                    ui.data_mut(|data| data.remove::<egui::Rect>(egui::Id::new("sms-filter-rect")));
+                }
+            });
             ui.add_space(8.0);
-            let query = state.search.trim().to_lowercase();
-            let rows: Vec<_> = vm
-                .rows
-                .iter()
-                .filter(|row| {
-                    (row.direction == SmsDirection::Outgoing) == state.outgoing
-                        && (query.is_empty()
-                            || row.sender_full.to_lowercase().contains(&query)
-                            || row.body.to_lowercase().contains(&query))
-                })
-                .collect();
-            if state
-                .selected
-                .is_some_and(|key| !rows.iter().any(|r| r.stable_id == key))
-            {
-                state.selected = None;
-            }
+            render_search(ui, language, state);
+            ui.add_space(10.0);
+            let rows = filtered_rows(&vm.rows, state);
+            clear_hidden_selection(&rows, state);
             // Everything the frame has left, minus the footer note, is the workspace. One
             // subtraction, from the container's real height — no screen-coordinate estimate and
             // no fixed cap, so a taller window really does show more messages.
@@ -950,18 +1108,9 @@ fn list_panel(
     sink: &dyn UiCommandSink,
     state: &mut SmsComposeState,
 ) {
-    // The search field is part of the list column, so the list gets the column's leftover height
-    // directly instead of receiving "height - 88 - 48" from the caller.
-    let column_height = ui.available_height();
-    ui.add(
-        egui::TextEdit::singleline(&mut state.search)
-            .hint_text(t(language, crate::localization::TextKey::SmsSearchHint))
-            .desired_width(f32::INFINITY)
-            .margin(egui::vec2(12.0, 10.0)),
-    );
-    ui.add_space(10.0);
-    let search_consumed = (column_height - ui.available_height()).max(0.0);
-    let viewport = sms_layout::list_viewport_height(column_height, search_consumed);
+    // The shared search row has already consumed its height, including in the narrow reader.
+    // Give the list the actual remaining space, with no second search-height subtraction.
+    let viewport = sms_layout::list_viewport_height(ui.available_height(), 0.0);
     ui.data_mut(|data| {
         data.insert_temp(list_viewport_id(), viewport);
     });
@@ -970,6 +1119,11 @@ fn list_panel(
             (
                 t(language, crate::localization::TextKey::SmsEmptySearch),
                 t(language, crate::localization::TextKey::SmsEmptySearchHint),
+            )
+        } else if !state.outgoing && state.inbox_filter != InboxFilter::All {
+            (
+                t(language, TextKey::SmsEmptyFilter),
+                t(language, TextKey::SmsEmptyFilterHint),
             )
         } else if state.outgoing {
             (
@@ -998,7 +1152,11 @@ fn list_panel(
             }
         };
         empty_panel(ui, &title, &note, viewport);
-        if !state.outgoing && state.search.is_empty() && !snapshot.sms_refresh_pending {
+        if !state.outgoing
+            && state.inbox_filter == InboxFilter::All
+            && state.search.is_empty()
+            && !snapshot.sms_refresh_pending
+        {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 refresh_button(
@@ -1591,6 +1749,7 @@ mod tests {
                 status: FeatureStatus::Supported,
                 has_incomplete: true,
                 evicted: 0,
+                ..Default::default()
             }),
             &[],
             Language::ZhCn,
@@ -1812,6 +1971,7 @@ mod tests {
             status: FeatureStatus::Supported,
             has_incomplete: true,
             evicted: 0,
+            ..Default::default()
         });
         let sink = NoopSink;
         let _ = context.run(
@@ -1854,6 +2014,7 @@ mod tests {
             status: FeatureStatus::Supported,
             has_incomplete: true,
             evicted: 2,
+            ..Default::default()
         });
         let messages = vec![
             message(1, Some(true), SmsStatus::Incomplete),
@@ -2051,6 +2212,403 @@ mod tests {
         }
     }
 
+    fn filter_fixture(language: Language) -> (ControllerSnapshot, SmsVm) {
+        let snapshot = snapshot(SmsInboxSummary {
+            status: FeatureStatus::Supported,
+            message_count: 3,
+            unread_count: 1,
+            has_incomplete: true,
+            ..Default::default()
+        });
+        let vm = sms_vm(
+            &snapshot,
+            &[
+                message(1, Some(false), SmsStatus::Received),
+                message(2, Some(true), SmsStatus::Incomplete),
+                message(3, None, SmsStatus::Received),
+                outgoing_message(SmsStatus::Submitted),
+            ],
+            language,
+        );
+        (snapshot, vm)
+    }
+
+    #[derive(Default)]
+    struct LocalViewSink(std::sync::Mutex<Vec<UiCommand>>);
+    impl UiCommandSink for LocalViewSink {
+        fn try_send(&self, command: UiCommand) -> Result<(), dji4g_application::UiSendError> {
+            self.0.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+
+    fn inbox_frame(
+        ctx: &egui::Context,
+        width: f32,
+        language: Language,
+        state: &mut SmsComposeState,
+        sink: &LocalViewSink,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let (snapshot, vm) = filter_fixture(language);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_inbox(ui, &vm, &snapshot, language, sink, state);
+                });
+            },
+        )
+    }
+
+    fn pointer_event(rect: egui::Rect, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(rect.center()),
+            egui::Event::PointerButton {
+                pos: rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn inbox_filters_intersect_search_and_ignore_unknown_read_state_and_outgoing_records() {
+        let (_, vm) = filter_fixture(Language::ZhCn);
+        let mut state = SmsComposeState::default();
+        assert_eq!(filtered_rows(&vm.rows, &state).len(), 3);
+        state.inbox_filter = InboxFilter::Unread;
+        let unread = filtered_rows(&vm.rows, &state);
+        assert_eq!(unread.iter().map(|row| row.index).collect::<Vec<_>>(), [1]);
+        assert_eq!(unread[0].unread, Some(true));
+        state.search = "  SENSITIVE  ".into();
+        assert_eq!(filtered_rows(&vm.rows, &state).len(), 1);
+        state.inbox_filter = InboxFilter::Incomplete;
+        assert_eq!(filtered_rows(&vm.rows, &state)[0].index, 2);
+        state.search = "sent".into();
+        assert!(filtered_rows(&vm.rows, &state).is_empty());
+        state.outgoing = true;
+        let outgoing = filtered_rows(&vm.rows, &state);
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].direction, SmsDirection::Outgoing);
+        state.selected = Some(outgoing[0].stable_id);
+        state.search = "not present".into();
+        clear_hidden_selection(&filtered_rows(&vm.rows, &state), &mut state);
+        assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn filter_and_clear_search_controls_fit_narrow_and_wide_readers_in_every_language() {
+        for width in [320.0, 552.0, 1100.0] {
+            for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+                for outgoing in [false, true] {
+                    let ctx = egui::Context::default();
+                    crate::ui::initialize_visuals(&ctx);
+                    let (_, vm) = filter_fixture(language);
+                    let mut state = SmsComposeState::default();
+                    state.outgoing = outgoing;
+                    state.inbox_filter = InboxFilter::Incomplete;
+                    state.selected = vm
+                        .rows
+                        .iter()
+                        .find(|row| {
+                            (row.direction == SmsDirection::Outgoing) == outgoing
+                                && (outgoing || row.status == SmsStatus::Incomplete)
+                        })
+                        .map(|row| row.stable_id);
+                    let sink = LocalViewSink::default();
+                    for _ in 0..2 {
+                        let _ = inbox_frame(&ctx, width, language, &mut state, &sink, vec![]);
+                    }
+                    for id in ["sms-search-rect", "sms-clear-search-rect"] {
+                        let rect = ctx
+                            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(id)))
+                            .expect(id);
+                        assert!(
+                            rect.width() > 0.0 && rect.left() >= 0.0 && rect.right() <= width + 0.5,
+                            "{id} exceeds {width}px in {language:?}: {rect:?}"
+                        );
+                        assert!(rect.bottom() <= 600.0);
+                    }
+                    let filter = ctx
+                        .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("sms-filter-rect")));
+                    if outgoing {
+                        assert!(filter.is_none());
+                    } else {
+                        let rect =
+                            filter.expect("inbox filter remains accessible above a narrow reader");
+                        assert!(
+                            rect.left() >= 0.0
+                                && rect.right() <= width + 0.5
+                                && rect.bottom() <= 600.0
+                        );
+                    }
+                    assert!(sink.0.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_complete_sms_page_keeps_new_controls_inside_the_minimum_content_width() {
+        for width in [552.0, 1100.0] {
+            for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+                let (snapshot, _) = filter_fixture(language);
+                let messages = display_messages(&[
+                    message(1, Some(false), SmsStatus::Received),
+                    message(2, Some(true), SmsStatus::Incomplete),
+                    outgoing_message(SmsStatus::Submitted),
+                ]);
+                let ctx = egui::Context::default();
+                crate::ui::initialize_visuals(&ctx);
+                let mut state = SmsComposeState::default();
+                state.inbox_filter = InboxFilter::Incomplete;
+                let sink = LocalViewSink::default();
+                for _ in 0..2 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 900.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                render(ui, &snapshot, &messages, language, &sink, &mut state);
+                                assert!(
+                                    ui.min_rect().right() <= width + 0.5,
+                                    "SMS page exceeds {width}px in {language:?}: {:?}",
+                                    ui.min_rect()
+                                );
+                            });
+                        },
+                    );
+                }
+                assert!(sink.0.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn choosing_an_inbox_filter_clears_hidden_detail_and_never_dispatches_a_device_command() {
+        for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+            let ctx = egui::Context::default();
+            crate::ui::initialize_visuals(&ctx);
+            let (_, vm) = filter_fixture(language);
+            let mut state = SmsComposeState::default();
+            state.selected = Some(vm.rows[1].stable_id);
+            let sink = LocalViewSink::default();
+            for _ in 0..2 {
+                let _ = inbox_frame(&ctx, 552.0, language, &mut state, &sink, vec![]);
+            }
+            let combo = ctx
+                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("sms-filter-rect")))
+                .unwrap();
+            for pressed in [true, false] {
+                let _ = inbox_frame(
+                    &ctx,
+                    552.0,
+                    language,
+                    &mut state,
+                    &sink,
+                    pointer_event(combo, pressed),
+                );
+            }
+            let _ = inbox_frame(&ctx, 552.0, language, &mut state, &sink, vec![]);
+            let unread = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new((
+                        "sms-filter-choice",
+                        InboxFilter::Unread as u8,
+                    )))
+                })
+                .expect("filter popup is open");
+            for pressed in [true, false] {
+                let _ = inbox_frame(
+                    &ctx,
+                    552.0,
+                    language,
+                    &mut state,
+                    &sink,
+                    pointer_event(unread, pressed),
+                );
+            }
+            assert_eq!(state.inbox_filter, InboxFilter::Unread);
+            assert!(state.selected.is_none());
+            assert!(sink.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn search_clear_button_and_shortcuts_update_the_view_without_stealing_decision_keys() {
+        let language = Language::EnUs;
+        let ctx = egui::Context::default();
+        crate::ui::initialize_visuals(&ctx);
+        let mut state = SmsComposeState::default();
+        state.search = "absent".into();
+        let sink = LocalViewSink::default();
+        let interaction = || {
+            ctx.data(|data| {
+                data.get_temp::<(egui::Id, egui::Rect, egui::Rect, bool, bool, bool)>(
+                    egui::Id::new("sms-clear-search-interaction"),
+                )
+            })
+            .unwrap()
+        };
+        let mut click_evidence = Vec::new();
+        for _ in 0..2 {
+            let _ = inbox_frame(&ctx, 552.0, language, &mut state, &sink, vec![]);
+            click_evidence.push(interaction());
+        }
+        let clear = ctx
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("sms-clear-search-rect")))
+            .unwrap();
+        for pressed in [true, false] {
+            let _ = inbox_frame(
+                &ctx,
+                552.0,
+                language,
+                &mut state,
+                &sink,
+                pointer_event(clear, pressed),
+            );
+            click_evidence.push(interaction());
+        }
+        assert!(
+            state.search.is_empty(),
+            "clear target {clear:?}; frames (id, interaction rect, clip, hover, down, click): {click_evidence:?}"
+        );
+        let key = |key, modifiers| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]
+        };
+        ctx.memory_mut(|memory| memory.surrender_focus(search_id()));
+        let _ = inbox_frame(
+            &ctx,
+            552.0,
+            language,
+            &mut state,
+            &sink,
+            key(egui::Key::F, egui::Modifiers::CTRL),
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(search_id())));
+        state.search = "text".into();
+        let _ = inbox_frame(
+            &ctx,
+            552.0,
+            language,
+            &mut state,
+            &sink,
+            key(egui::Key::Escape, egui::Modifiers::NONE),
+        );
+        assert!(state.search.is_empty());
+        assert!(
+            ctx.memory(|memory| memory.has_focus(search_id())),
+            "Esc clearing preserves focus for the next search"
+        );
+        let (_, vm) = filter_fixture(language);
+        state.selected = Some(vm.rows[0].stable_id);
+        let _ = inbox_frame(
+            &ctx,
+            552.0,
+            language,
+            &mut state,
+            &sink,
+            vec![egui::Event::Text("absent".into())],
+        );
+        assert_eq!(state.search, "absent");
+        assert!(
+            state.selected.is_none(),
+            "typing must clear a hidden reader in the same frame"
+        );
+        state.search = "keep".into();
+        state.selected = Some([9; 32]);
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("sms-row-delete-armed", [9u8; 32])),
+                Instant::now(),
+            )
+        });
+        let _ = inbox_frame(
+            &ctx,
+            552.0,
+            language,
+            &mut state,
+            &sink,
+            key(egui::Key::Escape, egui::Modifiers::NONE),
+        );
+        assert_eq!(state.search, "keep");
+        state.open = true;
+        ctx.memory_mut(|memory| memory.surrender_focus(search_id()));
+        let _ = inbox_frame(
+            &ctx,
+            552.0,
+            language,
+            &mut state,
+            &sink,
+            key(egui::Key::F, egui::Modifiers::CTRL),
+        );
+        assert!(!ctx.memory(|memory| memory.has_focus(search_id())));
+        assert_eq!(state.search, "keep");
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_local_filter_explains_the_filter_without_claiming_the_module_inbox_is_empty() {
+        for language in [Language::ZhCn, Language::ZhTw, Language::EnUs] {
+            let (snapshot, mut vm) = filter_fixture(language);
+            vm.rows.retain(|row| row.unread != Some(true));
+            let mut state = SmsComposeState::default();
+            state.inbox_filter = InboxFilter::Unread;
+            let sink = LocalViewSink::default();
+            let ctx = egui::Context::default();
+            crate::ui::initialize_visuals(&ctx);
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(552.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render_inbox(ui, &vm, &snapshot, language, &sink, &mut state);
+                    });
+                },
+            );
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some(text.galley.text())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(texts.contains(&t(language, TextKey::SmsEmptyFilter).as_str()));
+            assert!(!texts.contains(&t(language, TextKey::SmsInboxEmpty).as_str()));
+            assert!(!texts.contains(&t(language, TextKey::SmsRefreshMessages).as_str()));
+            assert!(sink.0.lock().unwrap().is_empty());
+        }
+    }
+
     /// Render the page into a window of `width` x `height` logical points and report the heights
     /// the workspace and the message list really received. Two passes are run so the values from
     /// the first frame (used by egui to size scroll areas) are settled by the second.
@@ -2062,6 +2620,7 @@ mod tests {
             status: FeatureStatus::Supported,
             has_incomplete: true,
             evicted: 0,
+            ..Default::default()
         });
         snapshot.sms_read_report = Some(dji4g_domain::SmsReadReport {
             raw_records: 23,

@@ -340,6 +340,7 @@ pub struct Controller {
     sms_read_in_flight: bool,
     sms_read_control: Option<dji4g_domain::SmsReadControl>,
     sms_read_report: Option<(DeviceEpoch, u64, dji4g_domain::SmsReadReport)>,
+    sms_last_sync: Option<(DeviceEpoch, u64, dji4g_domain::SmsStorageId, SystemTime)>,
     sms_inbox_failure: Option<(DeviceEpoch, u64, crate::PortError)>,
     next_sms_request_id: u64,
     sms_send_context: Option<(DeviceEpoch, u64)>,
@@ -385,6 +386,7 @@ impl Controller {
             sms_read_in_flight: false,
             sms_read_control: None,
             sms_read_report: None,
+            sms_last_sync: None,
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
@@ -429,6 +431,7 @@ impl Controller {
             sms_read_in_flight: false,
             sms_read_control: None,
             sms_read_report: None,
+            sms_last_sync: None,
             sms_inbox_failure: None,
             next_sms_request_id: 1,
             sms_send_context: None,
@@ -472,6 +475,14 @@ impl Controller {
                 *epoch == self.state.epoch() && *sim == self.state.sim_epoch()
             })
             .map(|(_, _, report)| report.clone());
+        if let Some((_, _, storage, at)) =
+            self.sms_last_sync.as_ref().filter(|(epoch, sim, _, _)| {
+                *epoch == self.state.epoch() && *sim == self.state.sim_epoch()
+            })
+        {
+            snapshot.sms_inbox.last_synced_at = Some(*at);
+            snapshot.sms_inbox.last_synced_storage = Some(storage.clone());
+        }
         snapshot.sms_delete = self.sms_delete.clone();
         snapshot.serial_work_busy = self.serial_work_busy();
         snapshot.sms_inbox_failure = self
@@ -1665,6 +1676,15 @@ impl Controller {
         );
         let check_event = event.clone();
         self.state = crate::reduce_state(&self.state, event, now);
+        if self
+            .sms_last_sync
+            .as_ref()
+            .is_some_and(|(epoch, sim, _, _)| {
+                *epoch != self.state.epoch() || *sim != self.state.sim_epoch()
+            })
+        {
+            self.sms_last_sync = None;
+        }
         if self.tool_context() != tool_context_before {
             self.invalidate_tool_context();
         }
@@ -1707,6 +1727,37 @@ impl Controller {
             message.sim_epoch = self.state.sim_epoch();
         }
         self.state.reconcile_sms_listed_slots(&listed);
+    }
+
+    /// Apply a successful listing's authoritative holder inventory and freshness evidence.
+    /// The runner has already checked cancellation and device/SIM continuity before this call.
+    /// Returns the complete-inventory proof to publish with the report; partial lists return false.
+    pub fn reconcile_sms_complete_listing(
+        &mut self,
+        listed: &[SmsMessage],
+        report: &dji4g_domain::SmsReadReport,
+    ) -> bool {
+        let mut listed = listed.to_vec();
+        let epoch = self.state.epoch();
+        let sim_epoch = self.state.sim_epoch();
+        for message in &mut listed {
+            message.sim_epoch = sim_epoch;
+        }
+        if !crate::SmsStore::is_complete_listing(&listed, report, epoch.0, sim_epoch) {
+            // A partial/legacy listing still proves the payloads of the slots it actually
+            // returned. Reconcile only those observed slots, never infer missing-slot deletion.
+            self.state.reconcile_sms_listed_slots(&listed);
+            return false;
+        }
+        self.state.reconcile_sms_complete_listing(&listed, report);
+        self.sms_last_sync = Some((
+            epoch,
+            sim_epoch,
+            report.storage.clone().expect("confirmed holder"),
+            self.clock.system_now(),
+        ));
+        self.state.publish_only_change();
+        true
     }
 
     pub fn ingest_sms(&mut self, mut message: SmsMessage) -> bool {
@@ -1925,6 +1976,7 @@ impl Controller {
             self.clock.system_now(),
         );
         if self.state.epoch() != before_epoch {
+            self.sms_last_sync = None;
             if let Some(check) = self.module_network_check.as_mut() {
                 check.invalidate();
             }

@@ -242,6 +242,7 @@ fn exported_sms_section_is_counts_only_and_never_carries_message_content() {
         status: FeatureStatus::Supported,
         has_incomplete: true,
         evicted: 0,
+        ..Default::default()
     };
 
     write_export(&paths.exports_dir, &snapshot, now).expect("export writes");

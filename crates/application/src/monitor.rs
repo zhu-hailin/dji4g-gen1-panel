@@ -1086,10 +1086,12 @@ impl ControllerRunner {
                 messages,
                 capacity,
                 status,
-                report,
+                mut report,
             } => {
+                report.complete = self
+                    .controller
+                    .reconcile_sms_complete_listing(&messages, &report);
                 self.controller.set_sms_read_report(report);
-                self.controller.reconcile_sms_listed_slots(&messages);
                 for message in messages {
                     self.controller.ingest_sms(message);
                 }

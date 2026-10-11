@@ -754,6 +754,19 @@ fn a_sim_change_clears_the_sms_store() {
     controller.ingest_sms(message(1, "x"));
     assert_eq!(controller.snapshot().sms_inbox.message_count, 1);
 
+    controller.reconcile_sms_complete_listing(
+        &[message(1, "x")],
+        &dji4g_domain::SmsReadReport {
+            storage: Some(storage()),
+            capacity: Some((1, 30)),
+            raw_records: 1,
+            decoded_records: 1,
+            supported_storages: vec![storage()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(controller.snapshot().sms_inbox.last_synced_at, Some(NOW));
+
     controller.apply_backend_event(at_finished(
         2,
         epoch,
@@ -765,6 +778,8 @@ fn a_sim_change_clears_the_sms_store() {
         )),
     ));
     assert_eq!(controller.snapshot().sms_inbox.message_count, 0);
+    assert_eq!(controller.snapshot().sms_inbox.last_synced_at, None);
+    assert_eq!(controller.snapshot().sms_inbox.last_synced_storage, None);
 }
 
 #[test]

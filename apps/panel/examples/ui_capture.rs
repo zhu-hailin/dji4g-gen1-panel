@@ -170,6 +170,7 @@ mod capture {
     /// The page list for each mode. `pages` walks the whole navigation strip.
     fn screens(mode: &str) -> Vec<Screen> {
         match mode {
+            "ux-review" => vec![Screen::Diagnostics, Screen::Settings],
             "onboarding-absent"
             | "onboarding-healthy"
             | "onboarding-missing-port"
@@ -179,6 +180,7 @@ mod capture {
             | "driver-restart-required"
             | "driver-unsupported" => vec![Screen::Overview],
             "history-reading"
+            | "balance-query"
             | "history-counts"
             | "history-storage-confirm"
             | "archive-disabled"
@@ -527,6 +529,9 @@ mod capture {
             if self.mode == "sms-queue-error" {
                 self.app.set_review_sms_queue_error();
             }
+            if self.mode == "balance-query" && self.ticks == 0 {
+                self.app.set_review_sms_balance_query();
+            }
             // Only initialize services once: archive fixtures must never read real user data
             // or create a fresh worker on every render frame.
             if self.ticks == 0 {
@@ -692,6 +697,7 @@ mod capture {
             status: FeatureStatus::Supported,
             has_incomplete: true,
             evicted: 2,
+            ..Default::default()
         };
         (messages, summary)
     }
@@ -1469,8 +1475,10 @@ mod capture {
             status: FeatureStatus::Supported,
             has_incomplete: false,
             evicted: 0,
+            ..Default::default()
         };
         snapshot.sms_read_report = Some(SmsReadReport {
+            complete: mode != "history-reading",
             storage: Some(SmsStorageId("SM".into())),
             capacity: snapshot.sms_inbox.capacity,
             raw_records: count as usize,
@@ -1480,6 +1488,9 @@ mod capture {
             restoration: SmsStorageRestoration::NotNeeded,
         });
         let reading = mode == "history-reading";
+        snapshot.sms_inbox.last_synced_at =
+            Some(SystemTime::now() - Duration::from_secs(if reading { 90 } else { 2 }));
+        snapshot.sms_inbox.last_synced_storage = Some(SmsStorageId("SM".into()));
         snapshot.sms_refresh_pending = reading;
         snapshot.serial_work_busy = reading;
         snapshot.sms_read_phase = Some(if reading {
@@ -1638,6 +1649,9 @@ mod capture {
             }
             if mode == "sms-queue-error" {
                 app.set_review_sms_queue_error();
+            }
+            if mode == "balance-query" {
+                app.set_review_sms_balance_query();
             }
             if mode == "history-storage-confirm" {
                 app.set_review_sms_storage_confirmation(dji4g_domain::SmsStorageId("ME".into()));

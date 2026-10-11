@@ -36,6 +36,8 @@ pub mod repairs;
 pub mod settings;
 pub mod sms;
 pub(crate) mod sms_archive;
+pub(crate) mod sms_balance;
+pub(crate) mod sms_freshness;
 pub(crate) mod sms_layout;
 pub(crate) mod wireless;
 

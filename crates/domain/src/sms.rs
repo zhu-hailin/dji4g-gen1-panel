@@ -393,4 +393,11 @@ pub struct SmsInboxSummary {
     /// exist); non-zero means the local view is incomplete and the UI must say so.
     #[serde(default)]
     pub evicted: u32,
+    /// Time a complete successful module listing was applied to the current device/SIM store.
+    /// Failed, cancelled and partial reads never advance this evidence.
+    #[serde(default)]
+    pub last_synced_at: Option<std::time::SystemTime>,
+    /// Exact holder of that listing. SM, ME and MT are independent reported index spaces.
+    #[serde(default)]
+    pub last_synced_storage: Option<SmsStorageId>,
 }

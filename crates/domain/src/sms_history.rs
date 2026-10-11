@@ -54,6 +54,10 @@ pub enum SmsStorageRestoration {
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SmsReadReport {
+    /// Runner-derived proof that the whole confirmed holder inventory was applied. Port reports
+    /// cannot assert this: the runner overwrites it after checking context and decoded records.
+    #[serde(default)]
+    pub complete: bool,
     pub storage: Option<SmsStorageId>,
     pub capacity: Option<(u32, u32)>,
     pub raw_records: usize,

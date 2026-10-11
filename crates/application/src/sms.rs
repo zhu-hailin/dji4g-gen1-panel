@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use dji4g_domain::{
     FeatureStatus, SmsConcatReference, SmsDirection, SmsDisplayMessage, SmsFragmentKey,
-    SmsInboxSummary, SmsMessage, SmsMultipartInfo, SmsStatus, SmsStorageId,
+    SmsInboxSummary, SmsMessage, SmsMultipartInfo, SmsReadReport, SmsStatus, SmsStorageId,
+    SmsStorageRestoration,
 };
 
 /// Identity of one long message: fragments belong together only when the SIM session, the device
@@ -88,28 +89,32 @@ impl SmsStore {
         true
     }
 
-    /// Reconcile slot reuse using one complete, successful listing before ingesting that batch.
+    /// Reconcile slot reuse using one successful listing before ingesting that batch.
     /// The caller must stamp the listing with the current device/SIM context first. Only slots
     /// explicitly represented by incoming records are authoritative: an empty or partial decoded
     /// list cannot identify the queried holder or prove that unlisted slots were deleted.
     /// All conflicting payloads reported in this same batch remain evidence, so this cannot turn
-    /// an ambiguous listing into a deletable row. Exact identities retain their existing read state.
+    /// an ambiguous listing into a deletable row. Exact identities only advance to confirmed read;
+    /// an unread or unknown observation never regresses read evidence.
     pub fn reconcile_listed_slots(&mut self, listed: &[SmsMessage]) -> bool {
         type Slot = (u64, u64, SmsStorageId, u32);
         let mut observed: HashMap<Slot, HashSet<[u8; 32]>> = HashMap::new();
+        let mut observed_read = HashSet::new();
         for message in listed {
             if message.direction != SmsDirection::Incoming || message.storage.0.trim().is_empty() {
                 continue;
             }
-            observed
-                .entry((
-                    message.device_epoch,
-                    message.sim_epoch,
-                    message.storage.clone(),
-                    message.index,
-                ))
-                .or_default()
-                .insert(message.payload_fingerprint());
+            let slot = (
+                message.device_epoch,
+                message.sim_epoch,
+                message.storage.clone(),
+                message.index,
+            );
+            let payload = message.payload_fingerprint();
+            if message.read == Some(true) {
+                observed_read.insert((slot.clone(), payload));
+            }
+            observed.entry(slot).or_default().insert(payload);
         }
         let before = self.messages.len();
         self.messages.retain(|message| {
@@ -123,11 +128,120 @@ impl SmsStore {
                     ))
                     .is_none_or(|payloads| payloads.contains(&message.payload_fingerprint()))
         });
-        if self.messages.len() == before {
+        let removed = self.messages.len() != before;
+        if removed {
+            self.rebuild_digests();
+        }
+        let mut read_changed = false;
+        for message in &mut self.messages {
+            if message.direction == SmsDirection::Incoming
+                && message.read != Some(true)
+                && observed_read.contains(&(
+                    (
+                        message.device_epoch,
+                        message.sim_epoch,
+                        message.storage.clone(),
+                        message.index,
+                    ),
+                    message.payload_fingerprint(),
+                ))
+            {
+                message.read = Some(true);
+                read_changed = true;
+            }
+        }
+        removed || read_changed
+    }
+
+    /// Whether a successful, decoded list proves the complete inventory of one confirmed holder.
+    /// Counts must agree with the module's capacity read; missing, skipped, mixed-context or
+    /// duplicate-slot records do not authorize deletion of cached evidence. The caller must only
+    /// use a terminal successful read here, after checking its cancellation and context guards.
+    #[must_use]
+    pub fn is_complete_listing(
+        listed: &[SmsMessage],
+        report: &SmsReadReport,
+        device_epoch: u64,
+        sim_epoch: u64,
+    ) -> bool {
+        let (Some(storage), Some((used, total))) = (&report.storage, report.capacity) else {
+            return false;
+        };
+        if storage.0.is_empty()
+            || !storage.0.bytes().all(|byte| byte.is_ascii_uppercase())
+            || !report.supported_storages.contains(storage)
+            || report.restoration == SmsStorageRestoration::Unknown
+            || report.skipped_records != 0
+            || report.raw_records != report.decoded_records
+            || report.decoded_records != listed.len()
+            || report.raw_records > MAX_STORED
+            || usize::try_from(used).ok() != Some(report.raw_records)
+            || used > total
+        {
             return false;
         }
-        self.rebuild_digests();
-        true
+        let mut indices = HashSet::new();
+        listed.iter().all(|message| {
+            message.direction == SmsDirection::Incoming
+                && message.storage == *storage
+                && message.device_epoch == device_epoch
+                && message.sim_epoch == sim_epoch
+                && indices.insert(message.index)
+        })
+    }
+
+    /// Reconcile the exact holder of a complete, successful inventory. An empty confirmed holder
+    /// removes its cached incoming records; other holders, device/SIM contexts and outgoing
+    /// records remain untouched. MT is its own reported index space, never inferred as SM or ME.
+    /// Returns whether cached evidence changed; ingestion remains the caller's next step.
+    pub fn reconcile_complete_listing(
+        &mut self,
+        listed: &[SmsMessage],
+        report: &SmsReadReport,
+        device_epoch: u64,
+        sim_epoch: u64,
+    ) -> bool {
+        if !Self::is_complete_listing(listed, report, device_epoch, sim_epoch) {
+            return false;
+        }
+        let storage = report.storage.as_ref().expect("confirmed listing holder");
+        let observed: HashSet<_> = listed
+            .iter()
+            .map(|message| (message.index, message.payload_fingerprint()))
+            .collect();
+        let observed_read: HashSet<_> = listed
+            .iter()
+            .filter(|message| message.read == Some(true))
+            .map(|message| (message.index, message.payload_fingerprint()))
+            .collect();
+        let before = self.messages.len();
+        self.messages.retain(|message| {
+            message.direction != SmsDirection::Incoming
+                || message.device_epoch != device_epoch
+                || message.sim_epoch != sim_epoch
+                || message.storage != *storage
+                || observed.contains(&(message.index, message.payload_fingerprint()))
+        });
+        let removed = self.messages.len() != before;
+        if removed {
+            self.rebuild_digests();
+        }
+        let mut read_changed = false;
+        for message in &mut self.messages {
+            if message.direction == SmsDirection::Incoming
+                && message.device_epoch == device_epoch
+                && message.sim_epoch == sim_epoch
+                && message.storage == *storage
+                && message.read != Some(true)
+                && observed_read.contains(&(message.index, message.payload_fingerprint()))
+            {
+                // Listing may itself change read state. Confirmed read evidence advances only;
+                // a later unread/unknown report never regresses a read the user already saw.
+                message.read = Some(true);
+                read_changed = true;
+            }
+        }
+        removed || read_changed
     }
 
     /// Mark the message with this `(index, storage)` as read. Returns whether a stored message
@@ -315,6 +429,8 @@ impl SmsStore {
             status,
             has_incomplete,
             evicted: self.evicted,
+            last_synced_at: None,
+            last_synced_storage: None,
         }
     }
 

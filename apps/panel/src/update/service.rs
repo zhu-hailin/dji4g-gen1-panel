@@ -6,6 +6,16 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// The last check outcome is separate from download/install state, so a failed check
+/// can never be presented as proof that the installed version is current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateCheckStatus {
+    NotChecked,
+    Checking,
+    UpToDate,
+    Available,
+    Failed,
+}
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub enum UpdateState {
     #[default]
@@ -41,6 +51,7 @@ pub struct UpdateService {
     sender: Option<SyncSender<Event>>,
     last_check: Option<Instant>,
     check_in_flight: bool,
+    last_check_result: Option<Result<(), UpdateError>>,
     check_task: Option<worker::CheckTask>,
     handoff: bool,
     updater: Option<std::process::Child>,
@@ -48,6 +59,35 @@ pub struct UpdateService {
 impl UpdateService {
     pub fn state(&self) -> &UpdateState {
         &self.state
+    }
+    pub fn check_status(&self) -> UpdateCheckStatus {
+        if self.check_in_flight {
+            UpdateCheckStatus::Checking
+        } else {
+            match self.last_check_result {
+                None => UpdateCheckStatus::NotChecked,
+                Some(Err(_)) => UpdateCheckStatus::Failed,
+                Some(Ok(())) if self.candidate.is_some() => UpdateCheckStatus::Available,
+                Some(Ok(())) => UpdateCheckStatus::UpToDate,
+            }
+        }
+    }
+    pub fn can_check(&self) -> bool {
+        self.sender.is_some()
+            && !self.check_in_flight
+            && self.check_task.is_none()
+            && !matches!(
+                self.state,
+                UpdateState::Downloading { .. }
+                    | UpdateState::Verifying
+                    | UpdateState::Ready
+                    | UpdateState::Installing
+            )
+    }
+    /// An explicit check bypasses the periodic interval, while retaining the same
+    /// single-flight guard and background worker as startup checks.
+    pub fn request_check(&mut self, ctx: &egui::Context) -> bool {
+        self.begin_check_at(ctx, Instant::now(), worker::spawn_check)
     }
     pub fn start(&mut self, ctx: &egui::Context) {
         self.start_at(ctx, Instant::now(), worker::spawn_check);
@@ -77,28 +117,37 @@ impl UpdateService {
         now: Instant,
         spawn: impl FnOnce(SyncSender<Event>, egui::Context) -> std::io::Result<worker::CheckTask>,
     ) -> bool {
-        let Some(tx) = self.sender.clone() else {
-            return false;
-        };
-        if self.check_in_flight
-            || self.check_task.is_some()
-            || matches!(
-                self.state,
-                UpdateState::Downloading { .. }
-                    | UpdateState::Verifying
-                    | UpdateState::Ready
-                    | UpdateState::Installing
-            )
-            || self
-                .last_check
-                .is_some_and(|last| now.saturating_duration_since(last) < CHECK_INTERVAL)
+        if self
+            .last_check
+            .is_some_and(|last| now.saturating_duration_since(last) < CHECK_INTERVAL)
         {
             return false;
         }
+        self.begin_check_at(ctx, now, spawn)
+    }
+    fn begin_check_at(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+        spawn: impl FnOnce(SyncSender<Event>, egui::Context) -> std::io::Result<worker::CheckTask>,
+    ) -> bool {
+        if !self.can_check() {
+            return false;
+        }
+        let Some(tx) = self.sender.clone() else {
+            return false;
+        };
         // Record attempts, including spawn and HTTP failures, so they never retry every frame.
         self.last_check = Some(now);
         self.check_in_flight = true;
-        if self.candidate.is_none() {
+        if self.candidate.is_none()
+            && !matches!(
+                self.state,
+                UpdateState::Failed {
+                    error: UpdateError::Unsupported
+                }
+            )
+        {
             self.state = UpdateState::Checking;
         }
         match spawn(tx, ctx.clone()) {
@@ -113,9 +162,18 @@ impl UpdateService {
             return;
         }
         self.check_in_flight = false;
+        self.last_check_result = Some(result.as_ref().map(|_| ()).map_err(|error| *error));
         match result {
             Ok(candidate) => self.candidate = candidate,
             Err(error) => tracing::info!(code=%error,"Optional update check unavailable"),
+        }
+        if matches!(
+            self.state,
+            UpdateState::Failed {
+                error: UpdateError::Unsupported
+            }
+        ) {
+            return;
         }
         self.state = match &self.candidate {
             Some(candidate) => UpdateState::Available {
@@ -184,6 +242,14 @@ impl UpdateService {
         }
     }
     fn begin_download(&mut self) -> Option<(Candidate, SyncSender<Event>)> {
+        if matches!(
+            self.state,
+            UpdateState::Failed {
+                error: UpdateError::Unsupported
+            }
+        ) {
+            return None;
+        }
         if !matches!(
             self.state,
             UpdateState::Available { .. } | UpdateState::Failed { .. }

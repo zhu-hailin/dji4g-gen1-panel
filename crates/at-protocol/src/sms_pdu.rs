@@ -132,16 +132,34 @@ pub fn decode_deliver_pdu(hex: &str) -> Result<DecodedSms, SmsPduError> {
 }
 
 /// Build a single-fragment UCS-2 SMS-SUBMIT PDU (no SMSC, no validity period, no delivery
-/// report). Recipients are explicit international numbers only; the body is BMP only and must
-/// fit 140 user-data octets.
+/// report). Recipients are explicit international numbers or one of the three supported
+/// carrier customer-service short codes; the body is BMP only and must fit 140 user-data octets.
 pub fn build_ucs2_submit(recipient: &str, text: &str) -> Result<EncodedSubmit, SmsPduError> {
-    validate_sms_recipient(recipient)?;
-    let digits = &recipient[1..];
-    build_ucs2_submit_validated(digits, text)
+    let address = classify_recipient(recipient)?;
+    build_ucs2_submit_validated(address, text)
 }
 
-/// Validate an explicit international recipient without guessing or normalizing its prefix.
+/// Validate an explicit international recipient or an allowlisted carrier customer-service
+/// short code, without guessing or normalizing its prefix.
 pub fn validate_sms_recipient(recipient: &str) -> Result<(), SmsPduError> {
+    classify_recipient(recipient).map(|_| ())
+}
+
+struct RecipientAddress<'a> {
+    digits: &'a str,
+    type_of_address: u8,
+}
+
+/// Keep validation and wire encoding on the same address classification. Unknown TON follows
+/// the network dialling plan (3GPP TS 23.040 §9.1.2.5); only these exact service numbers may use
+/// it here. Other local numbers require the existing explicit international format.
+fn classify_recipient(recipient: &str) -> Result<RecipientAddress<'_>, SmsPduError> {
+    if matches!(recipient, "10086" | "10010" | "10001") {
+        return Ok(RecipientAddress {
+            digits: recipient,
+            type_of_address: 0x81, // Unknown TON, ISDN/telephone numbering plan.
+        });
+    }
     let digits = recipient.strip_prefix('+').ok_or(SmsPduError::Number)?;
     if digits.is_empty()
         || digits.len() > MAX_RECIPIENT_DIGITS
@@ -150,10 +168,16 @@ pub fn validate_sms_recipient(recipient: &str) -> Result<(), SmsPduError> {
     {
         return Err(SmsPduError::Number);
     }
-    Ok(())
+    Ok(RecipientAddress {
+        digits,
+        type_of_address: 0x91, // International TON, ISDN/telephone numbering plan.
+    })
 }
 
-fn build_ucs2_submit_validated(digits: &str, text: &str) -> Result<EncodedSubmit, SmsPduError> {
+fn build_ucs2_submit_validated(
+    address: RecipientAddress<'_>,
+    text: &str,
+) -> Result<EncodedSubmit, SmsPduError> {
     if text.is_empty() {
         return Err(SmsPduError::Range);
     }
@@ -170,11 +194,16 @@ fn build_ucs2_submit_validated(digits: &str, text: &str) -> Result<EncodedSubmit
         }
     }
 
-    // SCA length 0 / SMS-SUBMIT (no validity period) / message reference / DA / international
-    // TOA (research appendix A).
-    let digit_bytes = digits.as_bytes();
+    // SCA length 0 / SMS-SUBMIT (no validity period) / message reference / DA / classified TOA.
+    let digit_bytes = address.digits.as_bytes();
     let mut pdu = Vec::with_capacity(16 + body.len());
-    pdu.extend_from_slice(&[0x00, 0x01, 0x00, digit_bytes.len() as u8, 0x91]);
+    pdu.extend_from_slice(&[
+        0x00,
+        0x01,
+        0x00,
+        digit_bytes.len() as u8,
+        address.type_of_address,
+    ]);
     for pair in digit_bytes.chunks(2) {
         let low = pair[0] - b'0';
         let high = pair.get(1).map_or(0x0F, |value| value - b'0');
@@ -509,6 +538,9 @@ mod tests {
             "+8613800138000",
             "+1",
             "+123456789012345",
+            "10086",
+            "10010",
+            "10001",
             "10690000",
             "13800138000",
             "+0123",
@@ -557,6 +589,96 @@ mod tests {
     }
 
     #[test]
+    fn carrier_short_codes_keep_their_digits_and_use_unknown_ton() {
+        for (recipient, body, expected, expected_tpdu_octets) in [
+            ("10086", "YE", "00010005810180F600080400590045", 14),
+            (
+                "10010",
+                "CXYE",
+                "00010005810110F00008080043005800590045",
+                18,
+            ),
+            ("10001", "102", "00010005810100F1000806003100300032", 16),
+        ] {
+            assert_eq!(validate_sms_recipient(recipient), Ok(()));
+            let pdu =
+                build_ucs2_submit(recipient, body).expect("allowlisted service number builds");
+            assert_eq!(pdu.expose_for_confirmed_send(), expected);
+            assert_eq!(pdu.tpdu_octets, expected_tpdu_octets);
+            let bytes = hex_to_bytes(pdu.expose_for_confirmed_send()).unwrap();
+            assert_eq!(bytes.len(), expected_tpdu_octets + 1);
+            assert_eq!(bytes[3], 5, "DA length counts the five original digits");
+            assert_eq!(bytes[4], 0x81, "unknown TON with ISDN NPI");
+            assert_eq!(
+                decode_sender(5, bytes[4], &bytes[5..8]).unwrap(),
+                recipient,
+                "service numbers never gain an international prefix"
+            );
+            assert_eq!(&bytes[8..10], &[0x00, 0x08], "PID and UCS-2 DCS");
+            let expected_body: Vec<_> = body.encode_utf16().flat_map(u16::to_be_bytes).collect();
+            assert_eq!(usize::from(bytes[10]), expected_body.len());
+            assert_eq!(&bytes[11..], expected_body.as_slice());
+        }
+    }
+
+    #[test]
+    fn international_recipients_keep_the_existing_wire_bytes_and_ton() {
+        for (recipient, expected, expected_tpdu_octets) in [
+            (
+                "+8613800138000",
+                "0001000D91683108108300F000080400590045",
+                18,
+            ),
+            ("+10086", "00010005910180F600080400590045", 14),
+        ] {
+            let pdu = build_ucs2_submit(recipient, "YE").unwrap();
+            assert_eq!(pdu.expose_for_confirmed_send(), expected);
+            assert_eq!(pdu.tpdu_octets, expected_tpdu_octets);
+            assert_eq!(
+                hex_to_bytes(pdu.expose_for_confirmed_send()).unwrap()[4],
+                0x91,
+                "an explicit + recipient stays international"
+            );
+        }
+    }
+
+    #[test]
+    fn non_allowlisted_local_addresses_and_modified_service_numbers_are_rejected() {
+        for recipient in [
+            "10000",
+            "10002",
+            "10011",
+            "10087",
+            "95588",
+            "10690000",
+            "13800138000",
+            "8610086",
+            "010086",
+            "100860",
+            " 10086",
+            "10010 ",
+            "\t10001",
+            "10086\rAT+CMGS=1",
+            "10010\n",
+            "10001\0",
+            "10086\u{001A}",
+            "100 86",
+            "１００８６",
+        ] {
+            assert_eq!(
+                validate_sms_recipient(recipient),
+                Err(SmsPduError::Number),
+                "recipient: {recipient:?}"
+            );
+            assert_eq!(
+                build_ucs2_submit(recipient, "YE").unwrap_err(),
+                SmsPduError::Number,
+                "recipient: {recipient:?}"
+            );
+        }
+    }
+
+    #[test]
     fn build_ucs2_submit_accepts_the_exact_140_byte_limit() {
         let body = "中".repeat(70);
         let pdu = build_ucs2_submit("+12025550123", &body).expect("70 BMP chars fit");
@@ -570,15 +692,20 @@ mod tests {
 
     #[test]
     fn build_ucs2_submit_rejects_empty_body_emoji_and_oversize() {
-        assert!(build_ucs2_submit("+12025550123", "").is_err());
-        assert_eq!(
-            build_ucs2_submit("+12025550123", "😀").unwrap_err(),
-            SmsPduError::Encoding
-        );
-        assert_eq!(
-            build_ucs2_submit("+12025550123", &"中".repeat(71)).unwrap_err(),
-            SmsPduError::TooLong
-        );
+        for recipient in ["+12025550123", "10086", "10010", "10001"] {
+            assert_eq!(
+                build_ucs2_submit(recipient, "").unwrap_err(),
+                SmsPduError::Range
+            );
+            assert_eq!(
+                build_ucs2_submit(recipient, "😀").unwrap_err(),
+                SmsPduError::Encoding
+            );
+            assert_eq!(
+                build_ucs2_submit(recipient, &"中".repeat(71)).unwrap_err(),
+                SmsPduError::TooLong
+            );
+        }
     }
 
     #[test]

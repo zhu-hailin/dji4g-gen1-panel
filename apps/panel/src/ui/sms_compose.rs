@@ -25,7 +25,7 @@ struct Pending {
 
 /// Content-free result of starting a reply; existing drafts require an explicit decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ReplyStartResult {
+pub(crate) enum ReplyStartResult {
     Opened,
     ReplacementConfirmation,
     InvalidRecipient,
@@ -47,6 +47,7 @@ pub(crate) struct SmsComposeState {
     pending: Option<Pending>,
     pub outgoing: bool,
     pub search: String,
+    pub inbox_filter: super::InboxFilter,
     pub refresh_error: Option<String>,
     pub storage_confirmation: Option<(
         Option<dji4g_domain::DeviceEpoch>,
@@ -60,7 +61,7 @@ pub(crate) struct SmsComposeState {
     pub selected: Option<[u8; 32]>,
     pub serial_busy: bool,
     pub module_read_only: bool,
-    reply_recipient: Option<String>,
+    replacement_draft: Option<Draft>,
     pub error: Option<String>,
     last_send_rejected: u64,
     context: Option<(Option<dji4g_domain::DeviceEpoch>, u64)>,
@@ -90,10 +91,27 @@ impl SmsComposeState {
     }
 
     pub(super) fn begin_reply(&mut self, recipient: &str) -> ReplyStartResult {
+        self.begin_draft(Draft {
+            recipient: recipient.to_owned(),
+            body: String::new(),
+        })
+    }
+
+    /// A service template is only a draft. It takes the same replacement and send confirmations
+    /// as a reply, and never queues a device command when the menu item is selected.
+    pub(crate) fn begin_balance_query(&mut self, recipient: &str, body: &str) -> ReplyStartResult {
+        self.begin_draft(Draft {
+            recipient: recipient.to_owned(),
+            body: body.to_owned(),
+        })
+    }
+
+    fn begin_draft(&mut self, draft: Draft) -> ReplyStartResult {
         if self.module_read_only
             || self.serial_busy
             || self.pending.is_some()
             || self.confirmation.is_some()
+            || self.replacement_draft.is_some()
         {
             self.error = Some(t(
                 self.language,
@@ -101,7 +119,7 @@ impl SmsComposeState {
             ));
             return ReplyStartResult::Busy;
         }
-        if dji4g_at_protocol::validate_sms_recipient(recipient).is_err() {
+        if dji4g_at_protocol::validate_sms_recipient(&draft.recipient).is_err() {
             self.error = Some(t(
                 self.language,
                 crate::localization::TextKey::ComposeUnsupportedSender,
@@ -110,13 +128,10 @@ impl SmsComposeState {
         }
         self.error = None;
         if !self.draft.recipient.is_empty() || !self.draft.body.is_empty() {
-            self.reply_recipient = Some(recipient.to_owned());
+            self.replacement_draft = Some(draft);
             ReplyStartResult::ReplacementConfirmation
         } else {
-            self.draft = Draft {
-                recipient: recipient.to_owned(),
-                body: String::new(),
-            };
+            self.draft = draft;
             self.open = true;
             self.editor_focus = Some(EditorFocus::Body);
             ReplyStartResult::Opened
@@ -124,7 +139,7 @@ impl SmsComposeState {
     }
 
     fn resolve_reply(&mut self, replace: bool) {
-        let Some(recipient) = self.reply_recipient.take() else {
+        let Some(draft) = self.replacement_draft.take() else {
             return;
         };
         if replace
@@ -133,13 +148,18 @@ impl SmsComposeState {
             && self.pending.is_none()
             && self.confirmation.is_none()
         {
-            self.draft = Draft {
-                recipient,
-                body: String::new(),
-            };
+            self.draft = draft;
             self.open = true;
             self.editor_focus = Some(EditorFocus::Body);
         }
+    }
+
+    pub(crate) fn search_shortcuts_allowed(&self) -> bool {
+        !self.open
+            && self.confirmation.is_none()
+            && self.replacement_draft.is_none()
+            && self.storage_confirmation.is_none()
+            && self.pending.is_none()
     }
 
     #[cfg(debug_assertions)]
@@ -206,7 +226,7 @@ impl SmsComposeState {
             || self.auto_refresh_paused
             || self.open
             || self.confirmation.is_some()
-            || self.reply_recipient.is_some()
+            || self.replacement_draft.is_some()
             || self.storage_confirmation.is_some()
             || !available
             || busy
@@ -273,6 +293,11 @@ impl SmsComposeState {
         {
             return;
         }
+        if snapshot.result == Some(SmsSendResult::Submitted) && !pending.context_changed {
+            // The next idle inbox frame should read the operator's reply without waiting for the
+            // ordinary cadence. Auto-refresh still yields to an open draft and serial work.
+            self.last_refresh_attempt = None;
+        }
         if snapshot.result == Some(SmsSendResult::Submitted)
             && self.draft == pending.draft
             && !pending.context_changed
@@ -293,7 +318,7 @@ impl SmsComposeState {
         }
         if self.context.is_some_and(|old| old != context) {
             self.confirmation = None;
-            self.reply_recipient = None;
+            self.replacement_draft = None;
             self.selected = None;
             self.last_refresh_attempt = None;
             if let Some(pending) = &mut self.pending {
@@ -446,7 +471,7 @@ pub(super) fn render(
     }
     // A reply whose original draft still needs a decision takes the screen on its own: showing the
     // editor underneath a second dialog would stack two dimmed cards and two scrims.
-    if state.open && state.confirmation.is_none() && state.reply_recipient.is_none() {
+    if state.open && state.confirmation.is_none() && state.replacement_draft.is_none() {
         // The form is the only element allowed to grow, so it carries the bound: the reserve covers
         // the card's padding, its title block, the hairline and the decision row.
         let fields_max_height = (ui.ctx().screen_rect().height() - 340.0).clamp(140.0, 400.0);
@@ -641,7 +666,7 @@ pub(super) fn render(
             state.confirmation = None;
         }
     }
-    if state.reply_recipient.is_some() {
+    if state.replacement_draft.is_some() {
         let outcome = crate::ui::modal::show(
             ui.ctx(),
             &crate::ui::modal::Dialog::new(
@@ -813,6 +838,98 @@ mod tests {
         assert_eq!(state.draft.recipient, "+8613900000000");
         assert!(state.draft.body.is_empty());
     }
+
+    #[test]
+    fn balance_templates_only_prefill_and_require_explicit_draft_replacement() {
+        for (recipient, body) in [("10086", "CXYE"), ("10010", "CXYE"), ("10001", "102")] {
+            let mut empty = SmsComposeState::default();
+            assert_eq!(
+                empty.begin_balance_query(recipient, body),
+                ReplyStartResult::Opened
+            );
+            assert_eq!(empty.draft.recipient, recipient);
+            assert_eq!(empty.draft.body, body);
+            assert!(empty.confirmation.is_none() && empty.pending.is_none());
+            assert!(empty.open);
+
+            let mut state = ready();
+            state.confirmation = None;
+            let original = state.draft.clone();
+            assert_eq!(
+                state.begin_balance_query(recipient, body),
+                ReplyStartResult::ReplacementConfirmation
+            );
+            assert!(state.draft == original);
+            state.resolve_reply(false);
+            assert!(state.draft == original);
+            assert_eq!(
+                state.begin_balance_query(recipient, body),
+                ReplyStartResult::ReplacementConfirmation
+            );
+            state.resolve_reply(true);
+            assert_eq!(state.draft.recipient, recipient);
+            assert_eq!(state.draft.body, body);
+            assert!(state.confirmation.is_none() && state.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn busy_frozen_and_context_changed_balance_templates_keep_the_existing_draft() {
+        for guard in ["serial", "read only", "confirmation", "replacement"] {
+            let mut state = ready();
+            state.confirmation = None;
+            let original = state.draft.clone();
+            match guard {
+                "serial" => state.serial_busy = true,
+                "read only" => state.module_read_only = true,
+                "confirmation" => state.confirmation = Some(original.clone()),
+                _ => {
+                    state.replacement_draft = Some(Draft {
+                        recipient: "10086".into(),
+                        body: "CXYE".into(),
+                    })
+                }
+            }
+            assert_eq!(
+                state.begin_balance_query("10010", "CXYE"),
+                ReplyStartResult::Busy
+            );
+            assert!(state.draft == original);
+        }
+        let mut state = ready();
+        state.confirmation = None;
+        state.observe_context((Some(dji4g_domain::DeviceEpoch(1)), 0));
+        let original = state.draft.clone();
+        assert_eq!(
+            state.begin_balance_query("10086", "CXYE"),
+            ReplyStartResult::ReplacementConfirmation
+        );
+        state.observe_context((Some(dji4g_domain::DeviceEpoch(1)), 1));
+        state.resolve_reply(true);
+        assert!(state.draft == original);
+        assert!(state.replacement_draft.is_none());
+    }
+
+    #[test]
+    fn local_inbox_changes_and_search_guards_never_modify_a_draft() {
+        let mut state = ready();
+        let original = state.draft.clone();
+        state.search = "local query".into();
+        state.inbox_filter = super::super::InboxFilter::Unread;
+        state.outgoing = true;
+        assert!(!state.search_shortcuts_allowed());
+        state.confirmation = None;
+        assert!(state.search_shortcuts_allowed());
+        state.open_editor();
+        assert!(!state.search_shortcuts_allowed());
+        state.open = false;
+        state.storage_confirmation = Some((None, 0, dji4g_domain::SmsStorageId("SM".into())));
+        assert!(!state.search_shortcuts_allowed());
+        state.storage_confirmation = None;
+        state.begin_balance_query("10086", "CXYE");
+        assert!(!state.search_shortcuts_allowed());
+        assert!(state.draft == original);
+    }
     #[test]
     fn invalid_sender_and_busy_or_frozen_send_cannot_replace_draft() {
         let mut state = ready();
@@ -825,17 +942,17 @@ mod tests {
             state.begin_reply("BANK"),
             ReplyStartResult::InvalidRecipient
         );
-        assert!(state.reply_recipient.is_none());
+        assert!(state.replacement_draft.is_none());
         state.serial_busy = true;
         assert_eq!(state.begin_reply("+8613900000000"), ReplyStartResult::Busy);
-        assert!(state.reply_recipient.is_none());
+        assert!(state.replacement_draft.is_none());
         assert!(state.draft == original);
     }
 
     #[test]
-    fn service_and_national_numbers_are_not_normalized_into_reply_recipients() {
+    fn unrecognized_service_and_national_numbers_are_not_normalized_into_reply_recipients() {
         for recipient in [
-            "10086",
+            "1008611",
             "10690000",
             "13800138000",
             "BANK",
@@ -847,7 +964,7 @@ mod tests {
                 ReplyStartResult::InvalidRecipient
             );
             assert!(state.draft.recipient.is_empty());
-            assert!(state.reply_recipient.is_none());
+            assert!(state.replacement_draft.is_none());
             assert!(!state.open);
         }
     }
@@ -867,7 +984,7 @@ mod tests {
                 ReplyStartResult::ReplacementConfirmation
             );
             state.observe_context(next);
-            assert!(state.reply_recipient.is_none());
+            assert!(state.replacement_draft.is_none());
             state.resolve_reply(true);
             assert!(state.draft == original);
             assert!(state.confirmation.is_none());
@@ -1156,6 +1273,33 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_submission_refreshes_once_when_the_inbox_becomes_idle() {
+        struct RefreshSink(std::sync::atomic::AtomicUsize);
+        impl UiCommandSink for RefreshSink {
+            fn try_send(&self, command: UiCommand) -> Result<(), UiSendError> {
+                assert!(matches!(command, UiCommand::SmsRefresh));
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let sink = RefreshSink(std::sync::atomic::AtomicUsize::new(0));
+        let now = std::time::Instant::now();
+        let mut state = ready();
+        state.last_refresh_attempt = Some(now);
+        state.confirm(&Sink(Ok(())), None);
+        state.auto_refresh(now, true, false, false, &sink);
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        state.synchronize(Some(&done(1, SmsSendResult::Submitted)));
+        assert!(state.last_refresh_attempt.is_none());
+        state.auto_refresh(now, true, true, false, &sink);
+        state.auto_refresh(now, true, false, true, &sink);
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        state.auto_refresh(now, true, false, false, &sink);
+        state.auto_refresh(now, true, false, false, &sink);
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn automatic_refresh_waits_for_editor_and_confirmations_then_resumes_once() {
         struct RefreshSink(std::sync::atomic::AtomicUsize);
         impl UiCommandSink for RefreshSink {
@@ -1180,7 +1324,12 @@ mod tests {
             match dialog {
                 "editor" => state.open_editor(),
                 "send confirmation" => state.confirmation = Some(state.draft.clone()),
-                "replace draft" => state.reply_recipient = Some("+8613900000000".into()),
+                "replace draft" => {
+                    state.replacement_draft = Some(Draft {
+                        recipient: "+8613900000000".into(),
+                        body: String::new(),
+                    })
+                }
                 _ => {
                     state.storage_confirmation =
                         Some((None, 0, dji4g_domain::SmsStorageId("SM".into())))
@@ -1198,7 +1347,7 @@ mod tests {
 
             state.open = false;
             state.confirmation = None;
-            state.reply_recipient = None;
+            state.replacement_draft = None;
             state.storage_confirmation = None;
             state.auto_refresh(later, true, false, false, &sink);
             state.auto_refresh(later, true, false, false, &sink);

@@ -390,3 +390,98 @@ fn finished_worker_without_result_recovers_without_retry_storm() {
     assert!(!service.check_in_flight);
     assert!(!service.check_due_at(&ctx, now, |_, _| panic!("immediate retry")));
 }
+
+#[test]
+fn manual_check_bypasses_interval_but_never_duplicates_a_running_check() {
+    let ctx = egui::Context::default();
+    let now = Instant::now();
+    let mut service = UpdateService::default();
+    assert_eq!(service.check_status(), UpdateCheckStatus::NotChecked);
+    assert!(!service.can_check());
+    service.start_at(&ctx, now, completed_job);
+    assert_eq!(service.check_status(), UpdateCheckStatus::Checking);
+    finish(&mut service, Ok(None));
+    assert_eq!(service.check_status(), UpdateCheckStatus::UpToDate);
+    assert!(service.can_check());
+    assert!(!service.check_due_at(&ctx, now, |_, _| panic!("not due")));
+    assert!(service.begin_check_at(&ctx, now, completed_job));
+    assert!(!service.begin_check_at(&ctx, now, |_, _| panic!("duplicate")));
+    finish(&mut service, Ok(Some(available())));
+    assert_eq!(service.check_status(), UpdateCheckStatus::Available);
+    assert!(service.download.is_none());
+    assert!(!service.handoff_active());
+}
+
+#[test]
+fn failed_manual_check_is_distinct_from_current_and_can_retry_immediately() {
+    let ctx = egui::Context::default();
+    let now = Instant::now();
+    let mut service = UpdateService::default();
+    service.start_at(&ctx, now, completed_job);
+    finish(&mut service, Ok(None));
+    assert!(
+        service.begin_check_at(&ctx, now, |_, _| Err(std::io::Error::other(
+            "spawn refused"
+        )))
+    );
+    assert_eq!(service.check_status(), UpdateCheckStatus::Failed);
+    assert_eq!(service.state(), &UpdateState::Idle);
+    assert!(!service.check_due_at(&ctx, now, |_, _| panic!("retry storm")));
+    assert!(service.begin_check_at(&ctx, now, completed_job));
+    finish(&mut service, Ok(None));
+    assert_eq!(service.check_status(), UpdateCheckStatus::UpToDate);
+}
+
+#[test]
+fn manual_check_cannot_replace_active_download_verification_or_installation() {
+    let ctx = egui::Context::default();
+    let now = Instant::now();
+    for state in [
+        UpdateState::Downloading {
+            downloaded: 1,
+            total: 100,
+        },
+        UpdateState::Verifying,
+        UpdateState::Ready,
+        UpdateState::Installing,
+    ] {
+        let (mut service, _) = test_driver(state.clone());
+        assert!(!service.can_check());
+        assert!(!service.begin_check_at(&ctx, now, |_, _| panic!("active task")));
+        assert_eq!(service.state(), &state);
+    }
+}
+
+#[test]
+fn unsupported_directory_does_not_start_another_download_on_retry() {
+    let (mut service, _) = test_driver(UpdateState::Failed {
+        error: UpdateError::Unsupported,
+    });
+    service.candidate = Some(available());
+    assert!(service.begin_download().is_none());
+    assert!(service.download.is_none());
+    assert_eq!(
+        service.state(),
+        &UpdateState::Failed {
+            error: UpdateError::Unsupported
+        }
+    );
+}
+
+#[test]
+fn checking_again_cannot_clear_an_unsupported_installation_directory() {
+    let ctx = egui::Context::default();
+    for result in [Ok(Some(available())), Ok(None), Err(UpdateError::Network)] {
+        let unsupported = UpdateState::Failed {
+            error: UpdateError::Unsupported,
+        };
+        let (mut service, _) = test_driver(unsupported.clone());
+        service.candidate = Some(available());
+        for _ in 0..2 {
+            assert!(service.begin_check_at(&ctx, Instant::now(), completed_job));
+            finish(&mut service, result.clone());
+            assert_eq!(service.state(), &unsupported);
+            assert!(service.begin_download().is_none());
+        }
+    }
+}

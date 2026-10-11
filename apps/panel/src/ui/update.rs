@@ -1,17 +1,20 @@
 //! Optional updater entry and status view, matching the header's circular GitHub control.
 use crate::{
     localization::{Language, TextKey, format_positional, template},
-    update::{UpdateError, UpdateState},
+    update::{UpdateCheckStatus, UpdateError, UpdateState},
 };
 use eframe::egui::{self, RichText};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
+    Check,
+    Open,
     Download,
     Install,
 }
 fn status_key(state: &UpdateState) -> TextKey {
     match state {
+        UpdateState::Checking => TextKey::UpdateChecking,
         UpdateState::Downloading { .. } => TextKey::UpdateDownloading,
         UpdateState::Verifying => TextKey::UpdateVerifying,
         UpdateState::Ready => TextKey::UpdateReady,
@@ -25,6 +28,83 @@ fn status_key(state: &UpdateState) -> TextKey {
         },
         _ => TextKey::UpdateTitle,
     }
+}
+/// A permanent settings entry makes checks and their outcomes discoverable even
+/// when no update icon is present on the overview.
+pub fn settings_entry(
+    ui: &mut egui::Ui,
+    state: &UpdateState,
+    check_status: UpdateCheckStatus,
+    can_check: bool,
+    language: Language,
+) -> Action {
+    let mut action = Action::None;
+    super::section_frame(ui, |ui| {
+        ui.label(super::section_heading(template(
+            language,
+            TextKey::UpdateTitle,
+        )));
+        ui.label(super::meta_text(format_positional(
+            language,
+            TextKey::UpdateCurrentVersion,
+            &[env!("CARGO_PKG_VERSION")],
+        )));
+        let key = match check_status {
+            UpdateCheckStatus::NotChecked => TextKey::UpdateNotChecked,
+            UpdateCheckStatus::Checking => TextKey::UpdateChecking,
+            UpdateCheckStatus::UpToDate => TextKey::UpdateUpToDate,
+            UpdateCheckStatus::Failed => TextKey::UpdateCheckFailed,
+            UpdateCheckStatus::Available => TextKey::UpdateTitle,
+        };
+        if check_status != UpdateCheckStatus::Available {
+            super::wrapped_label(ui, super::meta_text(template(language, key)));
+        }
+        match state {
+            UpdateState::Available { version } => {
+                super::wrapped_label(
+                    ui,
+                    super::meta_text(format_positional(
+                        language,
+                        TextKey::UpdateAvailable,
+                        &[version],
+                    )),
+                );
+            }
+            UpdateState::Idle | UpdateState::Checking => {}
+            _ => {
+                super::wrapped_label(ui, super::meta_text(template(language, status_key(state))));
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            if super::components::action_button(
+                ui,
+                template(language, TextKey::UpdateCheckNow),
+                super::components::ButtonKind::Outlined,
+                can_check,
+                Some(template(language, TextKey::UpdateBusy)),
+            )
+            .clicked()
+            {
+                action = Action::Check;
+            }
+            if !matches!(state, UpdateState::Idle | UpdateState::Checking)
+                && super::components::action_button(
+                    ui,
+                    template(language, TextKey::UpdateView),
+                    super::components::ButtonKind::Tonal,
+                    true,
+                    None,
+                )
+                .clicked()
+            {
+                action = Action::Open;
+            }
+            if check_status == UpdateCheckStatus::Checking {
+                super::components::loading_spinner(ui);
+            }
+        });
+    });
+    action
 }
 pub fn indicator(
     ui: &mut egui::Ui,
@@ -142,7 +222,7 @@ pub fn progress_window(
                 state,
                 UpdateState::Downloading { .. } | UpdateState::Verifying | UpdateState::Installing
             ) {
-                ui.spinner();
+                super::components::loading_spinner(ui);
             }
             if matches!(state, UpdateState::Ready) {
                 ui.label(template(language, TextKey::UpdateRestartHint));
@@ -159,13 +239,14 @@ pub fn progress_window(
                     action = Action::Install;
                 }
             }
-            if matches!(
-                state,
-                UpdateState::Available { .. } | UpdateState::Failed { .. }
-            ) && ui
-                .button(template(language, TextKey::UpdateRetry))
-                .clicked()
-            {
+            let download_label = match state {
+                UpdateState::Available { .. } => Some(TextKey::UpdateDownload),
+                UpdateState::Failed { error } if *error != UpdateError::Unsupported => {
+                    Some(TextKey::UpdateRetry)
+                }
+                _ => None,
+            };
+            if download_label.is_some_and(|key| ui.button(template(language, key)).clicked()) {
                 action = Action::Download;
             }
         });

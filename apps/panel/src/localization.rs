@@ -337,6 +337,7 @@ pub enum TextKey {
     LanguageEnUs,
     SettingsAutostart,
     SettingsAutostartDescription,
+    SettingsAutostartDisabled,
     SettingsStartMinimized,
     SettingsActiveProbe,
     SettingsActiveProbeDescription,
@@ -715,6 +716,14 @@ pub enum TextKey {
     GitHubProject,
     UpdateAvailable,
     UpdateTitle,
+    UpdateCurrentVersion,
+    UpdateCheckNow,
+    UpdateChecking,
+    UpdateNotChecked,
+    UpdateUpToDate,
+    UpdateCheckFailed,
+    UpdateView,
+    UpdateDownload,
     UpdateDownloading,
     UpdateProgress,
     UpdateVerifying,
@@ -1244,6 +1253,25 @@ pub enum TextKey {
     SmsTabOutgoing,
     SmsBackToList,
     SmsFooterNote,
+    SmsFilterAll,
+    SmsFilterIncomplete,
+    SmsClearSearch,
+    SmsEmptyFilter,
+    SmsEmptyFilterHint,
+    SmsBalanceQuery,
+    SmsBalanceIntro,
+    SmsBalanceInstructions,
+    SmsBalancePortal,
+    SmsBalanceBroadnetHelp,
+    SmsBalanceReplyHint,
+    SmsLastSynced,
+    SmsSyncReadingCache,
+    SmsSyncFailedCache,
+    SmsSyncPartialCache,
+    SmsSyncPausedCache,
+    SmsSyncStaleCache,
+    SmsSyncStoredList,
+    SmsSyncNotCompleted,
     SmsSearchHint,
     SmsEmptySearch,
     SmsEmptySearchHint,
@@ -1632,6 +1660,7 @@ impl TextKey {
         Self::LanguageEnUs,
         Self::SettingsAutostart,
         Self::SettingsAutostartDescription,
+        Self::SettingsAutostartDisabled,
         Self::SettingsStartMinimized,
         Self::SettingsActiveProbe,
         Self::SettingsActiveProbeDescription,
@@ -2004,6 +2033,14 @@ impl TextKey {
         Self::GitHubProject,
         Self::UpdateAvailable,
         Self::UpdateTitle,
+        Self::UpdateCurrentVersion,
+        Self::UpdateCheckNow,
+        Self::UpdateChecking,
+        Self::UpdateNotChecked,
+        Self::UpdateUpToDate,
+        Self::UpdateCheckFailed,
+        Self::UpdateView,
+        Self::UpdateDownload,
         Self::UpdateDownloading,
         Self::UpdateProgress,
         Self::UpdateVerifying,
@@ -2533,6 +2570,25 @@ impl TextKey {
         Self::SmsTabOutgoing,
         Self::SmsBackToList,
         Self::SmsFooterNote,
+        Self::SmsFilterAll,
+        Self::SmsFilterIncomplete,
+        Self::SmsClearSearch,
+        Self::SmsEmptyFilter,
+        Self::SmsEmptyFilterHint,
+        Self::SmsBalanceQuery,
+        Self::SmsBalanceIntro,
+        Self::SmsBalanceInstructions,
+        Self::SmsBalancePortal,
+        Self::SmsBalanceBroadnetHelp,
+        Self::SmsBalanceReplyHint,
+        Self::SmsLastSynced,
+        Self::SmsSyncReadingCache,
+        Self::SmsSyncFailedCache,
+        Self::SmsSyncPartialCache,
+        Self::SmsSyncPausedCache,
+        Self::SmsSyncStaleCache,
+        Self::SmsSyncStoredList,
+        Self::SmsSyncNotCompleted,
         Self::SmsSearchHint,
         Self::SmsEmptySearch,
         Self::SmsEmptySearchHint,
@@ -3201,6 +3257,7 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::LanguageEnUs => "English",
         TextKey::SettingsAutostart => "登录 Windows 时启动",
         TextKey::SettingsAutostartDescription => "默认关闭；启用后将直接启动到系统托盘。",
+        TextKey::SettingsAutostartDisabled => "已关闭",
         TextKey::SettingsStartMinimized => "启动时隐藏到托盘",
         TextKey::SettingsActiveProbe => "允许主动连接探测",
         TextKey::SettingsActiveProbeDescription => {
@@ -3677,6 +3734,14 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::GitHubProject => "GitHub 项目仓库",
         TextKey::UpdateAvailable => "发现新版本 v{}",
         TextKey::UpdateTitle => "软件更新",
+        TextKey::UpdateCurrentVersion => "当前版本 v{}",
+        TextKey::UpdateCheckNow => "检查更新",
+        TextKey::UpdateChecking => "正在检查更新…",
+        TextKey::UpdateNotChecked => "尚未检查更新。",
+        TextKey::UpdateUpToDate => "当前版本无需更新。",
+        TextKey::UpdateCheckFailed => "检查更新失败，可稍后重试。",
+        TextKey::UpdateView => "查看更新",
+        TextKey::UpdateDownload => "下载更新",
         TextKey::UpdateDownloading => "正在下载",
         TextKey::UpdateProgress => "已下载 {} / {}",
         TextKey::UpdateVerifying => "正在校验更新包",
@@ -3684,7 +3749,7 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::UpdatePreparing => "正在准备更新，请稍候。",
         TextKey::UpdateInstallRestart => "安装并重启",
         TextKey::UpdateRetry => "重新下载",
-        TextKey::UpdateBusy => "请等待当前操作结束后再安装。",
+        TextKey::UpdateBusy => "当前操作完成后即可继续。",
         TextKey::UpdateRestartHint => "安装时软件会退出，完成后自动重启。",
         TextKey::UpdateFailedNetwork => "更新下载失败，请检查网络后重试。",
         TextKey::UpdateFailedChecksum => "无法取得有效的 SHA-256 校验值，禁止安装。",
@@ -4099,8 +4164,10 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::ComposeTitle => "新建短信",
         TextKey::ComposeIntro => "通过当前连接的 4G 模块发送",
         TextKey::ComposeRecipient => "收件人",
-        TextKey::ComposeRecipientHint => "+86 手机号码",
-        TextKey::ComposeRecipientNote => "请输入含国家码的完整号码，例如 +8613800138000",
+        TextKey::ComposeRecipientHint => "国际号码或客服短号",
+        TextKey::ComposeRecipientNote => {
+            "输入 +8613800138000 等完整号码，或 10086 / 10010 / 10001。"
+        }
         TextKey::ComposeBodyLabel => "短信内容",
         TextKey::ComposeLength => "{} / 70 字",
         TextKey::ComposeBodyHint => "在这里输入短信内容…",
@@ -4120,9 +4187,9 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::ComposeConfirmAction => "确认发送这条短信",
         TextKey::ComposeKeepDraftTitle => "保留当前草稿？",
         TextKey::ComposeKeepDraftBody => {
-            "已有未发送草稿。默认保留；替换后将只填写回复号码，正文为空。"
+            "已有未发送草稿。可保留当前草稿，或替换为新草稿后继续编辑。"
         }
-        TextKey::ComposeReplaceDraft => "替换为回复草稿",
+        TextKey::ComposeReplaceDraft => "替换为新草稿",
         TextKey::ComposeKeepDraft => "保留草稿",
         TextKey::ComposeRejected => {
             "模块已明确拒绝本条短信，未接受提交。请根据错误码排查后再手动发送。"
@@ -4159,7 +4226,7 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::ComposeSerialBusyShort => "串口正在被其他任务占用，请等待任务结束。",
         TextKey::ComposePortBusyShort => "无法打开串口，请检查设备连接及端口占用。",
         TextKey::ComposeTimeoutShort => "等待模块响应超时，请检查连接及模块状态。",
-        TextKey::ComposeValidationFailed => "号码或正文未通过校验，请检查国际号码和正文长度。",
+        TextKey::ComposeValidationFailed => "号码或正文未通过校验，请检查支持的号码和正文长度。",
         TextKey::ComposeDeviceLost => "设备连接中断，请重新连接设备并刷新。",
         TextKey::ComposeGenericAdvice => {
             "请检查设备连接、SIM 卡状态和运营商短信服务；保留错误码以便排查。"
@@ -4312,6 +4379,25 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::SmsTabOutgoing => "发送记录  {}",
         TextKey::SmsBackToList => "返回消息列表",
         TextKey::SmsFooterNote => "模块接受发送 ≠ 收件人已收到  ·  短信内容不会写入诊断日志",
+        TextKey::SmsFilterAll => "全部",
+        TextKey::SmsFilterIncomplete => "长短信缺片",
+        TextKey::SmsClearSearch => "清空搜索",
+        TextKey::SmsEmptyFilter => "没有符合筛选条件的短信",
+        TextKey::SmsEmptyFilterHint => "切换为“全部”可查看其他短信",
+        TextKey::SmsBalanceQuery => "查询话费",
+        TextKey::SmsBalanceIntro => "选择 SIM 所属运营商，生成查询草稿后确认发送。",
+        TextKey::SmsBalanceInstructions => "指令说明",
+        TextKey::SmsBalancePortal => "打开广电营业厅查询",
+        TextKey::SmsBalanceBroadnetHelp => "登录后进入“个人中心 → 我的账户”查询余额。",
+        TextKey::SmsBalanceReplyHint => "短信回复显示在收件箱。查询指令及短信服务以当地套餐为准。",
+        TextKey::SmsLastSynced => "上次完整读取 {}：{}前",
+        TextKey::SmsSyncReadingCache => "正在读取模块，当前显示已有记录",
+        TextKey::SmsSyncFailedCache => "同步失败，当前显示缓存",
+        TextKey::SmsSyncPartialCache => "读取不完整，当前显示已有记录",
+        TextKey::SmsSyncPausedCache => "同步已暂停，当前显示已有记录",
+        TextKey::SmsSyncStaleCache => "记录较旧，等待同步",
+        TextKey::SmsSyncStoredList => "模块存储短信 · 本页每 15 秒同步",
+        TextKey::SmsSyncNotCompleted => "尚未完成模块存储读取",
         TextKey::SmsSearchHint => "搜索号码或短信内容",
         TextKey::SmsEmptySearch => "没有找到相关短信",
         TextKey::SmsEmptySearchHint => "试试其他号码或关键词",
@@ -4780,6 +4866,7 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::LanguageEnUs => "English",
         TextKey::SettingsAutostart => "登入 Windows 時啟動",
         TextKey::SettingsAutostartDescription => "預設關閉；啟用後將直接啟動到系統匣。",
+        TextKey::SettingsAutostartDisabled => "已關閉",
         TextKey::SettingsStartMinimized => "啟動時隱藏到系統匣",
         TextKey::SettingsActiveProbe => "允許主動連接探測",
         TextKey::SettingsActiveProbeDescription => {
@@ -5256,6 +5343,14 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::GitHubProject => "GitHub 專案儲存庫",
         TextKey::UpdateAvailable => "發現新版本 v{}",
         TextKey::UpdateTitle => "軟體更新",
+        TextKey::UpdateCurrentVersion => "目前版本 v{}",
+        TextKey::UpdateCheckNow => "檢查更新",
+        TextKey::UpdateChecking => "正在檢查更新…",
+        TextKey::UpdateNotChecked => "尚未檢查更新。",
+        TextKey::UpdateUpToDate => "目前版本無需更新。",
+        TextKey::UpdateCheckFailed => "檢查更新失敗，可稍後重試。",
+        TextKey::UpdateView => "查看更新",
+        TextKey::UpdateDownload => "下載更新",
         TextKey::UpdateDownloading => "正在下載",
         TextKey::UpdateProgress => "已下載 {} / {}",
         TextKey::UpdateVerifying => "正在驗證更新套件",
@@ -5263,7 +5358,7 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::UpdatePreparing => "正在準備更新，請稍候。",
         TextKey::UpdateInstallRestart => "安裝並重新啟動",
         TextKey::UpdateRetry => "重新下載",
-        TextKey::UpdateBusy => "請等待目前操作結束後再安裝。",
+        TextKey::UpdateBusy => "目前操作完成後即可繼續。",
         TextKey::UpdateRestartHint => "安裝時軟體會退出，完成後自動重新啟動。",
         TextKey::UpdateFailedNetwork => "更新下載失敗，請檢查網路後重試。",
         TextKey::UpdateFailedChecksum => "無法取得有效的 SHA-256 驗證值，禁止安裝。",
@@ -5684,8 +5779,10 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::ComposeTitle => "新建短訊",
         TextKey::ComposeIntro => "通過當前連接的 4G 模組發送",
         TextKey::ComposeRecipient => "收件人",
-        TextKey::ComposeRecipientHint => "+86 手機號碼",
-        TextKey::ComposeRecipientNote => "請輸入含國家碼的完整號碼，例如 +8613800138000",
+        TextKey::ComposeRecipientHint => "國際號碼或客服短號",
+        TextKey::ComposeRecipientNote => {
+            "輸入 +8613800138000 等完整號碼，或 10086 / 10010 / 10001。"
+        }
         TextKey::ComposeBodyLabel => "短訊內容",
         TextKey::ComposeLength => "{} / 70 字",
         TextKey::ComposeBodyHint => "在這里輸入短訊內容…",
@@ -5705,9 +5802,9 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::ComposeConfirmAction => "確認發送這條短訊",
         TextKey::ComposeKeepDraftTitle => "保留當前草稿？",
         TextKey::ComposeKeepDraftBody => {
-            "已有未發送草稿。預設保留；替換後將只填寫回復號碼，正文為空。"
+            "已有未發送草稿。可保留當前草稿，或替換為新草稿後繼續編輯。"
         }
-        TextKey::ComposeReplaceDraft => "替換為回復草稿",
+        TextKey::ComposeReplaceDraft => "替換為新草稿",
         TextKey::ComposeKeepDraft => "保留草稿",
         TextKey::ComposeRejected => {
             "模組已明確拒絕本條短訊，未接受提交。請根據錯誤碼排查後再手動發送。"
@@ -5744,7 +5841,7 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::ComposeSerialBusyShort => "序列埠正在被其他任務佔用，請等待任務結束。",
         TextKey::ComposePortBusyShort => "無法開啟序列埠，請檢查裝置連接及連接埠佔用。",
         TextKey::ComposeTimeoutShort => "等待模組響應超時，請檢查連接及模組狀態。",
-        TextKey::ComposeValidationFailed => "號碼或正文未通過驗證，請檢查國際號碼和正文長度。",
+        TextKey::ComposeValidationFailed => "號碼或正文未通過校驗，請檢查支援的號碼和正文長度。",
         TextKey::ComposeDeviceLost => "裝置連接中斷，請重新連接裝置並重新整理。",
         TextKey::ComposeGenericAdvice => {
             "請檢查裝置連接、SIM 卡狀態和網絡供應商短訊服務；保留錯誤碼以便排查。"
@@ -5901,6 +5998,25 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::SmsTabOutgoing => "發送記錄  {}",
         TextKey::SmsBackToList => "返回訊息清單",
         TextKey::SmsFooterNote => "模組接受發送 ≠ 收件人已收到  ·  短訊內容不會寫入診斷日誌",
+        TextKey::SmsFilterAll => "全部",
+        TextKey::SmsFilterIncomplete => "長短訊缺片",
+        TextKey::SmsClearSearch => "清空搜索",
+        TextKey::SmsEmptyFilter => "沒有符合篩選條件的短訊",
+        TextKey::SmsEmptyFilterHint => "切換為「全部」可查看其他短訊",
+        TextKey::SmsBalanceQuery => "查詢話費",
+        TextKey::SmsBalanceIntro => "選擇 SIM 所屬網絡供應商，產生查詢草稿後確認發送。",
+        TextKey::SmsBalanceInstructions => "指令說明",
+        TextKey::SmsBalancePortal => "開啟廣電營業廳查詢",
+        TextKey::SmsBalanceBroadnetHelp => "登入後進入「個人中心 → 我的帳戶」查詢餘額。",
+        TextKey::SmsBalanceReplyHint => "短訊回復顯示在收件箱。查詢指令及短訊服務以當地套餐為準。",
+        TextKey::SmsLastSynced => "上次完整讀取 {}：{}前",
+        TextKey::SmsSyncReadingCache => "正在讀取模組，目前顯示已有記錄",
+        TextKey::SmsSyncFailedCache => "同步失敗，目前顯示快取",
+        TextKey::SmsSyncPartialCache => "讀取不完整，目前顯示已有記錄",
+        TextKey::SmsSyncPausedCache => "同步已暫停，目前顯示已有記錄",
+        TextKey::SmsSyncStaleCache => "記錄較舊，等待同步",
+        TextKey::SmsSyncStoredList => "模組儲存短訊 · 本頁每 15 秒同步",
+        TextKey::SmsSyncNotCompleted => "尚未完成模組儲存讀取",
         TextKey::SmsSearchHint => "搜索號碼或短訊內容",
         TextKey::SmsEmptySearch => "沒有找到相關短訊",
         TextKey::SmsEmptySearchHint => "試試其他號碼或關鍵詞",
@@ -6477,6 +6593,7 @@ fn en_us(key: TextKey) -> &'static str {
         TextKey::SettingsAutostartDescription => {
             "Off by default; when enabled, the panel starts straight into the system tray."
         }
+        TextKey::SettingsAutostartDisabled => "Off",
         TextKey::SettingsStartMinimized => "Hide in the tray at startup",
         TextKey::SettingsActiveProbe => "Allow active connection probes",
         TextKey::SettingsActiveProbeDescription => {
@@ -7059,6 +7176,14 @@ fn en_us(key: TextKey) -> &'static str {
         TextKey::GitHubProject => "GitHub project repository",
         TextKey::UpdateAvailable => "New version v{} available",
         TextKey::UpdateTitle => "Software update",
+        TextKey::UpdateCurrentVersion => "Current version v{}",
+        TextKey::UpdateCheckNow => "Check for updates",
+        TextKey::UpdateChecking => "Checking for updates…",
+        TextKey::UpdateNotChecked => "Updates have not been checked yet.",
+        TextKey::UpdateUpToDate => "No update is needed for this version.",
+        TextKey::UpdateCheckFailed => "Could not check for updates. Try again later.",
+        TextKey::UpdateView => "View update",
+        TextKey::UpdateDownload => "Download update",
         TextKey::UpdateDownloading => "Downloading",
         TextKey::UpdateProgress => "Downloaded {} / {}",
         TextKey::UpdateVerifying => "Verifying update package",
@@ -7066,7 +7191,7 @@ fn en_us(key: TextKey) -> &'static str {
         TextKey::UpdatePreparing => "Preparing update. Please wait.",
         TextKey::UpdateInstallRestart => "Install and restart",
         TextKey::UpdateRetry => "Download again",
-        TextKey::UpdateBusy => "Wait for the current operation to finish before installing.",
+        TextKey::UpdateBusy => "Wait for the current operation to finish.",
         TextKey::UpdateRestartHint => {
             "The app exits during installation and restarts when it is complete."
         }
@@ -7619,9 +7744,9 @@ fn en_us(key: TextKey) -> &'static str {
         TextKey::ComposeTitle => "New message",
         TextKey::ComposeIntro => "Sent through the currently connected 4G module",
         TextKey::ComposeRecipient => "Recipient",
-        TextKey::ComposeRecipientHint => "+86 mobile number",
+        TextKey::ComposeRecipientHint => "International number or service code",
         TextKey::ComposeRecipientNote => {
-            "Enter the full number including the country code, for example +8613800138000"
+            "Enter a full number such as +8613800138000, or 10086 / 10010 / 10001."
         }
         TextKey::ComposeBodyLabel => "Message",
         TextKey::ComposeLength => "{} / 70 characters",
@@ -7644,9 +7769,9 @@ fn en_us(key: TextKey) -> &'static str {
         TextKey::ComposeConfirmAction => "Send this message",
         TextKey::ComposeKeepDraftTitle => "Keep the current draft?",
         TextKey::ComposeKeepDraftBody => {
-            "An unsent draft exists. It is kept by default; replacing it fills in only the reply number and leaves the text empty."
+            "An unsent draft exists. Keep it, or replace it with the new draft and continue editing."
         }
-        TextKey::ComposeReplaceDraft => "Replace with the reply draft",
+        TextKey::ComposeReplaceDraft => "Use the new draft",
         TextKey::ComposeKeepDraft => "Keep the draft",
         TextKey::ComposeRejected => {
             "The module explicitly rejected this message and did not accept the submission. Check the error code and send it by hand afterwards."
@@ -7700,7 +7825,7 @@ fn en_us(key: TextKey) -> &'static str {
             "Waiting for the module timed out; check the connection and the module state."
         }
         TextKey::ComposeValidationFailed => {
-            "The number or the text did not pass validation; check the international number and the text length."
+            "The number or message is invalid. Check the supported number format and message length."
         }
         TextKey::ComposeDeviceLost => {
             "The device connection dropped; reconnect the device and refresh."
@@ -7902,6 +8027,29 @@ fn en_us(key: TextKey) -> &'static str {
         TextKey::SmsFooterNote => {
             "The module accepting a send ≠ the recipient receiving it  ·  message bodies are never written to the diagnostics log"
         }
+        TextKey::SmsFilterAll => "All",
+        TextKey::SmsFilterIncomplete => "Missing fragments",
+        TextKey::SmsClearSearch => "Clear search",
+        TextKey::SmsEmptyFilter => "No messages match this filter",
+        TextKey::SmsEmptyFilterHint => "Select All to see other messages",
+        TextKey::SmsBalanceQuery => "Check balance",
+        TextKey::SmsBalanceIntro => "Choose the SIM carrier, then review and send the query draft.",
+        TextKey::SmsBalanceInstructions => "Instructions",
+        TextKey::SmsBalancePortal => "Open Broadnet account portal",
+        TextKey::SmsBalanceBroadnetHelp => {
+            "Sign in, then open Personal Center → My Account to check the balance."
+        }
+        TextKey::SmsBalanceReplyHint => {
+            "Replies appear in the inbox. Commands and SMS availability depend on the local plan."
+        }
+        TextKey::SmsLastSynced => "Last complete read of {}: {} ago",
+        TextKey::SmsSyncReadingCache => "Reading the module; showing existing records",
+        TextKey::SmsSyncFailedCache => "Sync failed; showing cached records",
+        TextKey::SmsSyncPartialCache => "Incomplete read; showing existing records",
+        TextKey::SmsSyncPausedCache => "Sync paused; showing existing records",
+        TextKey::SmsSyncStaleCache => "Older records; waiting to sync",
+        TextKey::SmsSyncStoredList => "Stored messages · syncs every 15 seconds on this page",
+        TextKey::SmsSyncNotCompleted => "No complete module-storage read yet",
         TextKey::SmsSearchHint => "Search number or message text",
         TextKey::SmsEmptySearch => "No matching message",
         TextKey::SmsEmptySearchHint => "Try another number or keyword",
@@ -9052,5 +9200,5 @@ fn english_catalog_has_no_chinese_leftovers() {
 /// a key missing from it would escape all of them. Bump this number with the key.
 #[test]
 fn the_key_list_covers_the_enum() {
-    assert_eq!(TextKey::ALL.len(), 1283);
+    assert_eq!(TextKey::ALL.len(), 1311);
 }

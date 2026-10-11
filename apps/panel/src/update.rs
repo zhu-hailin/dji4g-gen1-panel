@@ -3,7 +3,7 @@ mod service;
 mod worker;
 use semver::Version;
 use serde::Deserialize;
-pub use service::{UpdateService, UpdateState};
+pub use service::{UpdateCheckStatus, UpdateService, UpdateState};
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
