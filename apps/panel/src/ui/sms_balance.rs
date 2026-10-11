@@ -52,10 +52,7 @@ pub(crate) fn render_entry(ui: &mut Ui, language: Language, state: &mut SmsCompo
                     template.body,
                     template.recipient
                 );
-                let choice = ui.add_enabled(
-                    !state.module_read_only && !state.serial_busy,
-                    egui::Button::new(label),
-                );
+                let choice = ui.add_enabled(state.can_open_editor(), egui::Button::new(label));
                 #[cfg(test)]
                 ui.data_mut(|data| {
                     data.insert_temp(

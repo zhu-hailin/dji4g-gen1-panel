@@ -4,6 +4,10 @@ use crate::localization::Language;
 use dji4g_application::{SmsSendPhase, SmsSendResult, SmsSendSnapshot, UiCommand, UiSendError};
 use eframe::egui::{self, Ui};
 
+#[cfg(test)]
+#[path = "sms_compose_send_tests.rs"]
+mod send_flow_tests;
+
 /// One catalog string in the language this page was rendered with.
 fn t(language: crate::localization::Language, key: crate::localization::TextKey) -> String {
     crate::localization::LocalizedText::new(language, key).text
@@ -84,10 +88,21 @@ impl SmsComposeState {
     }
 
     pub(super) fn open_editor(&mut self) {
+        if !self.can_open_editor() {
+            return;
+        }
         if !self.open {
             self.editor_focus = Some(EditorFocus::Recipient);
         }
         self.open = true;
+    }
+
+    pub(in crate::ui) fn can_open_editor(&self) -> bool {
+        !self.module_read_only && !self.serial_busy && self.pending.is_none()
+    }
+
+    pub(super) fn has_draft(&self) -> bool {
+        !self.draft.recipient.is_empty() || !self.draft.body.is_empty()
     }
 
     pub(super) fn begin_reply(&mut self, recipient: &str) -> ReplyStartResult {
@@ -267,6 +282,10 @@ impl SmsComposeState {
         }) {
             Ok(()) => {
                 self.error = None;
+                // The accepted request owns this draft until its result arrives. Return to the
+                // inbox immediately instead of reopening the same form behind the confirmation.
+                self.open = false;
+                self.editor_focus = None;
                 self.pending = Some(Pending {
                     draft: frozen,
                     after_id: snapshot.map(|s| s.request_id),
@@ -275,7 +294,11 @@ impl SmsComposeState {
                     context_changed: false,
                 });
             }
-            Err(error) => self.error = Some(enqueue_error(error, self.language)),
+            Err(error) => {
+                self.error = Some(enqueue_error(error, self.language));
+                self.open = true;
+                self.editor_focus = Some(EditorFocus::Body);
+            }
         }
     }
 
@@ -356,12 +379,22 @@ pub(super) fn render(
     controller: &dji4g_application::ControllerSnapshot,
     sink: &dyn UiCommandSink,
 ) {
+    state.language = language;
     let snapshot = controller.sms_send.as_ref();
     state.observe_snapshot(controller);
+    // Before the new request has a snapshot, the controller may still show the previous result.
+    // Only expose a snapshot bound to this send; otherwise show its pending state below.
+    let visible_snapshot = snapshot.filter(|snapshot| {
+        (state.error.is_none() || snapshot.phase != SmsSendPhase::Finished)
+            && state
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.request_id == Some(snapshot.request_id))
+    });
     let sending =
         state.pending.is_some() || snapshot.is_some_and(|s| s.phase != SmsSendPhase::Finished);
     let busy = state.serial_busy || state.module_read_only || sending;
-    if let Some(snapshot) = snapshot {
+    if let Some(snapshot) = visible_snapshot {
         egui::Frame::none()
             .fill(crate::ui::scale::surface_sunken())
             .rounding(10.0)
@@ -462,7 +495,18 @@ pub(super) fn render(
                 }
             });
     } else if state.pending.is_some() {
-        ui.label(t(language, crate::localization::TextKey::ComposeQueued));
+        ui.label(t(
+            language,
+            if state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.request_id.is_some())
+            {
+                crate::localization::TextKey::ComposeSendingWait
+            } else {
+                crate::localization::TextKey::ComposeQueued
+            },
+        ));
     }
     if !state.open
         && let Some(error) = &state.error
@@ -662,6 +706,7 @@ pub(super) fn render(
         );
         if outcome.chosen() == Some(0) {
             state.confirm(sink, snapshot);
+            ui.ctx().request_repaint();
         } else if outcome.dismissed() {
             state.confirmation = None;
         }

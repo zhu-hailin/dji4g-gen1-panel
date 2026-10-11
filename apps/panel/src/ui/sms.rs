@@ -411,10 +411,14 @@ pub(crate) fn render(
             super::sms_balance::render_entry(ui, language, state);
             if ui
                 .add_enabled(
-                    !state.module_read_only,
+                    state.can_open_editor(),
                     super::theme::primary_button(t(
                         language,
-                        crate::localization::TextKey::ComposeTitle,
+                        if state.has_draft() {
+                            crate::localization::TextKey::ComposeResumeDraft
+                        } else {
+                            crate::localization::TextKey::ComposeTitle
+                        },
                     )),
                 )
                 .clicked()

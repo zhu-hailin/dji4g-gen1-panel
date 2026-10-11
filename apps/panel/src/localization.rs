@@ -1082,6 +1082,7 @@ pub enum TextKey {
     ComposeFailureStage,
     ComposeSystemError,
     ComposeTitle,
+    ComposeResumeDraft,
     ComposeIntro,
     ComposeRecipient,
     ComposeRecipientHint,
@@ -2399,6 +2400,7 @@ impl TextKey {
         Self::ComposeFailureStage,
         Self::ComposeSystemError,
         Self::ComposeTitle,
+        Self::ComposeResumeDraft,
         Self::ComposeIntro,
         Self::ComposeRecipient,
         Self::ComposeRecipientHint,
@@ -4162,6 +4164,7 @@ fn zh_cn(key: TextKey) -> &'static str {
         TextKey::ComposeFailureStage => "失败阶段：{} · 错误码：{}",
         TextKey::ComposeSystemError => "系统错误：{}",
         TextKey::ComposeTitle => "新建短信",
+        TextKey::ComposeResumeDraft => "继续草稿",
         TextKey::ComposeIntro => "通过当前连接的 4G 模块发送",
         TextKey::ComposeRecipient => "收件人",
         TextKey::ComposeRecipientHint => "国际号码或客服短号",
@@ -5777,6 +5780,7 @@ fn zh_tw(key: TextKey) -> &'static str {
         TextKey::ComposeFailureStage => "失敗階段：{} · 錯誤碼：{}",
         TextKey::ComposeSystemError => "系統錯誤：{}",
         TextKey::ComposeTitle => "新建短訊",
+        TextKey::ComposeResumeDraft => "繼續草稿",
         TextKey::ComposeIntro => "通過當前連接的 4G 模組發送",
         TextKey::ComposeRecipient => "收件人",
         TextKey::ComposeRecipientHint => "國際號碼或客服短號",
@@ -7742,6 +7746,7 @@ fn en_us(key: TextKey) -> &'static str {
         TextKey::ComposeFailureStage => "Failed at: {} · error code: {}",
         TextKey::ComposeSystemError => "System error: {}",
         TextKey::ComposeTitle => "New message",
+        TextKey::ComposeResumeDraft => "Resume draft",
         TextKey::ComposeIntro => "Sent through the currently connected 4G module",
         TextKey::ComposeRecipient => "Recipient",
         TextKey::ComposeRecipientHint => "International number or service code",
@@ -9200,5 +9205,5 @@ fn english_catalog_has_no_chinese_leftovers() {
 /// a key missing from it would escape all of them. Bump this number with the key.
 #[test]
 fn the_key_list_covers_the_enum() {
-    assert_eq!(TextKey::ALL.len(), 1311);
+    assert_eq!(TextKey::ALL.len(), 1312);
 }
