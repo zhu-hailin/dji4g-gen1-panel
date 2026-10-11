@@ -562,15 +562,33 @@ pub fn executable_version(_path: &Path) -> Result<String, ClashError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn fixture_root() -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "dji4g-proxy-parser-{}-{}",
-            std::process::id(),
-            nonce().unwrap()
-        ));
+        fixture_root_with_nonce(nonce().unwrap())
+    }
+
+    fn fixture_root_with_nonce(clock_nonce: u128) -> PathBuf {
+        // Reserve each fixture even when Windows returns the same clock value.
+        let root = loop {
+            let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "dji4g-proxy-parser-{}-{clock_nonce}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => break root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create fixture directory {}: {error}", root.display()),
+            }
+        };
         let profiles_dir = root.join("profiles");
-        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::create_dir(&profiles_dir).unwrap();
         fs::write(root.join("profiles.yaml"), "current: active\nitems:\n  - uid: active\n    type: remote\n    file: active.yaml\n  - uid: Merge\n    type: merge\n    file: global.yaml\n").unwrap();
         fs::write(profiles_dir.join("active.yaml"), "profile: test\n").unwrap();
         fs::write(
@@ -593,6 +611,38 @@ mod tests {
                 .starts_with("dji4g-proxy-parser-")
         );
         fs::remove_dir_all(actual).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_fixtures_with_the_same_clock_value_are_isolated() {
+        let start = Arc::new(Barrier::new(2));
+        let fixtures = (0..2)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    fixture_root_with_nonce(0)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut roots = fixtures.into_iter().map(|fixture| fixture.join().unwrap());
+        let first = roots.next().unwrap();
+        let second = roots.next().unwrap();
+        if first == second {
+            remove_fixture(&first);
+            panic!("simultaneous fixtures must not share a directory");
+        }
+        let candidate = inspect_directory(&first, Some("2.5.5"))
+            .unwrap()
+            .candidate
+            .unwrap();
+        fs::write(second.join("profiles/global.yaml"), "custom: other test\n").unwrap();
+        fs::write(second.join("profiles/active.yaml"), "profile: other test\n").unwrap();
+        let record = apply_candidate(&candidate).unwrap();
+        restore_candidate(&record).unwrap();
+        assert_eq!(fs::read(&record.source_path).unwrap(), candidate.before);
+        remove_fixture(&first);
+        remove_fixture(&second);
     }
 
     #[test]
