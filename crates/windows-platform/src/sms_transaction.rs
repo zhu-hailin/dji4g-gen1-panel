@@ -397,6 +397,55 @@ mod tests {
         assert_eq!(writes.lock().unwrap().len(), 4);
     }
     #[test]
+    fn echoed_production_submit_requires_cmgs_and_ok_and_never_resends() {
+        for (result_wire, expected_result) in [
+            (
+                "\r\n+CMGS: 7\r\nOK\r\n+CEREG: 1\r\n+CMTI: \"ME\",3\r\n",
+                SmsSendResult::Submitted,
+            ),
+            ("\r\nOK\r\n", SmsSendResult::OutcomeUnknown),
+            ("\r\n+CMGS: 7\r\n", SmsSendResult::OutcomeUnknown),
+            ("\r\n", SmsSendResult::OutcomeUnknown),
+            ("\r\n+CMS ERROR: 500\r\n", SmsSendResult::Failed),
+        ] {
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let submit = build_ucs2_submit("+8613800138000", "测试").unwrap();
+            let mut echo = submit.expose_for_confirmed_send().as_bytes().to_vec();
+            echo.push(0x1A);
+            echo.extend_from_slice(result_wire.as_bytes());
+            let actor = AtSessionActor::spawn(
+                DeviceEpoch(1),
+                Box::new(Fixture {
+                    writes: writes.clone(),
+                    reads: [
+                        b"+QCCID: 89860123456789012345\r\nOK\r\n".to_vec(),
+                        b"+CMGF: 0\r\nOK\r\n".to_vec(),
+                        b"+QCCID: 89860123456789012345\r\nOK\r\n".to_vec(),
+                        b">".to_vec(),
+                        echo,
+                    ]
+                    .into(),
+                }),
+            );
+            let control = SmsTransactionControl::new(Duration::from_secs(1));
+            let receipt = classify(
+                send_in_session(&actor, Some(test_sim()), submit, &control),
+                &control,
+            );
+            assert_eq!(receipt.result, expected_result, "{result_wire:?}");
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 5);
+            assert_eq!(
+                writes
+                    .iter()
+                    .filter(|wire| wire.starts_with(b"AT+CMGS="))
+                    .count(),
+                1
+            );
+            assert_eq!(writes.iter().filter(|wire| wire.contains(&0x1A)).count(), 1);
+        }
+    }
+    #[test]
     fn cms_code_survives_without_message_content() {
         let control = SmsTransactionControl::new(Duration::from_secs(1));
         control.mark_submission_possible();

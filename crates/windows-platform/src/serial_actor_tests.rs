@@ -238,6 +238,52 @@ fn native_zero_byte_reads_before_and_after_prompt_wait_for_cmgs_without_resendin
 }
 
 #[test]
+fn sms_response_accepts_exact_pdu_echo_and_ctrl_z_without_resending() {
+    let body = b"0011000B916800000000FF";
+    for terminator in [b"\x1A".as_slice(), b"^Z", b""] {
+        let mut echoed = body.to_vec();
+        echoed.extend_from_slice(terminator);
+        echoed.extend_from_slice(b"\r\n+CMGS: 42\r\nOK\r\n");
+        let (actor, state) = actor_with_raw_reads([Ok(b"AT+CMGS=9\r\n>".to_vec()), Ok(echoed)]);
+        let response = actor
+            .execute_prompt(AtCommand::SmsSend { tpdu_octets: 9 }, body.to_vec())
+            .unwrap();
+        assert_eq!(response.final_code, AtFinalCode::Ok);
+        assert_eq!(response.lines, ["+CMGS: 42"]);
+        assert_raw_submission_once(&state, body);
+    }
+}
+
+#[test]
+fn sms_response_preserves_cmgs_ack_followed_by_a_network_notification() {
+    let body = b"0011000B916800000000FF";
+    let (actor, state) = actor_with_raw_reads([
+        Ok(b"\r\n>".to_vec()),
+        Ok(b"\r\n+CMGS: 42\r\nOK\r\n+CEREG: 1\r\n+CMTI: \"ME\",3\r\n".to_vec()),
+    ]);
+    let response = actor
+        .execute_prompt(AtCommand::SmsSend { tpdu_octets: 9 }, body.to_vec())
+        .unwrap();
+    assert_eq!(response.lines, ["+CMGS: 42"]);
+    assert_raw_submission_once(&state, body);
+}
+
+#[test]
+fn sms_preflight_waits_through_quiet_intervals_without_repeating_at_or_ati() {
+    let (actor, state) = actor_with_raw_reads([
+        Ok(Vec::new()),
+        Ok(b"AT\r\nOK\r\n".to_vec()),
+        Ok(Vec::new()),
+        Ok(b"ATI\r\nQuectel EC200A\r\nOK\r\n".to_vec()),
+    ]);
+    assert_eq!(actor.safe_handshake().unwrap(), ["Quectel EC200A"]);
+    assert_eq!(
+        state.lock().unwrap().writes,
+        [b"AT\r".to_vec(), b"ATI\r".to_vec()]
+    );
+}
+
+#[test]
 fn native_zero_byte_reads_after_submission_obey_result_deadline_without_resending() {
     let body = b"0011000B916800000000FF";
     let (actor, state) = actor_with_raw_reads([Ok(b"\r\n>".to_vec())]);
@@ -312,7 +358,7 @@ fn native_read_adapter_preserves_actual_io_error_details() {
 }
 
 #[test]
-fn idempotent_read_retries_exactly_once() {
+fn quiet_interval_does_not_repeat_an_idempotent_command() {
     let (actor, state) = actor_with_reads([
         Err(io::Error::new(io::ErrorKind::TimedOut, "quiet")),
         Ok(b"+CSQ: 20,99\r\nOK\r\n".to_vec()),
@@ -320,15 +366,32 @@ fn idempotent_read_retries_exactly_once() {
 
     let response = actor.execute(AtCommand::SignalQuality).unwrap();
     assert_eq!(response.lines, vec!["+CSQ: 20,99"]);
+    assert_eq!(state.lock().unwrap().writes.len(), 1);
+}
+
+#[test]
+fn idempotent_read_retries_exactly_once_after_the_command_deadline() {
+    let (actor, state) = actor_with_state(FakeState {
+        quiet_when_empty: true,
+        ..FakeState::default()
+    });
+    let started = std::time::Instant::now();
+    let error = actor.execute(AtCommand::SignalQuality).unwrap_err();
+    assert_eq!(error.protocol_kind(), Some(ProtocolErrorKind::Timeout));
+    assert!(started.elapsed() >= super::COMMAND_TIMEOUT * 2);
+    assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(state.lock().unwrap().writes.len(), 2);
 }
 
 #[test]
 fn write_command_is_never_retried() {
-    let (actor, state) = actor_with_reads([Err(io::Error::new(io::ErrorKind::TimedOut, "quiet"))]);
+    let (actor, state) = actor_with_state(FakeState {
+        quiet_when_empty: true,
+        ..FakeState::default()
+    });
 
-    let result = actor.execute(AtCommand::RestartModule);
-    assert!(result.is_err());
+    let error = actor.execute(AtCommand::RestartModule).unwrap_err();
+    assert_eq!(error.protocol_kind(), Some(ProtocolErrorKind::Timeout));
     assert_eq!(state.lock().unwrap().writes.len(), 1);
 }
 

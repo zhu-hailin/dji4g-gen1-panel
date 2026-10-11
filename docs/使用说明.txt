@@ -1,4 +1,4 @@
-DJI 一代 4G 面板 · v0.1.17 · Windows 开发版
+DJI 一代 4G 面板 · v0.1.18 · Windows 开发版
 
 启动：将压缩包完整解压，运行 dji4g-panel.exe，保持 dji4g-helper.exe 和 dji4g-updater.exe 在同一目录。
 升级：先通过托盘或设置页完全退出旧程序，再运行新程序。

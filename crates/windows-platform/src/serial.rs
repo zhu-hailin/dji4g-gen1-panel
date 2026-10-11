@@ -27,6 +27,12 @@ use crate::SelectedPort;
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 
+/// A native read timeout is only a quiet interval, not the whole AT command timeout.
+#[cfg(not(test))]
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const COMMAND_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// The CMGS `>` prompt wait (research §6.3: the prompt is not a CRLF-terminated line, and a final
 /// code can arrive instead). Bounded by wall clock, not by the line parser.
 #[cfg(not(test))]
@@ -1174,16 +1180,26 @@ fn execute_once(
         .write_all(command.encode().as_bytes())
         .map_err(|error| io_error(&mut parser, error))?;
 
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
     loop {
         if !state.is_running() {
             return Err(ActorError::Protocol(parser.finish_removed()));
         }
-        let bytes = serial
-            .read_chunk()
-            .map_err(|error| io_error(&mut parser, error))?;
+        if Instant::now() >= deadline {
+            return Err(ActorError::Protocol(parser.finish_timeout()));
+        }
+        let read = serial.read_chunk();
         if !state.is_running() {
             return Err(ActorError::Protocol(parser.finish_removed()));
         }
+        if Instant::now() >= deadline {
+            return Err(ActorError::Protocol(parser.finish_timeout()));
+        }
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(error) if is_quiet(&error) => continue,
+            Err(error) => return Err(io_error(&mut parser, error)),
+        };
         for event in parser.push(&bytes).map_err(ActorError::Protocol)? {
             if let AtEvent::Response(response) = event {
                 if !state.is_running() {
@@ -1442,6 +1458,11 @@ fn run_prompt_transaction(
         return finish_prompt_response(response);
     }
 
+    if matches!(command, AtCommand::SmsSend { .. }) {
+        parser
+            .expect_prompt_body_echo(&body)
+            .map_err(ActorError::Protocol)?;
+    }
     let mut payload = body;
     payload.push(SUBMIT_TERMINATOR);
     if !state.is_running() {

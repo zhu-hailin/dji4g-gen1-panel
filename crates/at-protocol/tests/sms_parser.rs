@@ -453,6 +453,112 @@ fn prompt_is_emitted_then_parsing_continues_to_the_final_code() {
     assert_eq!(response.final_code, AtFinalCode::Ok);
 }
 
+fn send_parser_with_echo(body: &[u8]) -> StreamingParser {
+    let mut parser = StreamingParser::new_with_prompt(EPOCH, AtCommand::SmsSend { tpdu_octets: 9 });
+    assert_eq!(parser.push(b"> ").unwrap(), [AtEvent::Prompt]);
+    parser.expect_prompt_body_echo(body).unwrap();
+    parser
+}
+
+#[test]
+fn exact_submit_echo_is_ignored_across_every_chunk_boundary() {
+    let body = b"0011000B916800000000FF";
+    for terminator in [b"\x1A".as_slice(), b"^Z", b""] {
+        let mut wire = b" ".to_vec();
+        wire.extend_from_slice(body);
+        wire.extend_from_slice(terminator);
+        wire.extend_from_slice(b"\r\n+CMGS: 42\r\nOK\r\n");
+        for split in 0..=wire.len() {
+            let mut parser = send_parser_with_echo(body);
+            let mut events = parser.push(&wire[..split]).unwrap();
+            events.extend(parser.push(&wire[split..]).unwrap());
+            let response = one_response(events);
+            assert_eq!(response.lines, ["+CMGS: 42"]);
+            assert_eq!(response.final_code, AtFinalCode::Ok);
+        }
+    }
+}
+
+#[test]
+fn submit_echo_requires_a_prompt_and_an_exact_bounded_pdu() {
+    let body = b"0011000B916800000000FF";
+    let mut parser = StreamingParser::new_with_prompt(EPOCH, AtCommand::SmsSend { tpdu_octets: 9 });
+    assert!(parser.expect_prompt_body_echo(body).is_err());
+    for invalid in [
+        b"".as_slice(),
+        b"ABC",
+        b"NOT-A-PDU",
+        b"00\x1A",
+        &[b'A'; 1026],
+    ] {
+        let mut parser =
+            StreamingParser::new_with_prompt(EPOCH, AtCommand::SmsSend { tpdu_octets: 9 });
+        parser.push(b">").unwrap();
+        assert!(parser.expect_prompt_body_echo(invalid).is_err());
+    }
+    for invalid_echo in [
+        b"0011000B916800000000FE\r\n".as_slice(),
+        b"\x1A\r\n",
+        b"0011000B916800000000FF\x1B\r\n",
+        b"0011000B916800000000FF^X\r\n",
+        b"0011000B916800000000FF\r\n0011000B916800000000FF\r\n",
+        b"+CMGS: 42\r\n0011000B916800000000FF\r\nOK\r\n",
+    ] {
+        let mut parser = send_parser_with_echo(body);
+        assert_eq!(
+            parser.push(invalid_echo).unwrap_err().kind,
+            ProtocolErrorKind::WrongPortData
+        );
+    }
+}
+
+#[test]
+fn submit_echo_without_an_acknowledgement_still_times_out() {
+    let body = b"0011000B916800000000FF";
+    let mut parser = send_parser_with_echo(body);
+    assert!(
+        parser
+            .push(b"0011000B916800000000FF\x1A\r\n")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(parser.finish_timeout().kind, ProtocolErrorKind::Timeout);
+}
+
+#[test]
+fn known_notifications_after_final_ok_do_not_invalidate_the_response() {
+    let wire = b"+CMGS: 42\r\nOK\r\n+CEREG: 1\r\n+CMTI: \"ME\",3\r\n";
+    for split in 0..=wire.len() {
+        let mut parser = StreamingParser::new(EPOCH, AtCommand::SmsSend { tpdu_octets: 9 });
+        let mut events = parser.push(&wire[..split]).unwrap();
+        events.extend(parser.push(&wire[split..]).unwrap());
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], AtEvent::Response(response) if response.lines == ["+CMGS: 42"])
+        );
+        assert!(matches!(&events[1], AtEvent::Urc(urc) if urc.line == "+CEREG: 1"));
+        assert!(matches!(&events[2], AtEvent::Urc(urc) if urc.line == "+CMTI: \"ME\",3"));
+    }
+}
+
+#[test]
+fn other_data_after_final_ok_is_still_rejected() {
+    for tail in [
+        "OK\r\n",
+        "+CMGS: 99\r\n",
+        "+CEREG: invalid\r\n",
+        "garbage",
+        ">",
+    ] {
+        let mut parser = StreamingParser::new(EPOCH, AtCommand::SmsSend { tpdu_octets: 9 });
+        parser.push(b"+CMGS: 42\r\nOK\r\n").unwrap();
+        assert_eq!(
+            parser.push(tail.as_bytes()).unwrap_err().kind,
+            ProtocolErrorKind::UnexpectedData
+        );
+    }
+}
+
 #[test]
 fn prompt_is_emitted_at_a_chunk_boundary_without_a_terminator() {
     let mut parser = StreamingParser::new_with_prompt(EPOCH, AtCommand::Identity);

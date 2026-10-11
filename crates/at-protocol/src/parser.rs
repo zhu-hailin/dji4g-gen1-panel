@@ -21,6 +21,10 @@ const MAX_PDU_HEX_CHARS: usize = 1024;
 /// Upper bound for the channels of one `+QTEMP:` positional list.  A longer run of bare numbers
 /// is not a plausible sensor report and is skipped whole rather than read as temperatures.
 const MAX_QTEMP_CHANNELS: usize = 8;
+const URC_PREFIXES: &[&str] = &[
+    "+CEREG:", "+CGREG:", "+CREG:", "+CMTI:", "+CGEV:", "+QENG:", "+QIURC:", "+QIND:", "+QUSIM:",
+];
+const URC_EXACT: &[&str] = &["RING", "RDY", "SMS READY", "PB DONE", "POWERED DOWN"];
 
 pub struct StreamingParser {
     epoch: DeviceEpoch,
@@ -32,6 +36,10 @@ pub struct StreamingParser {
     unrecognized_lines: usize,
     /// Prompt mode is enabled only for PDU send transactions; elsewhere `>` stays invalid.
     prompt_enabled: bool,
+    prompt_seen: bool,
+    skip_prompt_space: bool,
+    /// Only the exact PDU written by this transaction can be treated as a body echo.
+    body_echo: Option<Vec<u8>>,
     /// A `+CMGL:`/`+CMGR:` header is waiting for its PDU continuation line.
     expecting_pdu: bool,
     /// Number of `+CMGL:`/`+CMGR:` message records seen (PDU lines not counted).
@@ -66,11 +74,29 @@ impl StreamingParser {
             response_bytes: 0,
             unrecognized_lines: 0,
             prompt_enabled,
+            prompt_seen: false,
+            skip_prompt_space: false,
+            body_echo: None,
             expecting_pdu: false,
             sms_records: 0,
             completed: false,
             terminal_error: None,
         }
+    }
+
+    /// Arm one exact PDU echo after the CMGS prompt and before writing the body. Echoed input
+    /// (including its Ctrl-Z) is never a submission acknowledgement.
+    pub fn expect_prompt_body_echo(&mut self, body: &[u8]) -> Result<(), ProtocolError> {
+        if !matches!(self.command, AtCommand::SmsSend { .. })
+            || !self.prompt_seen
+            || self.completed
+            || self.body_echo.is_some()
+            || !std::str::from_utf8(body).is_ok_and(is_pdu_hex_line)
+        {
+            return self.fail(ProtocolErrorKind::UnexpectedData);
+        }
+        self.body_echo = Some(body.to_vec());
+        Ok(())
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<AtEvent>, ProtocolError> {
@@ -80,11 +106,8 @@ impl StreamingParser {
 
         let mut events = Vec::new();
         for &byte in bytes {
-            if self.completed {
-                if matches!(byte, b'\r' | b'\n') {
-                    continue;
-                }
-                return self.fail(ProtocolErrorKind::UnexpectedData);
+            if self.skip_prompt_space && byte == b' ' {
+                continue;
             }
 
             if matches!(byte, b'\r' | b'\n') {
@@ -100,6 +123,13 @@ impl StreamingParser {
                 continue;
             }
 
+            self.skip_prompt_space = false;
+            if byte == 0x1A && self.body_echo.as_deref() == Some(self.current_line.as_slice()) {
+                self.current_line.clear();
+                self.body_echo = None;
+                continue;
+            }
+
             if !byte.is_ascii_graphic() && byte != b' ' {
                 return self.fail(ProtocolErrorKind::WrongPortData);
             }
@@ -107,12 +137,17 @@ impl StreamingParser {
                 return self.fail(ProtocolErrorKind::LineTooLong);
             }
             self.current_line.push(byte);
+            if self.completed && !could_be_urc(&self.current_line) {
+                return self.fail(ProtocolErrorKind::UnexpectedData);
+            }
         }
 
         // The modem's `>` prompt is not newline-terminated: `\r\n>` may be the last bytes of a
         // read chunk, so a prompt-shaped pending line is flushed as soon as the chunk ends.
         if self.prompt_enabled && is_prompt_bytes(&self.current_line) {
             self.current_line.clear();
+            self.prompt_seen = true;
+            self.skip_prompt_space = true;
             events.push(AtEvent::Prompt);
         }
 
@@ -142,6 +177,7 @@ impl StreamingParser {
         self.unrecognized_lines = 0;
         self.expecting_pdu = false;
         self.sms_records = 0;
+        self.body_echo = None;
         self.terminal_error = Some(error.clone());
         error
     }
@@ -151,6 +187,23 @@ impl StreamingParser {
         line: String,
         events: &mut Vec<AtEvent>,
     ) -> Result<(), ProtocolError> {
+        if self.completed {
+            return if is_known_urc(&line) {
+                events.push(AtEvent::Urc(AtUrc {
+                    epoch: self.epoch,
+                    line,
+                }));
+                Ok(())
+            } else {
+                self.fail(ProtocolErrorKind::UnexpectedData)
+            };
+        }
+        if self.body_echo.as_deref().is_some_and(|body| {
+            line.as_bytes() == body || line.strip_suffix("^Z").map(str::as_bytes) == Some(body)
+        }) {
+            self.body_echo = None;
+            return Ok(());
+        }
         if line.as_bytes() == self.echo {
             return Ok(());
         }
@@ -161,6 +214,8 @@ impl StreamingParser {
             return self.fail(ProtocolErrorKind::WrongPortData);
         }
         if self.prompt_enabled && is_prompt_line(&line) {
+            self.prompt_seen = true;
+            self.skip_prompt_space = true;
             events.push(AtEvent::Prompt);
             return Ok(());
         }
@@ -177,11 +232,15 @@ impl StreamingParser {
                 final_code,
             }));
             self.completed = true;
+            self.body_echo = None;
             return Ok(());
         }
 
         match classify_line(&self.command, &line, self.expecting_pdu) {
             LineClassification::Response => {
+                if matches!(self.command, AtCommand::SmsSend { .. }) {
+                    self.body_echo = None;
+                }
                 self.expecting_pdu = line_starts_sms_record(&self.command, &line);
                 if self.expecting_pdu {
                     self.sms_records += 1;
@@ -415,20 +474,23 @@ pub(crate) fn is_known_urc(line: &str) -> bool {
     }
 
     const PREFIXES: &[&str] = &["+CMTI:", "+CGEV:", "+QENG:", "+QIURC:", "+QIND:", "+QUSIM:"];
-    const EXACT: &[&str] = &["RING", "RDY", "SMS READY", "PB DONE", "POWERED DOWN"];
-
     PREFIXES
         .iter()
         .any(|prefix| nonempty_payload(line, prefix).is_some())
-        || EXACT.contains(&line)
+        || URC_EXACT.contains(&line)
 }
 
 fn looks_like_known_urc(line: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "+CEREG:", "+CGREG:", "+CREG:", "+CMTI:", "+CGEV:", "+QENG:", "+QIURC:", "+QIND:",
-        "+QUSIM:",
-    ];
-    PREFIXES.iter().any(|prefix| line.starts_with(prefix))
+    URC_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
+}
+
+fn could_be_urc(bytes: &[u8]) -> bool {
+    URC_PREFIXES
+        .iter()
+        .any(|prefix| prefix.as_bytes().starts_with(bytes) || bytes.starts_with(prefix.as_bytes()))
+        || URC_EXACT
+            .iter()
+            .any(|line| line.as_bytes().starts_with(bytes))
 }
 
 fn is_unsupported_multipart_urc(line: &str) -> bool {
